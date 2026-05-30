@@ -903,7 +903,15 @@ class Config:
     # 交易日检查：默认启用，非交易日跳过执行；设为 false 或 --force-run 可强制执行（Issue #373）
     trading_day_check_enabled: bool = True
 
-    # === 实时行情增强数据配置 ===
+    # === 盘中监控配置 ===
+    # 是否启用盘中监控（true/false）
+    intraday_monitor_enabled: bool = False
+    # 盘中监控候选股列表（逗号分隔），为空则使用 STOCK_LIST
+    intraday_monitor_stocks: str = ""
+    # 盘中决策时间（HH:MM 格式），14:30 执行最终决策
+    intraday_monitor_decision_time: str = "14:30"
+
+    # === 实时行情增强数据配置 ==="
     # 实时行情开关（关闭后使用历史收盘价进行分析）
     enable_realtime_quote: bool = True
     # 盘中实时技术面：启用时用实时价计算 MA/多头排列（Issue #234）；关闭则用昨日收盘
@@ -1708,6 +1716,9 @@ class Config:
                 os.getenv('MARKET_REVIEW_COLOR_SCHEME', 'green_up')
             ),
             trading_day_check_enabled=os.getenv('TRADING_DAY_CHECK_ENABLED', 'true').lower() != 'false',
+            intraday_monitor_enabled=os.getenv('INTRADAY_MONITOR_ENABLED', 'false').lower() == 'true',
+            intraday_monitor_stocks=os.getenv('INTRADAY_MONITOR_STOCKS', ''),
+            intraday_monitor_decision_time=os.getenv('INTRADAY_MONITOR_DECISION_TIME', '14:30'),
             webui_enabled=os.getenv('WEBUI_ENABLED', 'false').lower() == 'true',
             webui_host=os.getenv('WEBUI_HOST', '127.0.0.1'),
             webui_port=parse_env_int(os.getenv('WEBUI_PORT'), 8000, field_name='WEBUI_PORT', minimum=1, maximum=65535),

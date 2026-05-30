@@ -1,0 +1,140 @@
+name: 盘中实时监控
+
+on:
+  schedule:
+    # 北京时间 9:55 (UTC 1:55) — 早盘快照
+    - cron: '55 1 * * 1-5'
+    # 北京时间 10:25 (UTC 2:25) — 早盘快照
+    - cron: '25 2 * * 1-5'
+    # 北京时间 10:55 (UTC 2:55) — 早盘快照
+    - cron: '55 2 * * 1-5'
+    # 北京时间 11:25 (UTC 3:25) — 早盘快照
+    - cron: '25 3 * * 1-5'
+    # 北京时间 13:30 (UTC 5:30) — 午盘快照
+    - cron: '30 5 * * 1-5'
+    # 北京时间 14:00 (UTC 6:00) — 午盘快照
+    - cron: '0 6 * * 1-5'
+    # 北京时间 14:30 (UTC 6:30) — 快照 + 决策汇总
+    - cron: '30 6 * * 1-5'
+
+  workflow_dispatch:
+    inputs:
+      action:
+        description: '执行动作'
+        required: true
+        default: 'snapshot'
+        type: choice
+        options:
+          - snapshot
+          - decision
+
+# 独立并发组，不阻塞盘后分析
+concurrency:
+  group: intraday-monitor
+  cancel-in-progress: false
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: 随机延迟（避免固定时间访问）
+        run: sleep $((RANDOM % 20))
+
+      - name: 检出代码
+        uses: actions/checkout@v5
+
+      - name: 设置 Python 环境
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: 安装依赖
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: 创建必要目录
+        run: |
+          mkdir -p data logs reports
+
+      - name: 恢复盘中数据缓存
+        uses: actions/cache@v4
+        with:
+          path: data/
+          key: intraday-data-${{ runner.os }}-${{ github.run_id }}
+          restore-keys: |
+            intraday-data-${{ runner.os }}-
+
+      - name: 执行盘中任务
+        env:
+          # AI 配置
+          LITELLM_CONFIG: ${{ vars.LITELLM_CONFIG || secrets.LITELLM_CONFIG }}
+          LITELLM_API_KEY: ${{ secrets.LITELLM_API_KEY }}
+          LITELLM_MODEL: ${{ vars.LITELLM_MODEL || secrets.LITELLM_MODEL }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GEMINI_API_KEYS: ${{ secrets.GEMINI_API_KEYS }}
+          GEMINI_MODEL: ${{ vars.GEMINI_MODEL || secrets.GEMINI_MODEL || 'gemini-3-flash-preview' }}
+          AIHUBMIX_KEY: ${{ secrets.AIHUBMIX_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENAI_API_KEYS: ${{ secrets.OPENAI_API_KEYS }}
+          OPENAI_BASE_URL: ${{ vars.OPENAI_BASE_URL || secrets.OPENAI_BASE_URL }}
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          DEEPSEEK_API_KEYS: ${{ secrets.DEEPSEEK_API_KEYS }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          ANTHROPIC_API_KEYS: ${{ secrets.ANTHROPIC_API_KEYS }}
+
+          # 数据源
+          TUSHARE_TOKEN: ${{ secrets.TUSHARE_TOKEN }}
+          REALTIME_SOURCE_PRIORITY: ${{ vars.REALTIME_SOURCE_PRIORITY || 'tencent,akshare_sina,efinance,akshare_em' }}
+
+          # 邮件通知
+          EMAIL_SENDER: ${{ vars.EMAIL_SENDER || secrets.EMAIL_SENDER }}
+          EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
+          EMAIL_RECEIVERS: ${{ vars.EMAIL_RECEIVERS || secrets.EMAIL_RECEIVERS }}
+          EMAIL_SENDER_NAME: ${{ vars.EMAIL_SENDER_NAME || secrets.EMAIL_SENDER_NAME || 'daily_stock_analysis股票分析助手' }}
+
+          # 盘中监控配置
+          INTRADAY_MONITOR_ENABLED: 'true'
+          INTRADAY_MONITOR_STOCKS: ${{ vars.INTRADAY_MONITOR_STOCKS || secrets.INTRADAY_MONITOR_STOCKS || '' }}
+          TRADING_DAY_CHECK_ENABLED: 'true'
+
+          # 系统配置
+          LOG_LEVEL: INFO
+          STOCK_LIST: ${{ vars.STOCK_LIST || secrets.STOCK_LIST || '600519' }}
+
+        run: |
+          # 判断执行动作：手动触发用输入参数，定时触发用 UTC 时间
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            ACTION="${{ github.event.inputs.action }}"
+          else
+            UTC_HOUR=$(date +%H)
+            if [ "$UTC_HOUR" -ge "6" ] && [ "$UTC_HOUR" -lt "7" ]; then
+              ACTION="decision"
+            else
+              ACTION="snapshot"
+            fi
+          fi
+
+          echo "=========================================="
+          echo "盘中监控 — $ACTION"
+          echo "北京时间: $(TZ='Asia/Shanghai' date '+%Y-%m-%d %H:%M:%S')"
+          echo "监控股票: $INTRADAY_MONITOR_STOCKS"
+          echo "=========================================="
+
+          if [ "$ACTION" = "decision" ]; then
+            python main.py --intraday-decision
+          else
+            python main.py --intraday-snapshot
+          fi
+
+      - name: 上传运行日志
+        uses: actions/upload-artifact@v6
+        if: always()
+        with:
+          name: intraday-${{ github.run_number }}
+          path: |
+            logs/
+          retention-days: 3

@@ -59,6 +59,8 @@ reports/
 *.db
 *.sqlite
 *.sqlite3
+proceedings.md
+
 
 # 系统文件
 .DS_Store

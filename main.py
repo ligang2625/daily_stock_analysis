@@ -309,6 +309,18 @@ def parse_arguments() -> argparse.Namespace:
     )
 
     parser.add_argument(
+        '--intraday-snapshot',
+        action='store_true',
+        help='执行单次盘中快照（采集实时价格并保存到 SQLite）'
+    )
+
+    parser.add_argument(
+        '--intraday-decision',
+        action='store_true',
+        help='执行盘中决策汇总（读取当天事件 → LLM → 发送邮件）'
+    )
+
+    parser.add_argument(
         '--no-run-immediately',
         action='store_true',
         help='定时任务启动时不立即执行一次'
@@ -955,6 +967,31 @@ def main() -> int:
             )
             return 0
 
+        # 模式1.5: 盘中单次快照 / 决策（独立进程，不依赖 scheduler 长跑）
+        if args.intraday_snapshot or args.intraday_decision:
+            from src.core.intraday_monitor import IntradayMonitor
+            from data_provider.base import DataFetcherManager
+            from src.storage import DatabaseManager
+            from src.notification_sender.email_sender import EmailSender
+
+            db_mgr = DatabaseManager.get_instance()
+            fetcher_mgr = DataFetcherManager()
+            email_sender = EmailSender(config)
+
+            monitor = IntradayMonitor(
+                config=config,
+                fetcher_manager=fetcher_mgr,
+                db_manager=db_mgr,
+                email_sender=email_sender,
+            )
+
+            if args.intraday_snapshot:
+                monitor.run_one_shot_snapshot()
+            else:
+                monitor.run_one_shot_decision()
+
+            return 0
+
         # 模式2: 定时任务模式
         if args.schedule or config.schedule_enabled:
             logger.info("模式: 定时任务")
@@ -969,7 +1006,7 @@ def main() -> int:
 
             logger.info(f"启动时立即执行: {should_run_immediately}")
 
-            from src.scheduler import run_with_schedule
+            from src.scheduler import Scheduler
             scheduled_stock_codes = _resolve_scheduled_stock_codes(stock_codes)
             schedule_time_provider = _build_schedule_time_provider(config.schedule_time)
 
@@ -977,6 +1014,55 @@ def main() -> int:
                 runtime_config = _reload_runtime_config()
                 run_full_analysis(runtime_config, args, scheduled_stock_codes)
 
+            scheduler = Scheduler(
+                schedule_time=config.schedule_time,
+                schedule_time_provider=schedule_time_provider,
+            )
+
+            # Register main analysis task
+            scheduler.set_daily_task(scheduled_task, run_immediately=should_run_immediately)
+
+            # Register intraday monitoring jobs
+            if getattr(config, 'intraday_monitor_enabled', False):
+                logger.info("盘中监控已启用，注册盘中快照与决策任务...")
+                from src.core.intraday_monitor import IntradayMonitor
+                from data_provider.base import DataFetcherManager
+                from src.storage import DatabaseManager
+                from src.notification_sender.email_sender import EmailSender
+
+                db_mgr = DatabaseManager.get_instance()
+                fetcher_mgr = DataFetcherManager()
+                email_sender = EmailSender(config)
+
+                intraday_monitor = IntradayMonitor(
+                    config=config,
+                    fetcher_manager=fetcher_mgr,
+                    db_manager=db_mgr,
+                    email_sender=email_sender,
+                )
+                intraday_monitor._ensure_intraday_table()
+
+                # Snapshot jobs every 30 min from 10:00 to 14:00
+                # Note: schedule library has ~30s polling granularity.
+                # Jobs fire within [HH:MM:00, HH:MM:30) window, not at exact second.
+                snapshot_times = ["10:00", "10:30", "11:00", "11:30", "13:30", "14:00", "14:30"]
+                decision_time = getattr(config, 'intraday_monitor_decision_time', '14:30')
+
+                for t in snapshot_times:
+                    scheduler.add_daily_job(
+                        intraday_monitor.monitor_snapshot,
+                        t,
+                        name=f"intraday_snapshot_{t.replace(':', '')}",
+                    )
+                scheduler.add_daily_job(
+                    intraday_monitor.final_decision,
+                    decision_time,
+                    name="intraday_decision",
+                )
+                logger.info("盘中监控任务注册完成: %d 次快照 + 1 次决策 @ %s",
+                            len(snapshot_times), decision_time)
+
+            # Register background tasks
             background_tasks = []
             if getattr(config, 'agent_event_monitor_enabled', False):
                 from src.services.alert_worker import AlertWorker
@@ -997,13 +1083,15 @@ def main() -> int:
                     "name": "agent_event_monitor",
                 })
 
-            run_with_schedule(
-                task=scheduled_task,
-                schedule_time=config.schedule_time,
-                run_immediately=should_run_immediately,
-                background_tasks=background_tasks,
-                schedule_time_provider=schedule_time_provider,
-            )
+            for entry in background_tasks:
+                scheduler.add_background_task(
+                    task=entry["task"],
+                    interval_seconds=entry["interval_seconds"],
+                    run_immediately=entry.get("run_immediately", False),
+                    name=entry.get("name"),
+                )
+
+            scheduler.run()
             return 0
 
         # 模式3: 正常单次运行

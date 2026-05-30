@@ -86,6 +86,7 @@ class Scheduler:
         self.shutdown_handler = GracefulShutdown()
         self._task_callback: Optional[Callable] = None
         self._daily_job: Optional[Any] = None
+        self._daily_jobs: List[Dict[str, Any]] = []
         self._background_tasks: List[Dict[str, Any]] = []
         self._running = False
 
@@ -98,8 +99,7 @@ class Scheduler:
             run_immediately: 是否在设置后立即执行一次
         """
         self._task_callback = task
-        if not self._configure_daily_task(self.schedule_time):
-            raise ValueError(f"无效的定时执行时间: {self.schedule_time!r}")
+        self.add_daily_job(task, self.schedule_time, name="main_analysis")
 
         if run_immediately:
             logger.info("立即执行一次任务...")
@@ -113,45 +113,64 @@ class Scheduler:
             return False
         return True
 
-    def _cancel_daily_job(self) -> None:
-        """Remove the currently registered daily job if one exists."""
-        if self._daily_job is None:
-            return
+    def add_daily_job(self, task: Callable, time_str: str, name: Optional[str] = None) -> None:
+        """
+        Register a daily job at a specific time (e.g. "10:00", "14:20").
 
-        if hasattr(self.schedule, "cancel_job"):
-            self.schedule.cancel_job(self._daily_job)
-        else:  # pragma: no cover - compatibility fallback
-            jobs = getattr(self.schedule, "jobs", None)
-            if isinstance(jobs, list) and self._daily_job in jobs:
-                jobs.remove(self._daily_job)
+        Supports multiple concurrent daily jobs, each with its own callback.
 
-        self._daily_job = None
+        Args:
+            task: The callback to invoke at the scheduled time.
+            time_str: Time in "HH:MM" 24-hour format.
+            name: Optional human-readable name for logging.
+        """
+        if not self._is_valid_schedule_time(time_str):
+            raise ValueError(f"Invalid daily job time: {time_str!r}")
 
-    def _configure_daily_task(self, schedule_time: str) -> bool:
-        """(Re)register the daily job at the requested time."""
-        candidate = (schedule_time or "").strip()
-        if not self._is_valid_schedule_time(candidate):
-            logger.warning(
-                "检测到无效的定时执行时间 %r，继续沿用当前时间 %s",
-                schedule_time,
-                self.schedule_time,
-            )
-            return False
+        job_name = name or getattr(task, "__name__", "daily_job")
+        schedule_job = self.schedule.every().day.at(time_str).do(
+            self._make_safe_runner(task, job_name)
+        )
+        self._daily_jobs.append({
+            "job": schedule_job,
+            "callback": task,
+            "time_str": time_str,
+            "name": job_name,
+        })
+        logger.info("已注册每日任务: %s @ %s", job_name, time_str)
 
-        previous_time = self.schedule_time
-        self._cancel_daily_job()
-        self._daily_job = self.schedule.every().day.at(candidate).do(self._safe_run_task)
-        self.schedule_time = candidate
+    @staticmethod
+    def _make_safe_runner(task: Callable, job_name: str) -> Callable:
+        """Create a safe runner wrapper for a daily job callback."""
+        def _runner():
+            try:
+                logger.info("=" * 50)
+                logger.info("定时任务开始执行 [%s] - %s", job_name, datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+                logger.info("=" * 50)
+                task()
+                logger.info("定时任务执行完成 [%s] - %s", job_name, datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+            except Exception as e:
+                logger.exception("定时任务执行失败 [%s]: %s", job_name, e)
+        return _runner
 
-        if previous_time == candidate:
-            logger.info("已设置每日定时任务，执行时间: %s", self.schedule_time)
-        else:
-            logger.info(
-                "检测到 SCHEDULE_TIME 变更，已将每日定时任务从 %s 更新为 %s",
-                previous_time,
-                self.schedule_time,
-            )
-        return True
+    def _cancel_all_daily_jobs(self) -> None:
+        """Cancel all registered daily jobs."""
+        for entry in self._daily_jobs:
+            job = entry["job"]
+            if hasattr(self.schedule, "cancel_job"):
+                self.schedule.cancel_job(job)
+            else:  # pragma: no cover - compatibility fallback
+                jobs = getattr(self.schedule, "jobs", None)
+                if isinstance(jobs, list) and job in jobs:
+                    jobs.remove(job)
+        self._daily_jobs.clear()
+
+    def _reconfigure_all_daily_jobs(self) -> None:
+        """Rebuild all daily jobs from self._daily_jobs list (used after schedule time change)."""
+        saved = [(e["callback"], e["time_str"], e["name"]) for e in self._daily_jobs]
+        self._cancel_all_daily_jobs()
+        for callback, time_str, name in saved:
+            self.add_daily_job(callback, time_str, name=name)
 
     def _refresh_daily_schedule_if_needed(self) -> None:
         """Reload daily schedule time from the latest runtime config if needed."""
@@ -167,8 +186,10 @@ class Scheduler:
         if not latest_schedule_time or latest_schedule_time == self.schedule_time:
             return
 
-        if self._configure_daily_task(latest_schedule_time):
-            logger.info("更新后的下次执行时间: %s", self._get_next_run_time())
+        # Update main analysis job time
+        self.schedule_time = latest_schedule_time
+        self._reconfigure_all_daily_jobs()
+        logger.info("更新后的下次执行时间: %s", self._get_next_run_time())
 
     def _safe_run_task(self):
         """安全执行任务（带异常捕获）"""
