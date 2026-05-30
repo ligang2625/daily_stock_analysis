@@ -85,3 +85,13 @@ static/
 /apps/dsa-desktop/dist/
 /apps/dsa-desktop/node_modules/
 docs/specs/
+
+# Local Python env
+.venv/
+venv/
+env/
+
+# Local secrets
+.env
+*.env
+longbridge_token_cache_b64.txt
