@@ -23,7 +23,7 @@ import logging
 import threading
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from typing import Any, Callable, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
@@ -226,6 +226,23 @@ def _safe_float(val: Any) -> Optional[float]:
 # IntradayMonitor
 # ---------------------------------------------------------------------------
 
+def _get_previous_trading_day() -> date:
+    """Return the most recent trading day, handling weekends.
+
+    Monday/Friday -> Friday, Saturday/Sunday -> Friday,
+    Tuesday-Friday -> previous calendar day.
+    """
+    today = date.today()
+    w = today.weekday()
+    if w == 0:  # Monday -> Friday
+        return today - timedelta(days=3)
+    if w == 6:  # Sunday -> Friday
+        return today - timedelta(days=2)
+    if w == 5:  # Saturday -> Friday
+        return today - timedelta(days=1)
+    return today - timedelta(days=1)
+
+
 class IntradayMonitor:
     """
     盘中监控器
@@ -265,25 +282,25 @@ class IntradayMonitor:
 
         Returns {code: {ideal_buy, secondary_buy, stop_loss, take_profit}}
         """
-        from datetime import timedelta
 
         if not stock_codes:
             return {}
 
         result: Dict[str, Dict[str, Optional[float]]] = {}
-        yesterday = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+        previous_trading_day = _get_previous_trading_day()
+        yesterday_str = previous_trading_day.strftime("%Y-%m-%d")
 
         try:
             with self._db.session_scope() as session:
                 from src.storage import AnalysisHistory
-                from sqlalchemy import and_
+                from sqlalchemy import and_, func
 
                 rows = (
                     session.query(AnalysisHistory)
                     .filter(
                         and_(
                             AnalysisHistory.code.in_(stock_codes),
-                            AnalysisHistory.query_date >= yesterday,
+                            func.date(AnalysisHistory.created_at) >= yesterday_str,
                         )
                     )
                     .order_by(AnalysisHistory.created_at.desc())
