@@ -226,23 +226,6 @@ def _safe_float(val: Any) -> Optional[float]:
 # IntradayMonitor
 # ---------------------------------------------------------------------------
 
-def _get_previous_trading_day() -> date:
-    """Return the most recent trading day, handling weekends.
-
-    Monday/Friday -> Friday, Saturday/Sunday -> Friday,
-    Tuesday-Friday -> previous calendar day.
-    """
-    today = date.today()
-    w = today.weekday()
-    if w == 0:  # Monday -> Friday
-        return today - timedelta(days=3)
-    if w == 6:  # Sunday -> Friday
-        return today - timedelta(days=2)
-    if w == 5:  # Saturday -> Friday
-        return today - timedelta(days=1)
-    return today - timedelta(days=1)
-
-
 class IntradayMonitor:
     """
     盘中监控器
@@ -269,47 +252,84 @@ class IntradayMonitor:
         self._lock = threading.Lock()
         self._snapshot_times: List[str] = []  # record snapshot times for the day
 
+    def _resolve_market(self) -> str:
+        """Determine market region for trading calendar lookups."""
+        region = getattr(self._config, 'market_review_region', None)
+        if region and region in ('cn', 'hk', 'us'):
+            return region
+        return 'cn'
+
     # ------------------------------------------------------------------
     # Initialization
     # ------------------------------------------------------------------
 
     def load_yesterday_analysis(self, stock_codes: List[str]) -> Dict[str, Dict[str, Optional[float]]]:
         """
-        Load yesterday's AnalysisHistory from SQLite.
+        Load the most recent completed trading day's postmarket analysis.
 
-        Primary path: direct column fields (ideal_buy, secondary_buy, stop_loss, take_profit).
-        Fallback: raw_result JSON → _extract_sniper_points.
+        Primary query: effective_trading_date == target AND analysis_phase == 'postmarket'.
+        Fallback query (old records): func.date(created_at) >= target_date_str.
+        Primary records take precedence over fallback for the same code.
 
         Returns {code: {ideal_buy, secondary_buy, stop_loss, take_profit}}
         """
-
         if not stock_codes:
             return {}
 
         result: Dict[str, Dict[str, Optional[float]]] = {}
-        previous_trading_day = _get_previous_trading_day()
-        yesterday_str = previous_trading_day.strftime("%Y-%m-%d")
+        market = self._resolve_market()
+
+        try:
+            from src.core.trading_calendar import get_effective_trading_date
+            target_trading_date = get_effective_trading_date(market)
+        except Exception:
+            target_trading_date = date.today() - timedelta(days=1)
+
+        target_date_str = target_trading_date.strftime("%Y-%m-%d")
 
         try:
             with self._db.session_scope() as session:
                 from src.storage import AnalysisHistory
-                from sqlalchemy import and_, func
+                from sqlalchemy import or_, and_, func
 
-                rows = (
+                # --- Primary query: new columns ---
+                primary_rows = (
                     session.query(AnalysisHistory)
                     .filter(
                         and_(
                             AnalysisHistory.code.in_(stock_codes),
-                            func.date(AnalysisHistory.created_at) >= yesterday_str,
+                            AnalysisHistory.effective_trading_date == target_trading_date,
+                            AnalysisHistory.analysis_phase == 'postmarket',
                         )
                     )
                     .order_by(AnalysisHistory.created_at.desc())
                     .all()
                 )
 
+                primary_codes = {str(row.code or "").strip() for row in primary_rows}
+
+                # --- Fallback: old records without new columns ---
+                remaining_codes = [c for c in stock_codes if c not in primary_codes]
+                fallback_rows: list = []
+                if remaining_codes:
+                    fallback_rows = (
+                        session.query(AnalysisHistory)
+                        .filter(
+                            and_(
+                                AnalysisHistory.code.in_(remaining_codes),
+                                func.date(AnalysisHistory.created_at) >= target_date_str,
+                            )
+                        )
+                        .order_by(AnalysisHistory.created_at.desc())
+                        .all()
+                    )
+
+                # Combine: primary first, then fallback; keep first per code
+                all_rows = list(primary_rows) + list(fallback_rows)
+
                 # Keep latest per code
                 seen: set = set()
-                for row in rows:
+                for row in all_rows:
                     code = str(row.code or "").strip()
                     if not code or code in seen:
                         continue
@@ -325,7 +345,6 @@ class IntradayMonitor:
                         try:
                             raw = json.loads(row.raw_result) if isinstance(row.raw_result, str) else row.raw_result
                             if isinstance(raw, dict):
-                                # Search nested dict for sniper points (mirrors _find_sniper_in_dashboard logic)
                                 sp = _find_sniper_points_in_dict(raw)
                                 ideal = sp.get("ideal_buy")
                                 secondary = sp.get("secondary_buy")
@@ -341,7 +360,8 @@ class IntradayMonitor:
                         "take_profit": profit,
                     }
 
-            logger.info("加载昨日分析: %d 支股票", len(result))
+            logger.info("加载昨日分析: %d 支股票 (primary=%d, fallback=%d)",
+                         len(result), len(primary_codes), len(fallback_rows))
         except Exception as exc:
             logger.exception("加载昨日分析失败: %s", exc)
 
@@ -695,12 +715,10 @@ class IntradayMonitor:
     # ------------------------------------------------------------------
 
     def _is_trading_day(self) -> bool:
-        """Check if today is a trading day for CN market."""
+        """Check if today is a trading day for the configured market."""
         try:
-            from src.core.trading_calendar import TradingCalendar
-            ctx = TradingCalendar().get_market_phase_context("cn")
-            if ctx.is_trading_day is not None:
-                return ctx.is_trading_day
+            from src.core.trading_calendar import is_market_open
+            return is_market_open(self._resolve_market(), date.today())
         except Exception as exc:
             logger.warning("交易日检测异常，按交易日处理: %s", exc)
         return True  # fail-open

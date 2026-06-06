@@ -654,7 +654,9 @@ class StockAnalysisPipeline:
                         report_type=report_type.value,
                         news_content=news_context,
                         context_snapshot=context_snapshot,
-                        save_snapshot=self.save_context_snapshot
+                        save_snapshot=self.save_context_snapshot,
+                        analysis_phase=getattr(self, "analysis_phase", "auto"),
+                        effective_trading_date=market_phase_context.effective_daily_bar_date
                     )
                     record_history_run(
                         report_saved=bool(saved_count),
@@ -1187,6 +1189,16 @@ class StockAnalysisPipeline:
                     )
                     result.diagnostic_context_snapshot = agent_context_snapshot
                     agent_context_snapshot["stock_name"] = resolved_stock_name
+                    # Resolve effective trading date from market_phase_context dict
+                    _eff_date = None
+                    if isinstance(market_phase_context, dict):
+                        _eff_str = market_phase_context.get("effective_daily_bar_date")
+                        if _eff_str:
+                            try:
+                                _eff_date = date.fromisoformat(str(_eff_str))
+                            except (ValueError, TypeError):
+                                pass
+
                     saved_count = self.db.save_analysis_history(
                         result=result,
                         query_id=query_id,
@@ -1194,6 +1206,8 @@ class StockAnalysisPipeline:
                         news_content=None,
                         context_snapshot=agent_context_snapshot,
                         save_snapshot=self.save_context_snapshot,
+                        analysis_phase=getattr(self, "analysis_phase", "auto"),
+                        effective_trading_date=_eff_date,
                     )
                     record_history_run(
                         report_saved=bool(saved_count),

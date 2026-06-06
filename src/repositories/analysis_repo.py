@@ -84,7 +84,9 @@ class AnalysisRepository:
         query_id: str,
         report_type: str,
         news_content: Optional[str] = None,
-        context_snapshot: Optional[Dict[str, Any]] = None
+        context_snapshot: Optional[Dict[str, Any]] = None,
+        analysis_phase: str = "auto",
+        effective_trading_date: Optional[Any] = None,
     ) -> int:
         """
         保存分析结果
@@ -105,7 +107,9 @@ class AnalysisRepository:
                 query_id=query_id,
                 report_type=report_type,
                 news_content=news_content,
-                context_snapshot=context_snapshot
+                context_snapshot=context_snapshot,
+                analysis_phase=analysis_phase,
+                effective_trading_date=effective_trading_date,
             )
         except Exception as e:
             logger.error(f"保存分析结果失败: {e}")

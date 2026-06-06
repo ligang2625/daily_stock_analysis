@@ -298,3 +298,158 @@ def _make_monitor(intraday_stocks: str = ""):
     email = MagicMock()
 
     return IntradayMonitor(config=config, fetcher_manager=fetcher, db_manager=db, email_sender=email)
+
+
+# ============================================================
+# IntradayMonitor — _resolve_market
+# ============================================================
+
+class TestResolveMarket:
+    def test_defaults_to_cn(self):
+        monitor = _make_monitor()
+        assert monitor._resolve_market() == 'cn'
+
+    def test_uses_config_value(self):
+        monitor = _make_monitor()
+        monitor._config.market_review_region = 'hk'
+        assert monitor._resolve_market() == 'hk'
+
+    def test_us_market(self):
+        monitor = _make_monitor()
+        monitor._config.market_review_region = 'us'
+        assert monitor._resolve_market() == 'us'
+
+    def test_invalid_value_falls_back(self):
+        monitor = _make_monitor()
+        monitor._config.market_review_region = 'both'
+        assert monitor._resolve_market() == 'cn'
+
+
+# ============================================================
+# IntradayMonitor — _is_trading_day
+# ============================================================
+
+class TestIsTradingDay:
+    @pytest.fixture(autouse=True)
+    def _check_deps(self):
+        try:
+            import pandas  # noqa: F401
+            from src.core import trading_calendar  # noqa: F401
+        except (ImportError, ModuleNotFoundError):
+            pytest.skip("pandas not available")
+
+    def test_trading_day_returns_true(self):
+        from src.core import trading_calendar as _tc
+        monitor = _make_monitor()
+        with patch.object(_tc, 'is_market_open', return_value=True):
+            assert monitor._is_trading_day() is True
+
+    def test_non_trading_day_returns_false(self):
+        from src.core import trading_calendar as _tc
+        monitor = _make_monitor()
+        with patch.object(_tc, 'is_market_open', return_value=False):
+            assert monitor._is_trading_day() is False
+
+    def test_calendar_error_fail_open(self):
+        from src.core import trading_calendar as _tc
+        monitor = _make_monitor()
+        with patch.object(_tc, 'is_market_open', side_effect=RuntimeError("boom")):
+            assert monitor._is_trading_day() is True
+
+    def test_uses_configured_market(self):
+        from datetime import date
+        from src.core import trading_calendar as _tc
+        monitor = _make_monitor()
+        monitor._config.market_review_region = 'us'
+        with patch.object(_tc, 'is_market_open', return_value=True) as mock_is_open:
+            monitor._is_trading_day()
+            mock_is_open.assert_called_once_with('us', date.today())
+
+
+# ============================================================
+# IntradayMonitor — load_yesterday_analysis backward compat
+# ============================================================
+
+class TestLoadYesterdayAnalysisBackwardCompat:
+    @pytest.fixture(autouse=True)
+    def _check_deps(self):
+        try:
+            import pandas  # noqa: F401
+        except ImportError:
+            pytest.skip("pandas not available")
+
+    def test_fallback_used_for_old_records(self):
+        """Records without effective_trading_date/analysis_phase are found via fallback."""
+        from src.storage import AnalysisHistory
+        mock_session = MagicMock()
+
+        # Primary query returns empty
+        mock_session.query.return_value.filter.return_value.order_by.return_value.all.side_effect = [
+            [],  # primary query: no results
+            [  # fallback query: one old record
+                _make_mock_row("000001", 100, 95, 90, 115),
+            ],
+        ]
+
+        monitor = _make_monitor()
+        monitor._db.session_scope = MagicMock()
+        monitor._db.session_scope.return_value = mock_session
+
+        result = monitor.load_yesterday_analysis(["000001"])
+        assert "000001" in result
+        assert result["000001"]["ideal_buy"] == 100.0
+
+    def test_primary_beats_fallback(self):
+        """When both new and old records exist, primary (postmarket) wins."""
+        mock_session = MagicMock()
+
+        # Primary query returns a new record
+        primary_row = _make_mock_row("000001", 120, 115, 110, 130)
+        # Fallback query returns an old record
+        fallback_row = _make_mock_row("000001", 100, 95, 90, 115)
+
+        mock_session.query.return_value.filter.return_value.order_by.return_value.all.side_effect = [
+            [primary_row],   # primary query
+            [fallback_row],  # fallback query
+        ]
+
+        monitor = _make_monitor()
+        monitor._db.session_scope = MagicMock()
+        monitor._db.session_scope.return_value = mock_session
+
+        result = monitor.load_yesterday_analysis(["000001"])
+        # Primary record values should win
+        assert result["000001"]["ideal_buy"] == 120.0
+
+    def test_mixed_new_and_old_across_stocks(self):
+        """Stock A has new record, Stock B has only old record — both found."""
+        mock_session = MagicMock()
+
+        primary_row = _make_mock_row("000001", 120, 115, 110, 130)
+        fallback_row = _make_mock_row("000002", 50, 45, 40, 60)
+
+        mock_session.query.return_value.filter.return_value.order_by.return_value.all.side_effect = [
+            [primary_row],   # primary: only stock A
+            [fallback_row],  # fallback: stock B from old records
+        ]
+
+        monitor = _make_monitor()
+        monitor._db.session_scope = MagicMock()
+        monitor._db.session_scope.return_value = mock_session
+
+        result = monitor.load_yesterday_analysis(["000001", "000002"])
+        assert result["000001"]["ideal_buy"] == 120.0
+        assert result["000002"]["ideal_buy"] == 50.0
+
+
+def _make_mock_row(code, ideal, secondary, stop, profit):
+    """Helper to create a mock AnalysisHistory row."""
+    from src.storage import AnalysisHistory
+    row = MagicMock(spec=AnalysisHistory)
+    row.code = code
+    row.ideal_buy = ideal
+    row.secondary_buy = secondary
+    row.stop_loss = stop
+    row.take_profit = profit
+    row.raw_result = None
+    return row

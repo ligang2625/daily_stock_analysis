@@ -257,6 +257,12 @@ class AnalysisHistory(Base):
     stop_loss = Column(Float)
     take_profit = Column(Float)
 
+    # 分析阶段归属 (premarket / intraday / postmarket / auto / market_review)
+    analysis_phase = Column(String(16), nullable=True, index=True)
+
+    # 该条分析归属的有效交易日（交易日历语义）
+    effective_trading_date = Column(Date, nullable=True, index=True)
+
     created_at = Column(DateTime, default=datetime.now, index=True)
 
     __table_args__ = (
@@ -271,6 +277,7 @@ class AnalysisHistory(Base):
             'code': self.code,
             'name': self.name,
             'report_type': self.report_type,
+            'analysis_phase': self.analysis_phase,
             'sentiment_score': self.sentiment_score,
             'operation_advice': self.operation_advice,
             'trend_prediction': self.trend_prediction,
@@ -282,6 +289,7 @@ class AnalysisHistory(Base):
             'secondary_buy': self.secondary_buy,
             'stop_loss': self.stop_loss,
             'take_profit': self.take_profit,
+            'effective_trading_date': self.effective_trading_date.isoformat() if self.effective_trading_date else None,
             'created_at': self.created_at.isoformat() if self.created_at else None,
         }
 
@@ -854,6 +862,7 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
 
             # 创建所有表
             Base.metadata.create_all(self._engine)
+            self._apply_schema_migrations()
             self._ensure_schema_migration_record()
 
             self._initialized = True
@@ -898,6 +907,31 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
             raise
         finally:
             session.close()
+
+    def _apply_schema_migrations(self) -> None:
+        """Apply incremental schema changes not handled by metadata.create_all."""
+        if not self._is_sqlite_engine:
+            return
+        try:
+            with self._SessionLocal() as session:
+                conn = session.connection()
+                from sqlalchemy import text as sa_text
+
+                info = conn.execute(sa_text("PRAGMA table_info('analysis_history')")).fetchall()
+                existing_cols = {row[1] for row in info}
+                if 'analysis_phase' not in existing_cols:
+                    conn.execute(sa_text(
+                        "ALTER TABLE analysis_history ADD COLUMN analysis_phase VARCHAR(16)"
+                    ))
+                    logger.info("Schema migration: added analysis_history.analysis_phase")
+                if 'effective_trading_date' not in existing_cols:
+                    conn.execute(sa_text(
+                        "ALTER TABLE analysis_history ADD COLUMN effective_trading_date DATE"
+                    ))
+                    logger.info("Schema migration: added analysis_history.effective_trading_date")
+                session.commit()
+        except Exception as exc:
+            logger.warning("Schema migration error (non-fatal): %s", exc)
 
     @classmethod
     def get_instance(cls) -> 'DatabaseManager':
@@ -1381,7 +1415,9 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
         report_type: str,
         news_content: Optional[str],
         context_snapshot: Optional[Dict[str, Any]] = None,
-        save_snapshot: bool = True
+        save_snapshot: bool = True,
+        analysis_phase: str = "auto",
+        effective_trading_date: Optional[date] = None,
     ) -> int:
         """
         保存分析结果历史记录
@@ -1414,6 +1450,8 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
                         secondary_buy=sniper_points.get("secondary_buy"),
                         stop_loss=sniper_points.get("stop_loss"),
                         take_profit=sniper_points.get("take_profit"),
+                        analysis_phase=analysis_phase,
+                        effective_trading_date=effective_trading_date,
                         created_at=datetime.now(),
                     )
                 )

@@ -394,6 +394,15 @@ def _persist_market_review_history(
         if market_review_payload:
             context_snapshot["market_review_payload"] = market_review_payload
 
+        # Resolve effective trading date for the primary region
+        try:
+            from src.core.trading_calendar import get_effective_trading_date
+            primary_region = (region.split(",")[0].strip() if region else None) or "cn"
+            effective_date = get_effective_trading_date(primary_region)
+        except Exception:
+            from datetime import date as dt_date
+            effective_date = dt_date.today()
+
         saved = DatabaseManager.get_instance().save_analysis_history(
             result=result,
             query_id=history_query_id,
@@ -401,6 +410,8 @@ def _persist_market_review_history(
             news_content=review_report,
             context_snapshot=context_snapshot,
             save_snapshot=True,
+            analysis_phase="postmarket",
+            effective_trading_date=effective_date,
         )
         if saved:
             logger.info("大盘复盘历史记录已保存: query_id=%s", history_query_id)
