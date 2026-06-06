@@ -21,10 +21,12 @@ export interface AnalysisRequest {
   selectionSource?: 'manual' | 'autocomplete' | 'import' | 'image';
   notify?: boolean;
   skills?: string[];
+  reportLanguage?: ReportLanguage;
 }
 
 export interface MarketReviewRequest {
   sendNotification?: boolean;
+  reportLanguage?: ReportLanguage;
 }
 
 export interface MarketReviewAccepted {

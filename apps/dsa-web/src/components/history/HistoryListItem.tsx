@@ -5,6 +5,8 @@ import { getSentimentColor } from '../../types/analysis';
 import { formatDateTime } from '../../utils/format';
 import { getMarketPhaseSummaryLabel } from '../../utils/marketPhase';
 import { truncateStockName } from '../../utils/stockName';
+import { useUiLanguage } from '../../contexts/UiLanguageContext';
+import type { UiTextKey } from '../../i18n/uiText';
 
 interface HistoryListItemProps {
   item: HistoryItem;
@@ -15,24 +17,24 @@ interface HistoryListItemProps {
   onClick: (recordId: number) => void;
 }
 
-const getOperationBadgeLabel = (advice?: string) => {
+const getOperationBadgeLabel = (advice: string | undefined, t: (key: UiTextKey) => string) => {
   const normalized = advice?.trim();
   if (!normalized) {
-    return '情绪';
+    return t('history.sentiment');
   }
   if (normalized.includes('减仓')) {
-    return '减仓';
+    return t('history.operationReduce');
   }
   if (normalized.includes('卖')) {
-    return '卖出';
+    return t('history.operationSell');
   }
   if (normalized.includes('观望') || normalized.includes('等待')) {
-    return '观望';
+    return t('history.operationHold');
   }
   if (normalized.includes('买') || normalized.includes('布局')) {
-    return '买入';
+    return t('history.operationBuy');
   }
-  return normalized.split(/[，。；、\s]/)[0] || '建议';
+  return normalized.split(/[，。；、\s]/)[0] || t('history.operationAdvice');
 };
 
 export const HistoryListItem: React.FC<HistoryListItemProps> = ({
@@ -43,9 +45,13 @@ export const HistoryListItem: React.FC<HistoryListItemProps> = ({
   onToggleChecked,
   onClick,
 }) => {
+  const { language, t } = useUiLanguage();
   const sentimentColor = item.sentimentScore !== undefined ? getSentimentColor(item.sentimentScore) : null;
   const stockName = item.stockName || item.stockCode;
-  const phaseLabel = getMarketPhaseSummaryLabel(item.marketPhaseSummary, 'zh')?.replace('市场阶段: ', '').replace('市场阶段：', '');
+  const phaseLabel = getMarketPhaseSummaryLabel(item.marketPhaseSummary, language)
+    ?.replace('市场阶段: ', '')
+    .replace('市场阶段：', '')
+    .replace('Market phase: ', '');
 
   return (
     <div className="flex items-start gap-2 group">
@@ -61,7 +67,7 @@ export const HistoryListItem: React.FC<HistoryListItemProps> = ({
       <button
         type="button"
         onClick={() => onClick(item.id)}
-        aria-label={`${stockName} ${item.stockCode} 历史记录`}
+        aria-label={t('history.itemAria', { name: stockName, code: item.stockCode })}
         className={`home-history-item w-full min-w-0 flex-1 text-left p-2.5 group/item ${
           isViewing ? 'home-history-item-selected' : ''
         }`}
@@ -95,7 +101,7 @@ export const HistoryListItem: React.FC<HistoryListItemProps> = ({
                       backgroundColor: `${sentimentColor}10`,
                     }}
                   >
-                    {getOperationBadgeLabel(item.operationAdvice)} {item.sentimentScore}
+                    {getOperationBadgeLabel(item.operationAdvice, t)} {item.sentimentScore}
                   </Badge>
                 )}
               </div>

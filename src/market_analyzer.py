@@ -122,6 +122,7 @@ class MarketAnalyzer:
         search_service: Optional[SearchService] = None,
         analyzer=None,
         region: str = "cn",
+        config: Optional[Any] = None,
     ):
         """
         初始化大盘分析器
@@ -130,8 +131,9 @@ class MarketAnalyzer:
             search_service: 搜索服务实例
             analyzer: AI分析器实例（用于调用LLM）
             region: 市场区域 cn=A股 us=美股
+            config: 本次复盘使用的配置；未传时读取全局配置
         """
-        self.config = get_config()
+        self.config = config or get_config()
         self.search_service = search_service
         self.analyzer = analyzer
         self.data_manager = DataFetcherManager()

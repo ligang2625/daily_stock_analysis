@@ -130,5 +130,5 @@ def perform_market_review(
         notifier=review_notifier,
         analyzer=pipeline.analyzer,
         search_service=pipeline.search_service,
+        config=config,
     )
-

@@ -4,6 +4,7 @@ import { Badge, Button, ScrollArea } from '../common';
 import { DashboardPanelHeader, DashboardStateBlock } from '../dashboard';
 import { StockBarItemComponent } from './StockBarItem';
 import type { StockBarItem as StockBarItemType } from '../../types/analysis';
+import { useUiLanguage } from '../../contexts/UiLanguageContext';
 
 interface StockBarProps {
   items: StockBarItemType[];
@@ -30,6 +31,7 @@ export const StockBar: React.FC<StockBarProps> = ({
   isDeleting = false,
   className = '',
 }) => {
+  const { t } = useUiLanguage();
   const isMarketReview = (code: string) => code === 'MARKET';
   const [selectedCodes, setSelectedCodes] = useState<Set<string>>(new Set());
   const selectAllRef = useRef<HTMLInputElement>(null);
@@ -80,7 +82,7 @@ export const StockBar: React.FC<StockBarProps> = ({
         <div className="mb-4 space-y-3">
           <DashboardPanelHeader
             className="mb-1"
-            title="个股栏"
+            title={t('stockBar.title')}
             titleClassName="text-sm font-medium"
             leading={(
               <svg className="h-4 w-4 text-primary" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -91,10 +93,10 @@ export const StockBar: React.FC<StockBarProps> = ({
             actions={
               selectedCount > 0 ? (
                 <Badge variant="info" size="sm" className="animate-in fade-in zoom-in duration-200">
-                  已选 {selectedCount}
+                  {t('common.selectedCount', { count: selectedCount })}
                 </Badge>
               ) : items.length > 0 ? (
-                <span className="text-[11px] text-muted-text">{items.length}只</span>
+                <span className="text-[11px] text-muted-text">{t('common.itemsCount', { count: items.length })}</span>
               ) : undefined
             }
           />
@@ -112,10 +114,10 @@ export const StockBar: React.FC<StockBarProps> = ({
                   checked={allVisibleSelected}
                   onChange={toggleSelectAll}
                   disabled={isDeleting}
-                  aria-label="全选当前个股"
+                  aria-label={t('history.selectAllStockAria')}
                   className="h-3.5 w-3.5 cursor-pointer bg-transparent accent-primary focus:ring-primary/30 disabled:opacity-50"
                 />
-                <span className="text-[11px] text-muted-text select-none">全选当前</span>
+                <span className="text-[11px] text-muted-text select-none">{t('common.selectAllCurrent')}</span>
               </label>
               <Button
                 variant="danger-subtle"
@@ -125,7 +127,7 @@ export const StockBar: React.FC<StockBarProps> = ({
                 isLoading={isDeleting}
                 className="disabled:!border-transparent disabled:!bg-transparent"
               >
-                {isDeleting ? '删除中' : '删除'}
+                {isDeleting ? t('common.deleting') : t('common.delete')}
               </Button>
             </div>
           )}
@@ -135,12 +137,12 @@ export const StockBar: React.FC<StockBarProps> = ({
           <DashboardStateBlock
             loading
             compact
-            title="加载个股中..."
+            title={t('stockBar.loading')}
           />
         ) : items.length === 0 ? (
           <DashboardStateBlock
-            title="暂无个股记录"
-            description="完成首次分析后，这里将按股票展示最新分析结果。"
+            title={t('stockBar.emptyTitle')}
+            description={t('stockBar.emptyDescription')}
             icon={(
               <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" />

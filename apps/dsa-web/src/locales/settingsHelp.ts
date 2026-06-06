@@ -2014,7 +2014,7 @@ export function getSettingsHelpContent(
 
   if (fallbackDescription) {
     return {
-      title: '配置说明',
+      title: locale?.toLowerCase().startsWith('en') ? 'Configuration help' : '配置说明',
       summary: fallbackDescription,
     };
   }

@@ -11,6 +11,7 @@
 """
 
 import logging
+import copy
 import uuid
 from typing import Optional, Dict, Any, Callable, List
 
@@ -58,6 +59,7 @@ class AnalysisService:
         analysis_phase: str = "auto",
         query_source: str = "api",
         portfolio_context: Optional[Dict[str, Any]] = None,
+        report_language: Optional[str] = None,
     ) -> Optional[Dict[str, Any]]:
         """
         执行股票分析
@@ -98,6 +100,10 @@ class AnalysisService:
             
             # 获取配置
             config = get_config()
+            normalized_report_language = normalize_report_language(report_language, default="")
+            if normalized_report_language:
+                config = copy.copy(config)
+                config.report_language = normalized_report_language
             
             # 创建分析流水线
             pipeline = StockAnalysisPipeline(

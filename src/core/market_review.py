@@ -88,6 +88,7 @@ def run_market_review(
     notifier: NotificationService,
     analyzer: Optional[GeminiAnalyzer] = None,
     search_service: Optional[SearchService] = None,
+    config: Optional[object] = None,
     send_notification: bool = True,
     merge_notification: bool = False,
     override_region: Optional[str] = None,
@@ -101,6 +102,7 @@ def run_market_review(
         notifier: 通知服务
         analyzer: AI分析器（可选）
         search_service: 搜索服务（可选）
+        config: 本次复盘使用的配置（可选，未传时读取全局配置）
         send_notification: 是否发送通知
         merge_notification: 是否合并推送（跳过本次推送，由 main 层合并个股+大盘后统一发送，Issue #190）
         override_region: 覆盖 config 的 market_review_region（Issue #373 交易日过滤后有效子集）
@@ -110,12 +112,12 @@ def run_market_review(
         复盘报告文本
     """
     logger.info("开始执行大盘复盘分析...")
-    config = get_config()
-    review_text = _get_market_review_text(getattr(config, "report_language", "zh"))
+    runtime_config = config or get_config()
+    review_text = _get_market_review_text(getattr(runtime_config, "report_language", "zh"))
     raw_region = (
         override_region
         if override_region is not None
-        else (getattr(config, 'market_review_region', 'cn') or 'cn')
+        else (getattr(runtime_config, 'market_review_region', 'cn') or 'cn')
     )
     run_markets = _resolve_market_review_regions(raw_region)
     persist_region = ','.join(run_markets) if len(run_markets) > 1 else run_markets[0]
@@ -131,7 +133,10 @@ def run_market_review(
                     continue
                 logger.info("生成 %s 大盘复盘报告...", label)
                 mkt_analyzer = MarketAnalyzer(
-                    search_service=search_service, analyzer=analyzer, region=mkt
+                    search_service=search_service,
+                    analyzer=analyzer,
+                    region=mkt,
+                    config=runtime_config,
                 )
                 review_result = mkt_analyzer.run_daily_review_with_snapshot()
                 mkt_report = review_result.report
@@ -153,6 +158,7 @@ def run_market_review(
                 search_service=search_service,
                 analyzer=analyzer,
                 region=run_region,
+                config=runtime_config,
             )
             review_result = market_analyzer.run_daily_review_with_snapshot()
             review_report = review_result.report
@@ -170,7 +176,7 @@ def run_market_review(
                 review_report=review_report,
                 payloads=market_review_payloads,
                 region=persist_region,
-                language=getattr(config, "report_language", "zh"),
+                language=getattr(runtime_config, "report_language", "zh"),
                 root_title=review_text["root_title"],
             )
             markdown_report = _render_market_review_payload_markdown(
@@ -190,7 +196,7 @@ def run_market_review(
                 review_report=review_report,
                 markdown_report=markdown_report,
                 region=persist_region,
-                config=config,
+                config=runtime_config,
                 query_id=query_id,
                 market_light_snapshots=market_light_snapshots,
                 market_review_payload=market_review_payload,
