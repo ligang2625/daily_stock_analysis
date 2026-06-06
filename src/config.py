@@ -596,7 +596,8 @@ def setup_env(override: bool = False):
                   Default is False to preserve behavior on initial load where
                   system environment variables take precedence.
     """
-    Config._capture_bootstrap_runtime_env_overrides()
+    if hasattr(Config, '_capture_bootstrap_runtime_env_overrides'):
+        Config._capture_bootstrap_runtime_env_overrides()
     # src/config.py -> src/ -> root
     env_file = os.getenv("ENV_FILE")
     if env_file:
