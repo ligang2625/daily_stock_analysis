@@ -393,6 +393,26 @@ export function parseApiError(error: unknown): ParsedApiError {
     });
   }
 
+  if (errorCode === 'alphasift_screen_task_not_found') {
+    return createParsedApiError({
+      title: '选股任务不可恢复',
+      message: '服务端没有找到这次选股任务，可能后端已重启或任务记录已清理，请重新运行选股。',
+      rawMessage,
+      status,
+      category: 'http_error',
+    });
+  }
+
+  if (errorCode === 'alphasift_screen_failed') {
+    return createParsedApiError({
+      title: 'AlphaSift 选股失败',
+      message: 'AlphaSift 运行时访问外部行情、快照或模型服务失败，请稍后重试，或检查网络与代理设置。',
+      rawMessage,
+      status,
+      category: 'upstream_network',
+    });
+  }
+
   const noConfiguredLlm = (
     includesAny(matchText, ['all llm models failed']) && includesAny(matchText, ['last error: none'])
   ) || includesAny(matchText, [

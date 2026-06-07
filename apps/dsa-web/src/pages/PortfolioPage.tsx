@@ -5,6 +5,9 @@ import { portfolioApi } from '../api/portfolio';
 import type { ParsedApiError } from '../api/error';
 import { getParsedApiError } from '../api/error';
 import { ApiErrorAlert, Card, Badge, ConfirmDialog, EmptyState, InlineAlert } from '../components/common';
+import { useUiLanguage } from '../contexts/UiLanguageContext';
+import { formatUiText } from '../i18n/uiText';
+import { PORTFOLIO_TEXT } from '../locales/featureText';
 import type { FxRefreshFeedback } from '../utils/portfolioFormat';
 import {
   buildFxRefreshFeedback,
@@ -74,10 +77,13 @@ const PORTFOLIO_FILE_PICKER_CLASS =
   'input-surface input-focus-glow flex h-11 w-full cursor-pointer items-center justify-center rounded-xl border bg-transparent px-4 text-sm transition-all focus:outline-none disabled:cursor-not-allowed disabled:opacity-60';
 
 const PortfolioPage: React.FC = () => {
+  const { language } = useUiLanguage();
+  const text = PORTFOLIO_TEXT[language];
+
   // Set page title
   useEffect(() => {
-    document.title = '持仓分析 - DSA';
-  }, []);
+    document.title = text.documentTitle;
+  }, [text.documentTitle]);
 
   const [accounts, setAccounts] = useState<PortfolioAccountItem[]>([]);
   const [selectedAccount, setSelectedAccount] = useState<AccountOption>('all');
@@ -699,22 +705,22 @@ const PortfolioPage: React.FC = () => {
     <div className="portfolio-page min-h-screen space-y-4 p-4 md:p-6">
       <section className="space-y-3">
         <div className="space-y-2">
-          <h1 className="text-xl md:text-2xl font-semibold text-foreground">持仓管理</h1>
+          <h1 className="text-xl md:text-2xl font-semibold text-foreground">{text.title}</h1>
           <p className="text-xs md:text-sm text-secondary">
-            组合快照、手工录入、CSV 导入与风险分析（支持全组合 / 单账户切换）
+            {text.description}
           </p>
         </div>
         {hasAccounts ? (
           <div className="rounded-xl border border-white/10 bg-white/[0.02] p-3">
             <div className="grid grid-cols-1 xl:grid-cols-[minmax(0,1fr)_220px_280px] gap-2 items-end">
               <div>
-                <p className="text-xs text-secondary mb-1">账户视图</p>
+                <p className="text-xs text-secondary mb-1">{text.accountView}</p>
                 <select
                   value={String(selectedAccount)}
                   onChange={(e) => setSelectedAccount(e.target.value === 'all' ? 'all' : Number(e.target.value))}
                   className={PORTFOLIO_SELECT_CLASS}
                 >
-                  <option value="all">全部账户</option>
+                  <option value="all">{text.allAccounts}</option>
                   {accounts.map((account) => (
                     <option key={account.id} value={account.id}>
                       {account.name} (#{account.id})
@@ -723,14 +729,14 @@ const PortfolioPage: React.FC = () => {
                 </select>
               </div>
               <div>
-                <p className="text-xs text-secondary mb-1">成本口径</p>
+                <p className="text-xs text-secondary mb-1">{text.costMethod}</p>
                 <select
                   value={costMethod}
                   onChange={(e) => setCostMethod(e.target.value as PortfolioCostMethod)}
                   className={PORTFOLIO_SELECT_CLASS}
                 >
-                  <option value="fifo">先进先出（FIFO）</option>
-                  <option value="avg">均价成本（AVG）</option>
+                  <option value="fifo">{text.fifo}</option>
+                  <option value="avg">{text.avg}</option>
                 </select>
               </div>
               <div className="flex gap-2">
@@ -743,7 +749,7 @@ const PortfolioPage: React.FC = () => {
                     setAccountCreateSuccess(null);
                   }}
                 >
-                  {showCreateAccount ? '收起新建' : '新建账户'}
+                  {showCreateAccount ? text.collapseCreate : text.createAccount}
                 </button>
                 <button
                   type="button"
@@ -751,7 +757,7 @@ const PortfolioPage: React.FC = () => {
                   disabled={isLoading || fxRefreshing}
                   className="btn-secondary text-sm flex-1"
                 >
-                  {isLoading ? '刷新中...' : '刷新数据'}
+                  {isLoading ? text.refreshing : text.refreshData}
                 </button>
               </div>
             </div>
@@ -760,7 +766,7 @@ const PortfolioPage: React.FC = () => {
           <InlineAlert
             variant="warning"
             className="inline-block rounded-lg px-3 py-2 text-xs shadow-none"
-            message="还没有可用账户，请先创建账户后再录入交易或导入 CSV。"
+            message={text.noAccounts}
           />
         )}
       </section>
@@ -769,21 +775,21 @@ const PortfolioPage: React.FC = () => {
       {riskWarning ? (
         <InlineAlert
           variant="warning"
-          title="风险模块降级"
+          title={text.riskDegraded}
           message={riskWarning}
         />
       ) : null}
       {writeWarning ? (
         <InlineAlert
           variant="warning"
-          title="操作提示"
+          title={text.operationHint}
           message={writeWarning}
         />
       ) : null}
       {positionAnalysisMessage ? (
         <InlineAlert
           variant="success"
-          title="分析任务"
+          title={text.analysisTask}
           message={positionAnalysisMessage}
         />
       ) : null}
@@ -861,34 +867,34 @@ const PortfolioPage: React.FC = () => {
 
       <section className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-3">
         <Card variant="gradient" padding="md">
-          <p className="text-xs text-secondary">总权益</p>
+          <p className="text-xs text-secondary">{text.totalEquity}</p>
           <p className="mt-1 text-xl font-semibold text-foreground">{formatMoney(snapshot?.totalEquity, snapshot?.currency || 'CNY')}</p>
         </Card>
         <Card variant="gradient" padding="md">
-          <p className="text-xs text-secondary">总市值</p>
+          <p className="text-xs text-secondary">{text.totalMarketValue}</p>
           <p className="mt-1 text-xl font-semibold text-foreground">{formatMoney(snapshot?.totalMarketValue, snapshot?.currency || 'CNY')}</p>
         </Card>
         <Card variant="gradient" padding="md">
-          <p className="text-xs text-secondary">总现金</p>
+          <p className="text-xs text-secondary">{text.totalCash}</p>
           <p className="mt-1 text-xl font-semibold text-foreground">{formatMoney(snapshot?.totalCash, snapshot?.currency || 'CNY')}</p>
         </Card>
         <Card variant="gradient" padding="md">
           <div className="flex items-start justify-between gap-3">
-            <p className="text-xs text-secondary">汇率状态</p>
+            <p className="text-xs text-secondary">{text.fxStatus}</p>
             <button
               type="button"
               className="btn-secondary !px-3 !py-1 !text-xs shrink-0"
               onClick={() => void handleRefreshFx()}
               disabled={!hasAccounts || isLoading || fxRefreshing}
             >
-              {fxRefreshing ? '刷新中...' : '刷新汇率'}
+              {fxRefreshing ? text.refreshing : text.refreshFx}
             </button>
           </div>
-          <div className="mt-2">{snapshot?.fxStale ? <Badge variant="warning">过期</Badge> : <Badge variant="success">最新</Badge>}</div>
+          <div className="mt-2">{snapshot?.fxStale ? <Badge variant="warning">{text.stale}</Badge> : <Badge variant="success">{text.latest}</Badge>}</div>
           {fxRefreshFeedback ? (
             <InlineAlert
               variant={getFxRefreshFeedbackVariant(fxRefreshFeedback.tone)}
-              title="汇率刷新结果"
+              title={text.fxRefreshResult}
               message={fxRefreshFeedback.text}
               className="mt-3 rounded-xl px-3 py-2 text-xs shadow-none"
             />
@@ -899,13 +905,13 @@ const PortfolioPage: React.FC = () => {
       <section className="grid grid-cols-1 xl:grid-cols-3 gap-3">
         <Card className="xl:col-span-2" padding="md">
           <div className="flex items-center justify-between mb-3">
-            <h2 className="text-sm font-semibold text-foreground">持仓明细</h2>
-            <span className="text-xs text-secondary">共 {positionRows.length} 项</span>
+            <h2 className="text-sm font-semibold text-foreground">{text.positionsTitle}</h2>
+            <span className="text-xs text-secondary">{formatUiText(text.countItems, { count: positionRows.length })}</span>
           </div>
           {positionRows.length === 0 ? (
             <EmptyState
-              title="当前无持仓数据"
-              description="录入交易或导入 CSV 后，这里会展示按账户汇总的持仓明细。"
+              title={text.noPositionsTitle}
+              description={text.noPositionsDescription}
               className="border-none bg-transparent px-4 py-8 shadow-none"
             />
           ) : (
@@ -913,15 +919,15 @@ const PortfolioPage: React.FC = () => {
               <table className="w-full text-sm">
                 <thead className="text-xs text-secondary border-b border-white/10">
                   <tr>
-                    <th className="text-left py-2 pr-2">账户</th>
-                    <th className="text-left py-2 pr-2">代码</th>
-                    <th className="text-right py-2 pr-2">数量</th>
-                    <th className="text-right py-2 pr-2">均价</th>
-                    <th className="text-right py-2 pr-2">现价</th>
-                    <th className="text-right py-2 pr-2">市值</th>
-                    <th className="text-right py-2">未实现盈亏</th>
-                    <th className="text-right py-2">收益率</th>
-                    <th className="text-right py-2">操作</th>
+                    <th className="text-left py-2 pr-2">{text.account}</th>
+                    <th className="text-left py-2 pr-2">{text.code}</th>
+                    <th className="text-right py-2 pr-2">{text.quantity}</th>
+                    <th className="text-right py-2 pr-2">{text.avgCost}</th>
+                    <th className="text-right py-2 pr-2">{text.lastPrice}</th>
+                    <th className="text-right py-2 pr-2">{text.marketValue}</th>
+                    <th className="text-right py-2">{text.unrealizedPnl}</th>
+                    <th className="text-right py-2">{text.returnPct}</th>
+                    <th className="text-right py-2">{text.action}</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -970,7 +976,7 @@ const PortfolioPage: React.FC = () => {
                           disabled={analyzing}
                           className="btn-secondary px-2 py-1 text-xs disabled:cursor-wait disabled:opacity-60"
                         >
-                          {analyzing ? '提交中' : '分析'}
+                          {analyzing ? text.submitting : text.analyze}
                         </button>
                       </td>
                     </tr>
@@ -983,7 +989,9 @@ const PortfolioPage: React.FC = () => {
         </Card>
 
         <Card padding="md">
-          <h2 className="text-sm font-semibold text-foreground mb-3">{concentrationMode === 'sector' ? '行业集中度分布' : '行业数据暂不可用，当前展示个股集中度'}</h2>
+          <h2 className="text-sm font-semibold text-foreground mb-3">
+            {concentrationMode === 'sector' ? text.sectorConcentration : text.positionConcentrationFallback}
+          </h2>
           {concentrationPieData.length > 0 ? (
             <div className="h-64">
               <ResponsiveContainer width="100%" height="100%">
@@ -1000,15 +1008,15 @@ const PortfolioPage: React.FC = () => {
             </div>
           ) : (
             <EmptyState
-              title="暂无集中度数据"
-              description="风险模块完成计算后，这里会展示行业或个股维度的集中度分布。"
+              title={text.noConcentrationTitle}
+              description={text.noConcentrationDescription}
               className="border-none bg-transparent px-4 py-10 shadow-none"
             />
           )}
           <div className="mt-3 text-xs text-secondary space-y-1">
-            <div>展示口径: {concentrationMode === 'sector' ? '行业维度' : '个股维度（降级显示）'}</div>
-            <div>板块集中度告警: {risk?.sectorConcentration?.alert ? '是' : '否'}</div>
-            <div>Top1 权重: {formatPct(risk?.sectorConcentration?.topWeightPct ?? risk?.concentration?.topWeightPct)}</div>
+            <div>{text.displayScope}: {concentrationMode === 'sector' ? text.sectorDimension : text.positionDimensionFallback}</div>
+            <div>{text.sectorAlert}: {risk?.sectorConcentration?.alert ? text.yes : text.no}</div>
+            <div>{text.topWeight}: {formatPct(risk?.sectorConcentration?.topWeightPct ?? risk?.concentration?.topWeightPct)}</div>
           </div>
         </Card>
       </section>
@@ -1017,33 +1025,33 @@ const PortfolioPage: React.FC = () => {
         <InlineAlert
           variant="warning"
           className="rounded-lg px-3 py-2 text-xs shadow-none"
-          message="当前处于“全部账户”视图。为避免误写，请先选择一个具体账户后再进行手工录入或 CSV 提交。"
+          message={text.writeBlocked}
         />
       ) : null}
 
       <section className="grid grid-cols-1 md:grid-cols-3 gap-3">
         <Card padding="md">
-          <h3 className="text-sm font-semibold text-foreground mb-2">回撤监控</h3>
+          <h3 className="text-sm font-semibold text-foreground mb-2">{text.drawdownMonitor}</h3>
           <div className="text-xs text-secondary space-y-1">
-            <div>最大回撤: {formatPct(risk?.drawdown?.maxDrawdownPct)}</div>
-            <div>当前回撤: {formatPct(risk?.drawdown?.currentDrawdownPct)}</div>
-            <div>告警: {risk?.drawdown?.alert ? '是' : '否'}</div>
+            <div>{text.maxDrawdown}: {formatPct(risk?.drawdown?.maxDrawdownPct)}</div>
+            <div>{text.currentDrawdown}: {formatPct(risk?.drawdown?.currentDrawdownPct)}</div>
+            <div>{text.alert}: {risk?.drawdown?.alert ? text.yes : text.no}</div>
           </div>
         </Card>
         <Card padding="md">
-          <h3 className="text-sm font-semibold text-foreground mb-2">止损接近预警</h3>
+          <h3 className="text-sm font-semibold text-foreground mb-2">{text.stopLossWarning}</h3>
           <div className="text-xs text-secondary space-y-1">
-            <div>触发数: {risk?.stopLoss?.triggeredCount ?? 0}</div>
-            <div>接近数: {risk?.stopLoss?.nearCount ?? 0}</div>
-            <div>告警: {risk?.stopLoss?.nearAlert ? '是' : '否'}</div>
+            <div>{text.triggeredCount}: {risk?.stopLoss?.triggeredCount ?? 0}</div>
+            <div>{text.nearCount}: {risk?.stopLoss?.nearCount ?? 0}</div>
+            <div>{text.alert}: {risk?.stopLoss?.nearAlert ? text.yes : text.no}</div>
           </div>
         </Card>
         <Card padding="md">
-          <h3 className="text-sm font-semibold text-foreground mb-2">口径</h3>
+          <h3 className="text-sm font-semibold text-foreground mb-2">{text.scope}</h3>
           <div className="text-xs text-secondary space-y-1">
-            <div>账户数: {snapshot?.accountCount ?? 0}</div>
-            <div>计价币种: {snapshot?.currency || 'CNY'}</div>
-            <div>成本法: {(snapshot?.costMethod || costMethod).toUpperCase()}</div>
+            <div>{text.accountCount}: {snapshot?.accountCount ?? 0}</div>
+            <div>{text.currency}: {snapshot?.currency || 'CNY'}</div>
+            <div>{text.costMethodShort}: {(snapshot?.costMethod || costMethod).toUpperCase()}</div>
           </div>
         </Card>
       </section>

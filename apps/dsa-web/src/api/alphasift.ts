@@ -119,6 +119,26 @@ export type AlphaSiftScreenResponse = {
   };
 };
 
+export type AlphaSiftScreenAccepted = {
+  taskId: string;
+  traceId?: string | null;
+  status: 'pending' | 'processing' | 'completed' | 'failed' | string;
+  message: string;
+  strategy: string;
+  market: string;
+  maxResults: number;
+};
+
+export type AlphaSiftScreenTaskStatus = {
+  taskId: string;
+  traceId?: string | null;
+  status: 'pending' | 'processing' | 'completed' | 'failed' | string;
+  progress?: number | null;
+  message?: string | null;
+  error?: string | null;
+  result?: AlphaSiftScreenResponse | null;
+};
+
 export function notifyAlphaSiftConfigChanged(): void {
   window.dispatchEvent(new Event(ALPHASIFT_CONFIG_CHANGED_EVENT));
   notifySystemConfigChanged();
@@ -152,6 +172,20 @@ export const alphasiftApi = {
       max_results: payload.maxResults,
     }, { timeout: ALPHASIFT_SCREEN_TIMEOUT_MS });
     return toCamelCase<AlphaSiftScreenResponse>(response.data);
+  },
+
+  async startScreen(payload: { market: string; strategy: string; maxResults: number }): Promise<AlphaSiftScreenAccepted> {
+    const response = await apiClient.post<Record<string, unknown>>('/api/v1/alphasift/screen/tasks', {
+      market: payload.market,
+      strategy: payload.strategy,
+      max_results: payload.maxResults,
+    });
+    return toCamelCase<AlphaSiftScreenAccepted>(response.data);
+  },
+
+  async getScreenTask(taskId: string): Promise<AlphaSiftScreenTaskStatus> {
+    const response = await apiClient.get<Record<string, unknown>>(`/api/v1/alphasift/screen/tasks/${encodeURIComponent(taskId)}`);
+    return toCamelCase<AlphaSiftScreenTaskStatus>(response.data);
   },
 
   async getStrategies(): Promise<AlphaSiftStrategiesResponse> {

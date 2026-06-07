@@ -2,19 +2,61 @@ import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import StockScreeningPage from '../StockScreeningPage';
 
-const { enableAlphaSift, getAlphaSiftStatus, getStrategies, screenStocks } = vi.hoisted(() => ({
-  enableAlphaSift: vi.fn(),
-  getAlphaSiftStatus: vi.fn(),
-  getStrategies: vi.fn(),
-  screenStocks: vi.fn(),
-}));
+const {
+  enableAlphaSift,
+  getAlphaSiftStatus,
+  getStrategies,
+  getScreenTask,
+  resetLastScreenResult,
+  screenStocks,
+  startScreenTask,
+} = vi.hoisted(() => {
+  let lastScreenResult: unknown = null;
+  const screenStocks = vi.fn();
+  const startScreenTask = vi.fn(async (payload: unknown) => {
+    lastScreenResult = await screenStocks(payload);
+    return {
+      taskId: 'screen-task-1',
+      traceId: 'screen-task-1',
+      status: 'pending',
+      message: 'AlphaSift 选股任务已提交',
+      strategy: 'dual_low',
+      market: 'cn',
+      maxResults: 3,
+    };
+  });
+  const getScreenTask = vi.fn(async (taskId: string) => {
+    void taskId;
+    return {
+      taskId: 'screen-task-1',
+      traceId: 'screen-task-1',
+      status: 'completed',
+      progress: 100,
+      message: '任务执行完成',
+      result: lastScreenResult,
+    };
+  });
+  return {
+    enableAlphaSift: vi.fn(),
+    getAlphaSiftStatus: vi.fn(),
+    getStrategies: vi.fn(),
+    getScreenTask,
+    resetLastScreenResult: () => {
+      lastScreenResult = null;
+    },
+    screenStocks,
+    startScreenTask,
+  };
+});
 
 vi.mock('../../api/alphasift', () => ({
   alphasiftApi: {
-    enable: (...args: unknown[]) => enableAlphaSift(...args),
-    getStatus: (...args: unknown[]) => getAlphaSiftStatus(...args),
-    getStrategies: (...args: unknown[]) => getStrategies(...args),
-    screen: (...args: unknown[]) => screenStocks(...args),
+    enable: () => enableAlphaSift(),
+    getStatus: () => getAlphaSiftStatus(),
+    getStrategies: () => getStrategies(),
+    getScreenTask: (taskId: string) => getScreenTask(taskId),
+    screen: (payload: unknown) => screenStocks(payload),
+    startScreen: (payload: unknown) => startScreenTask(payload),
   },
 }));
 
@@ -40,8 +82,12 @@ describe('StockScreeningPage', () => {
     enableAlphaSift.mockReset();
     getAlphaSiftStatus.mockReset();
     getStrategies.mockReset();
+    getScreenTask.mockClear();
+    resetLastScreenResult();
     screenStocks.mockReset();
+    startScreenTask.mockClear();
     getStrategies.mockResolvedValue(mockStrategiesResponse);
+    window.sessionStorage.clear();
   });
 
   it('re-syncs enabled state when AlphaSift availability check fails after config is enabled', async () => {
@@ -191,6 +237,98 @@ describe('StockScreeningPage', () => {
     expect(screen.getByText('当前策略：资金热度 · A 股')).toBeInTheDocument();
   });
 
+  it('restores an in-flight screening task after remounting the page', async () => {
+    getAlphaSiftStatus.mockResolvedValue({
+      enabled: true,
+      available: true,
+      installSpecIsDefault: true,
+    });
+    screenStocks.mockResolvedValueOnce({
+      enabled: true,
+      candidates: [
+        {
+          rank: 1,
+          code: '000001',
+          name: '恢复后的候选',
+          score: 88.5,
+          reason: 'restored result',
+          raw: {},
+        },
+      ],
+      candidateCount: 1,
+    });
+    getScreenTask
+      .mockResolvedValueOnce({
+        taskId: 'screen-task-1',
+        traceId: 'screen-task-1',
+        status: 'processing',
+        progress: 35,
+        message: '正在执行 AlphaSift 选股',
+        result: null,
+      })
+      .mockResolvedValueOnce({
+        taskId: 'screen-task-1',
+        traceId: 'screen-task-1',
+        status: 'completed',
+        progress: 100,
+        message: '任务执行完成',
+        result: {
+          enabled: true,
+          candidates: [
+            {
+              rank: 1,
+              code: '000001',
+              name: '恢复后的候选',
+              score: 88.5,
+              reason: 'restored result',
+              raw: {},
+            },
+          ],
+          candidateCount: 1,
+        },
+      });
+
+    const firstRender = render(<StockScreeningPage />);
+
+    expect(await screen.findByText('选股已开启')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: /运行选股/ }));
+
+    expect(await screen.findByText('选股运行中')).toBeInTheDocument();
+    expect(window.sessionStorage.getItem('dsa.alphasift.activeScreenTask.v1')).toContain('screen-task-1');
+
+    firstRender.unmount();
+    render(<StockScreeningPage />);
+
+    expect(await screen.findByText('恢复后的候选')).toBeInTheDocument();
+    expect(screen.getByText('选股完成')).toBeInTheDocument();
+    expect(window.sessionStorage.getItem('dsa.alphasift.activeScreenTask.v1')).toBeNull();
+  });
+
+  it('keeps a restored screening task recoverable when status polling times out', async () => {
+    getAlphaSiftStatus.mockResolvedValue({
+      enabled: true,
+      available: true,
+      installSpecIsDefault: true,
+    });
+    window.sessionStorage.setItem('dsa.alphasift.activeScreenTask.v1', JSON.stringify({
+      taskId: 'screen-task-1',
+      market: 'cn',
+      strategy: 'dual_low',
+      maxResults: 3,
+    }));
+    getScreenTask.mockRejectedValueOnce(Object.assign(new Error('timeout of 30000ms exceeded'), {
+      code: 'ECONNABORTED',
+    }));
+
+    render(<StockScreeningPage />);
+
+    expect(await screen.findByText('选股任务运行中')).toBeInTheDocument();
+    await waitFor(() => expect(getScreenTask).toHaveBeenCalledTimes(1));
+    expect(screen.getByText('选股运行中')).toBeInTheDocument();
+    expect(screen.getByText(/连接上游服务超时/)).toBeInTheDocument();
+    expect(window.sessionStorage.getItem('dsa.alphasift.activeScreenTask.v1')).toContain('screen-task-1');
+  });
+
   it('surfaces AlphaSift LLM fallback instead of showing empty LLM fields as normal', async () => {
     getAlphaSiftStatus.mockResolvedValueOnce({
       enabled: true,
@@ -300,9 +438,10 @@ describe('StockScreeningPage', () => {
     expect(await screen.findByText('选股已开启')).toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: /运行选股/ }));
 
-    const alert = await screen.findByRole('alert');
+    const efinanceWarning = await screen.findByText('数据源降级：efinance（网络连接中断）');
+    const alert = efinanceWarning.closest('[role="alert"]');
     expect(alert).toHaveClass('max-w-full');
-    expect(screen.getByText('数据源降级：efinance（网络连接中断）')).toBeInTheDocument();
+    expect(efinanceWarning).toBeInTheDocument();
     expect(screen.getByText('数据源降级：akshare_em（网络连接中断）')).toBeInTheDocument();
     expect(screen.queryByText(/HTTPConnectionPool/)).not.toBeInTheDocument();
     expect(screen.queryByText(/\/api\/qt\/clist\/get/)).not.toBeInTheDocument();

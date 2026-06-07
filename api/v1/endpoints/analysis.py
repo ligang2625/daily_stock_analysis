@@ -107,26 +107,6 @@ def _market_review_lock_path(config: Config) -> Path:
     return market_review_lock_path(config)
 
 
-def _compute_market_review_override_region(config: Config) -> Optional[str]:
-    if not getattr(config, "trading_day_check_enabled", True):
-        return None
-
-    try:
-        from src.core.trading_calendar import (
-            get_open_markets_today,
-            compute_effective_region,
-        )
-
-        open_markets = get_open_markets_today()
-        return compute_effective_region(
-            getattr(config, "market_review_region", "cn") or "cn",
-            open_markets,
-        )
-    except Exception as exc:
-        logger.warning("大盘复盘交易日过滤失败，按配置继续执行: %s", exc)
-        return None
-
-
 def _build_market_review_runtime(config: Config, source_message: Optional[Any] = None) -> tuple[Any, Any, Any]:
     return _runtime_build_market_review_runtime(config, source_message)
 
@@ -494,7 +474,7 @@ def _handle_sync_analysis(
         500: {"description": "提交失败", "model": ErrorResponse},
     },
     summary="触发大盘复盘",
-    description="提交一个后台大盘复盘任务，复用 CLI 的大盘复盘链路并保存报告。接口内部仅提供进程内/单机防重，如多实例（多 Worker/多容器）部署，需结合外部幂等机制避免重复触发。",
+    description="提交一个后台大盘复盘任务，复用 CLI 的大盘复盘运行时装配并保存报告。该人工触发入口不按交易日检查跳过；接口内部仅提供进程内/单机防重，如多实例（多 Worker/多容器）部署，需结合外部幂等机制避免重复触发。",
 )
 def trigger_market_review(
     request: Optional[MarketReviewRequest] = Body(None),
@@ -507,14 +487,6 @@ def trigger_market_review(
         config,
         getattr(request, "report_language", None),
     )
-    override_region = _compute_market_review_override_region(runtime_config)
-    if override_region == "":
-        return MarketReviewAccepted(
-            status="accepted",
-            message="今日大盘复盘相关市场均为非交易日，已跳过大盘复盘",
-            send_notification=request.send_notification,
-            trace_id=None,
-        )
 
     lock_token = _try_acquire_market_review_lock(runtime_config)
     if lock_token is None:
@@ -525,7 +497,7 @@ def trigger_market_review(
         task = get_task_queue().submit_background_task(
             lambda: _run_market_review_background(
                 request.send_notification,
-                override_region=override_region,
+                override_region=None,
                 lock_token=lock_token,
                 config=runtime_config,
                 query_id=task_id,

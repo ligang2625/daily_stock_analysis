@@ -5,11 +5,66 @@ import {
   alphasiftApi,
   type AlphaSiftCandidate,
   type AlphaSiftScreenResponse,
+  type AlphaSiftScreenTaskStatus,
   type AlphaSiftStrategy,
 } from '../api/alphasift';
+import { formatParsedApiError, getParsedApiError, toApiErrorMessage, type ParsedApiError } from '../api/error';
 import { AppPage, Button, InlineAlert } from '../components/common';
 
 const MARKETS = [{ id: 'cn', label: 'A 股' }];
+const SCREEN_TASK_STORAGE_KEY = 'dsa.alphasift.activeScreenTask.v1';
+const SCREEN_TASK_POLL_INTERVAL_MS = 2000;
+
+type PersistedScreenTask = {
+  taskId: string;
+  market: string;
+  strategy: string;
+  maxResults: number;
+};
+
+const readPersistedScreenTask = (): PersistedScreenTask | null => {
+  if (typeof window === 'undefined') {
+    return null;
+  }
+  try {
+    const raw = window.sessionStorage.getItem(SCREEN_TASK_STORAGE_KEY);
+    if (!raw) {
+      return null;
+    }
+    const parsed = JSON.parse(raw) as Partial<PersistedScreenTask>;
+    if (typeof parsed.taskId !== 'string' || !parsed.taskId.trim()) {
+      return null;
+    }
+    const restoredMaxResults = Number(parsed.maxResults);
+    return {
+      taskId: parsed.taskId,
+      market: typeof parsed.market === 'string' && parsed.market.trim() ? parsed.market : 'cn',
+      strategy: typeof parsed.strategy === 'string' && parsed.strategy.trim() ? parsed.strategy : 'dual_low',
+      maxResults: Number.isFinite(restoredMaxResults) ? Math.min(100, Math.max(1, restoredMaxResults)) : 3,
+    };
+  } catch {
+    return null;
+  }
+};
+
+const persistScreenTask = (task: PersistedScreenTask) => {
+  try {
+    window.sessionStorage.setItem(SCREEN_TASK_STORAGE_KEY, JSON.stringify(task));
+  } catch {
+    // Session storage is best-effort; polling still works while the page stays mounted.
+  }
+};
+
+const clearPersistedScreenTask = () => {
+  try {
+    window.sessionStorage.removeItem(SCREEN_TASK_STORAGE_KEY);
+  } catch {
+    // Ignore storage cleanup failures.
+  }
+};
+
+const isUnrecoverableScreenTaskError = (error: ParsedApiError) =>
+  error.title === '选股任务不可恢复';
 
 const formatScore = (score: AlphaSiftCandidate['score']) => {
   if (score == null || Number.isNaN(Number(score))) {
@@ -176,6 +231,16 @@ const getScreenMessages = (meta: AlphaSiftScreenResponse | null) => {
   return messages;
 };
 
+const isRunningScreenTask = (status: string | undefined | null) => status === 'pending' || status === 'processing';
+
+const formatScreenTaskFailure = (value: string | null | undefined) => {
+  const text = String(value || '').trim();
+  if (!text) {
+    return '选股任务失败，请稍后重试。';
+  }
+  return `选股任务失败：${summarizeAlphaSiftDiagnostic(text)}`;
+};
+
 const ScreenAlertMessage: React.FC<{ messages: string[] }> = ({ messages }) => {
   if (messages.length <= 1) {
     return <span>{messages[0]}</span>;
@@ -200,20 +265,24 @@ const hasLlmInsight = (item: AlphaSiftCandidate) =>
   );
 
 const StockScreeningPage: React.FC = () => {
+  const [restoredTask] = useState<PersistedScreenTask | null>(() => readPersistedScreenTask());
   const [enabled, setEnabled] = useState(false);
   const [available, setAvailable] = useState(false);
-  const [market, setMarket] = useState('cn');
-  const [strategy, setStrategy] = useState('dual_low');
+  const [market, setMarket] = useState(restoredTask?.market || 'cn');
+  const [strategy, setStrategy] = useState(restoredTask?.strategy || 'dual_low');
   const [strategies, setStrategies] = useState<AlphaSiftStrategy[]>([]);
-  const [maxResults, setMaxResults] = useState(3);
+  const [maxResults, setMaxResults] = useState(restoredTask?.maxResults || 3);
   const [candidates, setCandidates] = useState<AlphaSiftCandidate[]>([]);
   const [screenMeta, setScreenMeta] = useState<AlphaSiftScreenResponse | null>(null);
   const [expandedCode, setExpandedCode] = useState<string | null>(null);
-  const [loading, setLoading] = useState(false);
+  const [loading, setLoading] = useState(Boolean(restoredTask?.taskId));
   const [enabling, setEnabling] = useState(false);
   const [loadingStrategies, setLoadingStrategies] = useState(false);
   const [error, setError] = useState('');
   const [strategyLoadError, setStrategyLoadError] = useState('');
+  const [activeTaskId, setActiveTaskId] = useState<string | null>(restoredTask?.taskId ?? null);
+  const [taskProgress, setTaskProgress] = useState(restoredTask?.taskId ? 10 : 0);
+  const [taskMessage, setTaskMessage] = useState(restoredTask?.taskId ? '正在恢复选股任务状态...' : '');
 
   const selectedStrategy = useMemo(() => strategies.find((item) => item.id === strategy), [strategies, strategy]);
   const selectedStrategyTitle = selectedStrategy?.name || selectedStrategy?.title || '自定义策略';
@@ -228,6 +297,13 @@ const StockScreeningPage: React.FC = () => {
     : screenMessages;
   const isScreeningEnabled = enabled && available;
   const statusText = isScreeningEnabled ? '选股已开启' : '选股未开启';
+
+  const applyScreenResult = useCallback((result: AlphaSiftScreenResponse) => {
+    const nextCandidates = result.candidates || [];
+    setScreenMeta(result);
+    setCandidates(nextCandidates);
+    setExpandedCode(nextCandidates[0]?.code ?? null);
+  }, []);
 
   const clearScreeningResults = () => {
     setCandidates([]);
@@ -280,6 +356,92 @@ const StockScreeningPage: React.FC = () => {
     };
   }, [loadStrategies]);
 
+  useEffect(() => {
+    if (!activeTaskId) {
+      return undefined;
+    }
+
+    const pollingTaskId = activeTaskId;
+    let active = true;
+    let timer: ReturnType<typeof window.setTimeout> | undefined;
+
+    function finishTask() {
+      clearPersistedScreenTask();
+      setActiveTaskId(null);
+      setLoading(false);
+    }
+
+    function applyTaskStatus(task: AlphaSiftScreenTaskStatus) {
+      const nextProgress = Number(task.progress ?? 0);
+      setTaskProgress(Number.isFinite(nextProgress) ? nextProgress : 0);
+      setTaskMessage(task.message || '');
+
+      if (task.status === 'completed') {
+        if (task.result) {
+          applyScreenResult(task.result);
+          setError('');
+        } else {
+          setError('选股任务已完成，但服务端未返回候选结果。');
+          setCandidates([]);
+          setScreenMeta(null);
+        }
+        finishTask();
+        return;
+      }
+
+      if (task.status === 'failed') {
+        setCandidates([]);
+        setScreenMeta(null);
+        setExpandedCode(null);
+        setError(formatScreenTaskFailure(task.error || task.message));
+        finishTask();
+        return;
+      }
+
+      if (isRunningScreenTask(task.status)) {
+        setLoading(true);
+        timer = window.setTimeout(pollTask, SCREEN_TASK_POLL_INTERVAL_MS);
+        return;
+      }
+
+      setError(`选股任务返回未知状态：${task.status || 'unknown'}`);
+      finishTask();
+    }
+
+    async function pollTask() {
+      try {
+        const task = await alphasiftApi.getScreenTask(pollingTaskId);
+        if (!active) {
+          return;
+        }
+        applyTaskStatus(task);
+      } catch (err) {
+        if (!active) {
+          return;
+        }
+        const parsedError = getParsedApiError(err);
+        setError(formatParsedApiError(parsedError) || '暂时无法获取选股任务状态，稍后将自动重试。');
+        if (isUnrecoverableScreenTaskError(parsedError)) {
+          setCandidates([]);
+          setScreenMeta(null);
+          finishTask();
+          return;
+        }
+        setLoading(true);
+        timer = window.setTimeout(pollTask, SCREEN_TASK_POLL_INTERVAL_MS);
+      }
+    }
+
+    void pollTask();
+
+    return () => {
+      active = false;
+      if (timer) {
+        window.clearTimeout(timer);
+      }
+    };
+  }, [activeTaskId, applyScreenResult]);
+
   const handleEnable = async () => {
     setEnabling(true);
     setError('');
@@ -328,16 +490,23 @@ const StockScreeningPage: React.FC = () => {
     setLoading(true);
     setError('');
     setScreenMeta(null);
+    setTaskProgress(0);
+    setTaskMessage('正在提交选股任务...');
     try {
-      const result = await alphasiftApi.screen({ market, strategy, maxResults });
-      setScreenMeta(result);
-      setCandidates(result.candidates);
-      setExpandedCode(result.candidates[0]?.code ?? null);
+      const task = await alphasiftApi.startScreen({ market, strategy, maxResults });
+      persistScreenTask({
+        taskId: task.taskId,
+        market,
+        strategy,
+        maxResults,
+      });
+      setActiveTaskId(task.taskId);
+      setTaskProgress(0);
+      setTaskMessage(task.message || 'AlphaSift 选股任务已提交');
     } catch (err) {
       setCandidates([]);
-      setError(err instanceof Error ? err.message : '选股失败');
-    } finally {
       setLoading(false);
+      setError(toApiErrorMessage(err, '选股任务提交失败，请稍后重试。'));
     }
   };
 
@@ -387,6 +556,14 @@ const StockScreeningPage: React.FC = () => {
         message="AlphaSift 选股仍处于实验性质，结果仅用于研究和辅助判断，不构成投资建议；市场有风险，交易决策和损益由使用者自行承担。"
       />
 
+      {loading ? (
+        <InlineAlert
+          variant="info"
+          title="选股任务运行中"
+          message={`${taskMessage || '正在执行 AlphaSift 选股'}。任务 ID：${activeTaskId ? activeTaskId.slice(0, 12) : '-'}`}
+        />
+      ) : null}
+
       {error ? <InlineAlert variant="danger" title="调用失败" message={error} /> : null}
 
       <section className="rounded-2xl border border-cyan/35 bg-card/95 p-4 shadow-soft-card">
@@ -421,6 +598,7 @@ const StockScreeningPage: React.FC = () => {
                       : 'border-border/80 bg-surface/70 hover:border-cyan/45 hover:bg-hover/70'
                   }`}
                   type="button"
+                  disabled={loading}
                   onClick={() => handleStrategyChange(item.id)}
                 >
                   <span className="text-base font-semibold text-foreground">{item.name || item.title || item.id}</span>
@@ -447,6 +625,7 @@ const StockScreeningPage: React.FC = () => {
             <select
               className="h-11 w-full rounded-xl border border-border bg-surface px-3 text-sm text-foreground outline-none transition-colors focus:border-cyan"
               value={market}
+              disabled={loading}
               onChange={(event) => handleMarketChange(event.target.value)}
             >
               {MARKETS.map((item) => (
@@ -462,6 +641,7 @@ const StockScreeningPage: React.FC = () => {
             <input
               className="h-11 w-full rounded-xl border border-border bg-surface px-3 text-sm text-foreground outline-none transition-colors focus:border-cyan"
               value={strategy}
+              disabled={loading}
               onChange={(event) => handleStrategyChange(event.target.value)}
             />
           </label>
@@ -474,6 +654,7 @@ const StockScreeningPage: React.FC = () => {
               min={1}
               max={100}
               value={maxResults}
+              disabled={loading}
               onChange={(event) => handleMaxResultsChange(Number(event.target.value))}
             />
           </label>
@@ -503,14 +684,17 @@ const StockScreeningPage: React.FC = () => {
             </span>
             <div>
               <h2 className="text-sm font-semibold text-foreground">
-                {candidates.length > 0 ? '选股完成' : isScreeningEnabled ? '等待运行' : '等待开启'}
+                {loading ? '选股运行中' : candidates.length > 0 ? '选股完成' : isScreeningEnabled ? '等待运行' : '等待开启'}
               </h2>
               <p className="mt-1 text-xs text-secondary-text">
-                当前策略：{displayedStrategy} · {MARKETS.find((item) => item.id === market)?.label}
+                {loading
+                  ? `${taskMessage || '正在执行 AlphaSift 选股'} · ${taskProgress}%`
+                  : `当前策略：${displayedStrategy} · ${MARKETS.find((item) => item.id === market)?.label}`}
               </p>
             </div>
           </div>
           <div className="grid gap-1 text-xs text-secondary-text sm:text-right">
+            <span>任务：{activeTaskId ? activeTaskId.slice(0, 12) : '-'}</span>
             <span>Run ID：{screenMeta?.runId || '-'}</span>
             <span>
               快照 {screenMeta?.snapshotCount ?? '-'} · 过滤后 {screenMeta?.afterFilterCount ?? '-'} · 候选 {screenMeta?.candidateCount ?? candidates.length}

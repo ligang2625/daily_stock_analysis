@@ -1,5 +1,7 @@
 import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { UiLanguageProvider } from '../../contexts/UiLanguageContext';
+import { UI_LANGUAGE_STORAGE_KEY } from '../../utils/uiLanguage';
 import BacktestPage from '../BacktestPage';
 
 const {
@@ -50,6 +52,7 @@ const basePerformance = {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  window.localStorage.clear();
   mockGetOverallPerformance.mockResolvedValue(basePerformance);
   mockGetStockPerformance.mockResolvedValue(null);
   mockGetResults.mockResolvedValue({
@@ -86,6 +89,15 @@ beforeEach(() => {
 });
 
 describe('BacktestPage', () => {
+  function renderEnglishPage() {
+    window.localStorage.setItem(UI_LANGUAGE_STORAGE_KEY, 'en');
+    render(
+      <UiLanguageProvider>
+        <BacktestPage />
+      </UiLanguageProvider>,
+    );
+  }
+
   it('renders shared surface inputs and prediction tracking outputs', async () => {
     render(<BacktestPage />);
 
@@ -109,6 +121,20 @@ describe('BacktestPage', () => {
     expect(screen.getAllByLabelText('是').length).toBeGreaterThan(0);
     expect(screen.getByText('方向准确率')).toBeInTheDocument();
     expect(screen.getByText('平均模拟收益')).toBeInTheDocument();
+  });
+
+  it('renders backtest controls and result headings in English UI mode', async () => {
+    renderEnglishPage();
+
+    expect(await screen.findByPlaceholderText('Filter by stock code (leave empty for all)')).toBeInTheDocument();
+    expect(screen.getByText('Evaluation window')).toBeInTheDocument();
+    expect(screen.getAllByText('Phase').length).toBeGreaterThan(0);
+    expect(screen.getByRole('button', { name: 'Run backtest' })).toBeInTheDocument();
+    expect(screen.getByText('Window return')).toBeInTheDocument();
+    expect(screen.getByText('Direction match')).toBeInTheDocument();
+    expect(screen.getByText('Direction accuracy')).toBeInTheDocument();
+    expect(screen.queryByText('运行回测')).not.toBeInTheDocument();
+    expect(screen.queryByText('窗口收益')).not.toBeInTheDocument();
   });
 
   it('filters results with stock code, window, phase, and analysis date range when clicking Filter', async () => {

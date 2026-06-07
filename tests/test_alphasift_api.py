@@ -21,6 +21,7 @@ except ModuleNotFoundError:
 from api.v1.endpoints import alphasift as alphasift_endpoint
 from src.config import Config, DEFAULT_ALPHASIFT_INSTALL_SPEC
 from src.services import alphasift_service
+from src.services.task_queue import TaskInfo, TaskStatus as QueueTaskStatus
 
 DEFAULT_ALPHASIFT_TEST_SPEC = DEFAULT_ALPHASIFT_INSTALL_SPEC
 
@@ -298,6 +299,82 @@ class AlphaSiftOpportunitiesApiTestCase(unittest.TestCase):
         self.assertEqual(caught.exception.detail.get("diagnostics", {}).get("reason"), "missing_module")
         self.assertIn("pip install -r requirements.txt", caught.exception.detail["message"])
         install_mock.assert_not_called()
+
+    def test_start_screen_task_submits_background_work(self) -> None:
+        config = self._config(enabled=True)
+        fake_queue = MagicMock()
+        fake_queue.submit_background_task.return_value = SimpleNamespace(
+            task_id="screen-task-1",
+            trace_id="screen-task-1",
+            status=QueueTaskStatus.PENDING,
+            message="AlphaSift 选股任务已提交",
+        )
+
+        with (
+            patch("api.v1.endpoints.alphasift.get_task_queue", return_value=fake_queue),
+            patch("api.v1.endpoints.alphasift.uuid.uuid4", return_value=SimpleNamespace(hex="screen-task-1")),
+            patch.object(
+                alphasift_endpoint.AlphaSiftService,
+                "screen",
+                return_value={"enabled": True, "candidates": [], "candidate_count": 0},
+            ) as screen_mock,
+        ):
+            payload = alphasift_endpoint.alphasift_start_screen_task(
+                alphasift_endpoint.AlphaSiftScreenRequest(market="cn", strategy="dual_low", max_results=3),
+                http_request=self._request(),
+                config=config,
+            )
+            run_task = fake_queue.submit_background_task.call_args.args[0]
+            result = run_task()
+
+        self.assertEqual(payload.task_id, "screen-task-1")
+        self.assertEqual(payload.max_results, 3)
+        fake_queue.submit_background_task.assert_called_once()
+        self.assertEqual(fake_queue.submit_background_task.call_args.kwargs["report_type"], "alphasift_screen")
+        screen_mock.assert_called_once_with(strategy="dual_low", market="cn", max_results=3)
+        self.assertEqual(result["candidate_count"], 0)
+        fake_queue.update_task_progress.assert_any_call(
+            "screen-task-1",
+            20,
+            "正在执行 AlphaSift 选股，外部数据源较慢时会持续后台运行",
+        )
+
+    def test_screen_task_status_returns_alphasift_result(self) -> None:
+        task = TaskInfo(
+            task_id="screen-task-1",
+            trace_id="screen-task-1",
+            stock_code="alphasift_screen",
+            status=QueueTaskStatus.COMPLETED,
+            progress=100,
+            message="任务执行完成",
+            result={"enabled": True, "candidates": [], "candidate_count": 0},
+            report_type="alphasift_screen",
+        )
+        fake_queue = MagicMock()
+        fake_queue.get_task.return_value = task
+
+        with patch("api.v1.endpoints.alphasift.get_task_queue", return_value=fake_queue):
+            payload = alphasift_endpoint.alphasift_screen_task_status("screen-task-1")
+
+        self.assertEqual(payload.status, "completed")
+        self.assertEqual(payload.result["candidate_count"], 0)
+
+    def test_screen_task_status_rejects_non_alphasift_task(self) -> None:
+        task = TaskInfo(
+            task_id="analysis-task-1",
+            stock_code="600519",
+            status=QueueTaskStatus.COMPLETED,
+            report_type="detailed",
+        )
+        fake_queue = MagicMock()
+        fake_queue.get_task.return_value = task
+
+        with patch("api.v1.endpoints.alphasift.get_task_queue", return_value=fake_queue):
+            with self.assertRaises(HTTPException) as caught:
+                alphasift_endpoint.alphasift_screen_task_status("analysis-task-1")
+
+        self.assertEqual(caught.exception.status_code, 404)
+        self.assertEqual(caught.exception.detail["error"], "alphasift_screen_task_not_found")
 
     def test_screen_does_not_auto_install_when_adapter_runtime_unavailable(self) -> None:
         config = self._config(enabled=True)

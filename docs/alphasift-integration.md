@@ -102,6 +102,8 @@ AlphaSift 侧已在 `ZhuLinsen/alphasift@1a0ed8c99b3615c0cb1076e6029827ffc6de234
 - `/api/v1/alphasift/install`：显式修复安装入口。桌面模式（`DSA_DESKTOP_MODE=true`）不要求管理员会话，非桌面部署必须启用 `ADMIN_AUTH_ENABLED=true` 并携带有效管理员会话，否则返回 `401/403`。接口只允许默认受信任安装来源，并会强制重装锁定 commit，避免旧版 `alphasift` 包残留。
 - `/api/v1/alphasift/strategies`：读取 AlphaSift 策略列表；如果 `ALPHASIFT_ENABLED=true` 但适配层缺失或状态异常，返回 `424 + diagnostics`，不触发运行时安装。
 - `/api/v1/alphasift/screen`：调用适配层 `screen(..., use_llm=True)`，并在调用期间临时注入 DSA 已解析的 LLM 运行环境，同时向适配层传入结构化 LLM/DSA provider 配置；AlphaSift 在 LLM 前只消费轻量 DSA provider context，并优先通过 DSA 日线链路补齐 AlphaSift 因子特征，DSA 返回阶段对最终 Top 候选补新闻并复用已增强字段。适配层缺失或运行时异常返回 `424 + diagnostics` 并保留原始错误边界。
+- `/api/v1/alphasift/screen/tasks`：Web/桌面选股页使用的后台任务入口，提交后立即返回 `task_id`，实际选股在共享任务队列中继续执行，避免浏览器长请求被外部快照、行情、新闻或 LLM 延迟拖到超时。
+- `/api/v1/alphasift/screen/tasks/{task_id}`：查询后台选股任务状态。进行中返回 `pending/processing + progress/message`，完成后在 `result` 中返回与 `/screen` 相同的候选结构，失败时返回 `failed + error`；仅接受 `report_type=alphasift_screen` 的任务 ID，普通分析任务不会被误读为选股结果。
 
 ## 配置兼容边界（LLM / LiteLLM / Base URL）
 
@@ -153,7 +155,7 @@ AlphaSift 侧已在 `ZhuLinsen/alphasift@1a0ed8c99b3615c0cb1076e6029827ffc6de234
 - 选股页未开启时展示开启按钮；开启后读取 AlphaSift 策略列表。
 - 当前只暴露 A 股 `cn` 市场。
 - 默认返回数量为 3，避免一次选股过慢或结果过多。
-- 选股请求使用独立长超时，避免 LLM 重排未完成时被普通 API 超时截断。
+- 选股页通过后台任务提交和状态轮询获取结果；任务 ID 会保存在当前浏览器 tab 的 `sessionStorage`，切换页面后返回选股页会继续恢复进度或最终结果。后端重启或任务被清理时，前端会提示任务不可恢复并允许重新运行。
 - 结果页展示运行 ID、样本数量、过滤后数量、LLM 是否重排、LLM 覆盖率和 DSA 增强计数；如果 AlphaSift 返回 warning/source error/LLM parse error 或 `llm_ranked=false`，页面会明确显示降级原因，避免把本地因子结果误展示成正常 LLM 判断；重复的快照源 fallback warning/source error 会在前端合并展示为一条“数据源降级”提示。
 - 展开候选时展示 AlphaSift 摘要、因子和 LLM 判断；若 DSA 已增强，还会展示 `DSA 增强摘要`、`DSA 新闻` 和 `DSA 增强提示`。
 

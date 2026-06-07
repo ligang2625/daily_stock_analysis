@@ -147,4 +147,50 @@ describe('alphasiftApi', () => {
       { timeout: 180000 }
     );
   });
+
+  it('starts an async screening task', async () => {
+    post.mockResolvedValueOnce({
+      data: {
+        task_id: 'screen-task-1',
+        trace_id: 'screen-task-1',
+        status: 'pending',
+        message: 'AlphaSift 选股任务已提交',
+        strategy: 'dual_low',
+        market: 'cn',
+        max_results: 3,
+      },
+    });
+
+    const result = await alphasiftApi.startScreen({ market: 'cn', strategy: 'dual_low', maxResults: 3 });
+
+    expect(post).toHaveBeenCalledWith(
+      '/api/v1/alphasift/screen/tasks',
+      { market: 'cn', strategy: 'dual_low', max_results: 3 }
+    );
+    expect(result.taskId).toBe('screen-task-1');
+    expect(result.maxResults).toBe(3);
+  });
+
+  it('loads async screening task status', async () => {
+    get.mockResolvedValueOnce({
+      data: {
+        task_id: 'screen-task-1',
+        trace_id: 'screen-task-1',
+        status: 'completed',
+        progress: 100,
+        message: '任务执行完成',
+        result: {
+          enabled: true,
+          candidates: [],
+          candidate_count: 0,
+        },
+      },
+    });
+
+    const result = await alphasiftApi.getScreenTask('screen-task-1');
+
+    expect(get).toHaveBeenCalledWith('/api/v1/alphasift/screen/tasks/screen-task-1');
+    expect(result.taskId).toBe('screen-task-1');
+    expect(result.result?.candidateCount).toBe(0);
+  });
 });

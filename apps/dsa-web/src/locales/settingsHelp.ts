@@ -539,7 +539,7 @@ const settingsHelpZhCN: SettingsHelpMap = {
     summary: '控制非交易日是否跳过分析。',
     usage: '默认 true；需要强制运行可设为 false 或使用 --force-run。',
     valueNotes: ['会结合市场日历判断 A 股、港股、美股等市场是否开市。'],
-    impact: ['影响定时任务和手动运行是否在休市日执行。'],
+    impact: ['影响定时任务、CLI 和 GitHub Actions 手动运行是否在休市日执行；Web/API 大盘复盘按钮会直接提交任务。'],
     notes: ['关闭后休市日可能生成缺少实时行情的报告。'],
   },
   'settings.system.HTTP_PROXY': {
@@ -1504,7 +1504,7 @@ const settingsHelpEnUS: SettingsHelpMap = {
     summary: 'Controls whether analysis is skipped on non-trading days.',
     usage: 'Default true. Set false or use --force-run to override.',
     valueNotes: ['Uses market calendars for A-share, HK, US, and other supported markets.'],
-    impact: ['Affects whether manual and scheduled runs execute on holidays.'],
+    impact: ['Affects scheduled jobs, CLI runs, and GitHub Actions manual runs on holidays; the Web/API market-review button submits directly.'],
     notes: ['Disabling it can produce reports with missing realtime quotes on closed markets.'],
   },
   'settings.system.HTTP_PROXY': {
