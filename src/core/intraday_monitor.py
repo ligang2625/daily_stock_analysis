@@ -14,19 +14,25 @@
 - SQLite 持久化盘中事件，进程重启不丢失
 - threading.Lock 序列化 monitor_snapshot() 和 final_decision()
 - get_realtime_quote() 调用包装 10s 超时
+- 多市场支持：CN/HK/US 股票各自使用对应交易日历
+- 市场本地日期：事件 query_date 使用市场本地日期，避免服务器时区偏移
 """
 
 from __future__ import annotations
 
+import concurrent.futures
 import json
 import logging
 import threading
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, date, timedelta
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Set
 
 logger = logging.getLogger(__name__)
+
+# Module-level executor for realtime quote timeout (shared across instances)
+_QUOTE_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=4)
 
 
 # ---------------------------------------------------------------------------
@@ -231,9 +237,12 @@ class IntradayMonitor:
     盘中监控器
 
     Lifecycle:
-    1. 首次 monitor_snapshot() 时自动 load_yesterday_analysis() + clear_today_events()
+    1. 首次 monitor_snapshot() 时自动 load_yesterday_analysis() + 新交易日清空事件
     2. 后续快照直接比对写入
     3. 14:20 final_decision() 读取全天事件 → LLM → 发邮件
+
+    Multi-market: CN/HK/US stocks each use their own trading calendar.
+    Market-local dates: event query_date uses market timezone, not server local time.
     """
 
     def __init__(
@@ -251,13 +260,36 @@ class IntradayMonitor:
         self._initialized: bool = False
         self._lock = threading.Lock()
         self._snapshot_times: List[str] = []  # record snapshot times for the day
+        self._daily_init_marker: Optional[str] = None  # tracks which trading date was initialized
 
-    def _resolve_market(self) -> str:
-        """Determine market region for trading calendar lookups."""
-        region = getattr(self._config, 'market_review_region', None)
-        if region and region in ('cn', 'hk', 'us'):
-            return region
+    # ------------------------------------------------------------------
+    # Market resolution (per-stock)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _get_market_for_stock(code: str) -> str:
+        """Infer market for a stock code. Returns 'cn' | 'hk' | 'us'. Unknown → 'cn'."""
+        try:
+            from src.core.trading_calendar import get_market_for_stock
+            mkt = get_market_for_stock(code)
+            if mkt:
+                return mkt
+        except Exception:
+            pass
         return 'cn'
+
+    @staticmethod
+    def _get_market_query_date(market: str) -> str:
+        """Return market-local date string (YYYY-MM-DD) for the given market."""
+        try:
+            from src.core.trading_calendar import get_market_now
+            return get_market_now(market).date().isoformat()
+        except Exception:
+            return date.today().isoformat()
+
+    def _get_stock_markets(self, stock_codes: List[str]) -> Dict[str, str]:
+        """Map stock codes to their market regions."""
+        return {code: self._get_market_for_stock(code) for code in stock_codes}
 
     # ------------------------------------------------------------------
     # Initialization
@@ -267,8 +299,11 @@ class IntradayMonitor:
         """
         Load the most recent completed trading day's postmarket analysis.
 
+        Multi-market: groups stocks by market, uses per-market effective trading date.
+
         Primary query: effective_trading_date == target AND analysis_phase == 'postmarket'.
-        Fallback query (old records): func.date(created_at) >= target_date_str.
+        Fallback query (old records only): analysis_phase IS NULL AND effective_trading_date IS NULL
+          AND func.date(created_at) >= target_date_str.
         Primary records take precedence over fallback for the same code.
 
         Returns {code: {ideal_buy, secondary_buy, stop_loss, take_profit}}
@@ -277,55 +312,91 @@ class IntradayMonitor:
             return {}
 
         result: Dict[str, Dict[str, Optional[float]]] = {}
-        market = self._resolve_market()
+        stock_markets = self._get_stock_markets(stock_codes)
 
         try:
             from src.core.trading_calendar import get_effective_trading_date
-            target_trading_date = get_effective_trading_date(market)
         except Exception:
-            target_trading_date = date.today() - timedelta(days=1)
+            get_effective_trading_date = None
 
-        target_date_str = target_trading_date.strftime("%Y-%m-%d")
+        # Group stocks by market
+        by_market: Dict[str, List[str]] = {}
+        for code in stock_codes:
+            mkt = stock_markets.get(code, 'cn')
+            by_market.setdefault(mkt, []).append(code)
 
         try:
             with self._db.session_scope() as session:
                 from src.storage import AnalysisHistory
-                from sqlalchemy import or_, and_, func
+                from sqlalchemy import and_, func
 
-                # --- Primary query: new columns ---
-                primary_rows = (
-                    session.query(AnalysisHistory)
-                    .filter(
-                        and_(
-                            AnalysisHistory.code.in_(stock_codes),
-                            AnalysisHistory.effective_trading_date == target_trading_date,
-                            AnalysisHistory.analysis_phase == 'postmarket',
-                        )
-                    )
-                    .order_by(AnalysisHistory.created_at.desc())
-                    .all()
-                )
+                all_primary: list = []
+                all_fallback: list = []
+                fallback_warning_codes: Set[str] = set()
+                allow_fallback = getattr(self._config, 'intraday_legacy_fallback_enabled', True)
 
-                primary_codes = {str(row.code or "").strip() for row in primary_rows}
+                for market, codes_in_market in by_market.items():
+                    if not codes_in_market:
+                        continue
 
-                # --- Fallback: old records without new columns ---
-                remaining_codes = [c for c in stock_codes if c not in primary_codes]
-                fallback_rows: list = []
-                if remaining_codes:
-                    fallback_rows = (
+                    # Per-market target trading date
+                    if get_effective_trading_date:
+                        try:
+                            target_trading_date = get_effective_trading_date(market)
+                        except Exception:
+                            target_trading_date = date.today() - timedelta(days=1)
+                    else:
+                        target_trading_date = date.today() - timedelta(days=1)
+
+                    target_date_str = target_trading_date.strftime("%Y-%m-%d")
+
+                    # --- Primary query: new columns, per-market date ---
+                    primary_rows = (
                         session.query(AnalysisHistory)
                         .filter(
                             and_(
-                                AnalysisHistory.code.in_(remaining_codes),
-                                func.date(AnalysisHistory.created_at) >= target_date_str,
+                                AnalysisHistory.code.in_(codes_in_market),
+                                AnalysisHistory.effective_trading_date == target_trading_date,
+                                AnalysisHistory.analysis_phase == 'postmarket',
                             )
                         )
                         .order_by(AnalysisHistory.created_at.desc())
                         .all()
                     )
+                    all_primary.extend(primary_rows)
+                    primary_codes = {str(row.code or "").strip() for row in primary_rows}
+
+                    # --- Fallback: old records only (no new columns) ---
+                    remaining_codes = [c for c in codes_in_market if c not in primary_codes]
+                    if remaining_codes and allow_fallback:
+                        fallback_rows = (
+                            session.query(AnalysisHistory)
+                            .filter(
+                                and_(
+                                    AnalysisHistory.code.in_(remaining_codes),
+                                    AnalysisHistory.analysis_phase.is_(None),
+                                    AnalysisHistory.effective_trading_date.is_(None),
+                                    func.date(AnalysisHistory.created_at) >= target_date_str,
+                                )
+                            )
+                            .order_by(AnalysisHistory.created_at.desc())
+                            .all()
+                        )
+                        all_fallback.extend(fallback_rows)
+                        if fallback_rows:
+                            fallback_warning_codes.update(
+                                str(row.code or "").strip() for row in fallback_rows
+                            )
+
+                if fallback_warning_codes:
+                    logger.warning(
+                        "盘中监控: %d 支股票命中 legacy fallback（旧记录，无 analysis_phase）: %s",
+                        len(fallback_warning_codes),
+                        ", ".join(sorted(fallback_warning_codes)),
+                    )
 
                 # Combine: primary first, then fallback; keep first per code
-                all_rows = list(primary_rows) + list(fallback_rows)
+                all_rows = list(all_primary) + list(all_fallback)
 
                 # Keep latest per code
                 seen: set = set()
@@ -360,24 +431,50 @@ class IntradayMonitor:
                         "take_profit": profit,
                     }
 
-            logger.info("加载昨日分析: %d 支股票 (primary=%d, fallback=%d)",
-                         len(result), len(primary_codes), len(fallback_rows))
+            logger.info("加载昨日分析: %d 支股票 (primary=%d, fallback=%d, markets=%s)",
+                         len(result), len(all_primary), len(all_fallback),
+                         ", ".join(f"{m}={len(c)}" for m, c in by_market.items()))
         except Exception as exc:
             logger.exception("加载昨日分析失败: %s", exc)
 
         self._yesterday_analysis = result
         return result
 
-    def clear_today_events(self) -> None:
-        """Delete today's intraday events from SQLite (idempotent)."""
-        today = date.today().isoformat()
+    def _get_daily_init_key(self) -> str:
+        """Return a unique key for today's initialization state.
+        Uses the primary market's local date so multi-market setups get a stable key.
+        """
+        primary_market = self._resolve_primary_market()
+        return f"{primary_market}:{self._get_market_query_date(primary_market)}"
+
+    def _resolve_primary_market(self) -> str:
+        """Determine primary market for global checks (config-driven)."""
+        region = getattr(self._config, 'market_review_region', None)
+        if region and region in ('cn', 'hk', 'us'):
+            return region
+        return 'cn'
+
+    def _should_clear_events(self) -> bool:
+        """Return True if today's events should be cleared (new trading day, never initialized)."""
+        today_key = self._get_daily_init_key()
+        return self._daily_init_marker != today_key
+
+    def clear_today_events(self, markets: Optional[List[str]] = None) -> None:
+        """Delete today's intraday events for given markets (or all markets if None)."""
+        if markets is None:
+            markets = ['cn', 'hk', 'us']
         try:
             with self._db.session_scope() as session:
                 conn = session.connection()
                 from sqlalchemy import text as sa_text
-                conn.execute(sa_text("DELETE FROM intraday_events WHERE query_date = :qd"), {"qd": today})
+                for mkt in markets:
+                    mkt_date = self._get_market_query_date(mkt)
+                    conn.execute(
+                        sa_text("DELETE FROM intraday_events WHERE query_date = :qd AND market = :mkt"),
+                        {"qd": mkt_date, "mkt": mkt},
+                    )
                 session.commit()
-            logger.info("已清空当天盘中事件: %s", today)
+            logger.info("已清空当天盘中事件: markets=%s", markets)
         except Exception as exc:
             logger.warning("清空当天盘中事件失败（可能表不存在）: %s", exc)
 
@@ -398,28 +495,34 @@ class IntradayMonitor:
 
     def _monitor_snapshot_locked(self) -> None:
         """Snapshot implementation (caller must hold self._lock)."""
-        # Trading day check
-        if not self._is_trading_day():
-            logger.info("非交易日，跳过盘中快照")
-            return
-
-        # Lazy init on first call
-        if not self._initialized:
-            stock_codes = self._get_stock_codes()
-            self.load_yesterday_analysis(stock_codes)
-            self.clear_today_events()
-            self._initialized = True
-            logger.info("盘中监控初始化完成，监控 %d 支股票", len(stock_codes))
-
         stock_codes = self._get_stock_codes()
         if not stock_codes:
             return
 
+        # Per-stock trading day check: only snapshot stocks in open markets
+        tradable_codes = [c for c in stock_codes if self._is_stock_trading_today(c)]
+        if not tradable_codes:
+            all_closed = all(not self._is_stock_trading_today(c) for c in stock_codes)
+            if all_closed:
+                logger.info("所有监控股票对应市场今日均休市，跳过盘中快照")
+            return
+
+        # Lazy init on first call of a new trading day
+        if not self._initialized or self._should_clear_events():
+            self.load_yesterday_analysis(stock_codes)
+            # Only clear events on genuinely new trading day (not on restart)
+            if self._should_clear_events():
+                self.clear_today_events()
+            self._daily_init_marker = self._get_daily_init_key()
+            self._initialized = True
+            logger.info("盘中监控初始化完成，监控 %d 支股票", len(stock_codes))
+
         now = datetime.now()
         self._snapshot_times.append(now.strftime("%H:%M"))
-        logger.info("盘中快照开始: %s, 候选股 %d 支", now.strftime("%H:%M:%S"), len(stock_codes))
+        logger.info("盘中快照开始: %s, 候选 %d 支 (可交易 %d 支)",
+                     now.strftime("%H:%M:%S"), len(stock_codes), len(tradable_codes))
 
-        for code in stock_codes:
+        for code in tradable_codes:
             try:
                 self._snapshot_one_stock(code, now)
             except Exception as exc:
@@ -487,19 +590,19 @@ class IntradayMonitor:
             self._save_event(event)
 
     def _get_realtime_with_timeout(self, code: str, timeout: float = 10.0):
-        """Call get_realtime_quote with timeout protection."""
-        import concurrent.futures
-
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-            future = executor.submit(self._fetcher.get_realtime_quote, code)
-            try:
-                return future.result(timeout=timeout)
-            except concurrent.futures.TimeoutError:
-                logger.warning("get_realtime_quote [%s] 超时 (%ss)", code, timeout)
-                return None
-            except Exception as exc:
-                logger.warning("get_realtime_quote [%s] 异常: %s", code, exc)
-                return None
+        """Call get_realtime_quote with timeout protection.
+        Uses a module-level executor so shutdown does not block on stuck threads.
+        """
+        future = _QUOTE_EXECUTOR.submit(self._fetcher.get_realtime_quote, code)
+        try:
+            return future.result(timeout=timeout)
+        except concurrent.futures.TimeoutError:
+            logger.warning("get_realtime_quote [%s] 超时 (%ss)", code, timeout)
+            future.cancel()
+            return None
+        except Exception as exc:
+            logger.warning("get_realtime_quote [%s] 异常: %s", code, exc)
+            return None
 
     # ------------------------------------------------------------------
     # Final decision
@@ -518,22 +621,40 @@ class IntradayMonitor:
 
     def _final_decision_locked(self) -> None:
         """Final decision implementation (caller must hold self._lock)."""
-        if not self._is_trading_day():
-            logger.info("非交易日，跳过盘中决策")
-            return
+        # Ensure yesterday analysis is loaded for prompt construction
+        stock_codes = self._get_stock_codes()
+        if stock_codes and not self._yesterday_analysis:
+            logger.info("_yesterday_analysis 为空，尝试加载...")
+            self.load_yesterday_analysis(stock_codes)
+        if not self._yesterday_analysis:
+            logger.warning(
+                "未加载到昨日盘后基准分析，盘中决策将在无基准的情况下生成"
+            )
 
-        today_str = date.today().isoformat()
-        events = self._load_today_events(today_str)
-        logger.info("盘中决策: 读取到 %d 条事件", len(events))
+        # Per-market trading day check: at least one market must be trading
+        tradable = [c for c in stock_codes if self._is_stock_trading_today(c)]
+        if not tradable:
+            logger.info("所有监控股票对应市场今日均休市，跳过盘中决策")
+            if not getattr(self._config, 'intraday_force_run', False):
+                return
 
-        if not events:
+        # Load events for all relevant market-local dates
+        markets = set(self._get_market_for_stock(c) for c in stock_codes)
+        all_events: List[IntradayEvent] = []
+        for mkt in markets:
+            mkt_date = self._get_market_query_date(mkt)
+            all_events.extend(self._load_today_events(mkt_date, market=mkt))
+
+        logger.info("盘中决策: 读取到 %d 条事件 (markets=%s)", len(all_events), markets)
+
+        if not all_events:
             logger.info("无盘中事件，跳过决策邮件")
             return
 
         # Build prompt
         from src.core.intraday_prompt import build_intraday_prompt
         prompt = build_intraday_prompt(
-            events=events,
+            events=all_events,
             yesterday_analysis=self._yesterday_analysis,
             snapshot_times=self._snapshot_times,
         )
@@ -542,10 +663,10 @@ class IntradayMonitor:
         decision_text = self._call_llm_with_retries(prompt)
         if decision_text is None:
             # Fallback: send raw data summary
-            decision_text = self._build_raw_summary(events)
+            decision_text = self._build_raw_summary(all_events)
 
         # Send email
-        self._send_decision_email(decision_text, events)
+        self._send_decision_email(decision_text, all_events)
 
     def _call_llm_with_retries(self, prompt: str) -> Optional[str]:
         """Call litellm.completion() with 3 retries, 5s interval."""
@@ -590,13 +711,14 @@ class IntradayMonitor:
         return "\n".join(lines)
 
     def _send_decision_email(self, content: str, events: List[IntradayEvent]) -> None:
-        """Send decision email via EmailSender."""
+        """Send decision email via EmailSender. Uses primary market local date for subject."""
         if self._email_sender is None:
             logger.warning("EmailSender 未配置，跳过邮件发送")
             return
 
-        today_str = date.today().isoformat()
-        subject = f"盘中监控报告 - {today_str} 14:30"
+        primary_market = self._resolve_primary_market()
+        report_date = self._get_market_query_date(primary_market)
+        subject = f"盘中监控报告 - {report_date} 14:30"
 
         try:
             success = self._email_sender.send_to_email(
@@ -615,8 +737,9 @@ class IntradayMonitor:
     # ------------------------------------------------------------------
 
     def _save_event(self, event: IntradayEvent) -> None:
-        """Persist one intraday event to SQLite."""
-        today = date.today().isoformat()
+        """Persist one intraday event to SQLite. Uses market-local date."""
+        market = self._get_market_for_stock(event.stock_code)
+        query_date = self._get_market_query_date(market)
         try:
             with self._db.session_scope() as session:
                 conn = session.connection()
@@ -624,12 +747,13 @@ class IntradayMonitor:
                 conn.execute(
                     sa_text(
                         "INSERT INTO intraday_events "
-                        "(query_date, timestamp, stock_code, stock_name, current_price, "
+                        "(query_date, market, timestamp, stock_code, stock_name, current_price, "
                         "volume_ratio, change_pct, event_type, description, raw_quote) "
-                        "VALUES (:qd, :ts, :sc, :sn, :cp, :vr, :cpct, :et, :desc, :rq)"
+                        "VALUES (:qd, :mkt, :ts, :sc, :sn, :cp, :vr, :cpct, :et, :desc, :rq)"
                     ),
                     {
-                        "qd": today,
+                        "qd": query_date,
+                        "mkt": market,
                         "ts": event.timestamp.isoformat(),
                         "sc": event.stock_code,
                         "sn": event.stock_name,
@@ -645,21 +769,32 @@ class IntradayMonitor:
         except Exception as exc:
             logger.error("保存盘中事件失败 [%s]: %s", event.stock_code, exc)
 
-    def _load_today_events(self, query_date: str) -> List[IntradayEvent]:
-        """Load all intraday events for a given date from SQLite."""
+    def _load_today_events(self, query_date: str, market: Optional[str] = None) -> List[IntradayEvent]:
+        """Load all intraday events for a given date (and optionally market) from SQLite."""
         events: List[IntradayEvent] = []
         try:
             with self._db.session_scope() as session:
                 conn = session.connection()
                 from sqlalchemy import text as sa_text
-                rows = conn.execute(
-                    sa_text(
-                        "SELECT timestamp, stock_code, stock_name, current_price, "
-                        "volume_ratio, change_pct, event_type, description "
-                        "FROM intraday_events WHERE query_date = :qd ORDER BY timestamp"
-                    ),
-                    {"qd": query_date},
-                ).fetchall()
+                if market:
+                    rows = conn.execute(
+                        sa_text(
+                            "SELECT timestamp, stock_code, stock_name, current_price, "
+                            "volume_ratio, change_pct, event_type, description "
+                            "FROM intraday_events "
+                            "WHERE query_date = :qd AND market = :mkt ORDER BY timestamp"
+                        ),
+                        {"qd": query_date, "mkt": market},
+                    ).fetchall()
+                else:
+                    rows = conn.execute(
+                        sa_text(
+                            "SELECT timestamp, stock_code, stock_name, current_price, "
+                            "volume_ratio, change_pct, event_type, description "
+                            "FROM intraday_events WHERE query_date = :qd ORDER BY timestamp"
+                        ),
+                        {"qd": query_date},
+                    ).fetchall()
 
                 for row in rows:
                     ts = row[0]
@@ -681,7 +816,7 @@ class IntradayMonitor:
         return events
 
     def _ensure_intraday_table(self) -> None:
-        """Create intraday_events table if not exists."""
+        """Create intraday_events table if not exists (with market column)."""
         try:
             with self._db.session_scope() as session:
                 conn = session.connection()
@@ -690,6 +825,7 @@ class IntradayMonitor:
                     "CREATE TABLE IF NOT EXISTS intraday_events ("
                     "id INTEGER PRIMARY KEY AUTOINCREMENT, "
                     "query_date TEXT NOT NULL, "
+                    "market TEXT NOT NULL DEFAULT 'cn', "
                     "timestamp TEXT NOT NULL, "
                     "stock_code TEXT NOT NULL, "
                     "stock_name TEXT, "
@@ -701,9 +837,21 @@ class IntradayMonitor:
                     "raw_quote TEXT"
                     ")"
                 ))
+                # Migrate: add market column if table existed before
+                info = conn.execute(sa_text("PRAGMA table_info('intraday_events')")).fetchall()
+                existing_cols = {row[1] for row in info}
+                if 'market' not in existing_cols:
+                    conn.execute(sa_text(
+                        "ALTER TABLE intraday_events ADD COLUMN market TEXT NOT NULL DEFAULT 'cn'"
+                    ))
+                    logger.info("Schema migration: added intraday_events.market")
                 conn.execute(sa_text(
                     "CREATE INDEX IF NOT EXISTS idx_intraday_date_code "
                     "ON intraday_events(query_date, stock_code)"
+                ))
+                conn.execute(sa_text(
+                    "CREATE INDEX IF NOT EXISTS idx_intraday_date_market "
+                    "ON intraday_events(query_date, market)"
                 ))
                 session.commit()
                 logger.info("intraday_events 表已就绪")
@@ -715,13 +863,41 @@ class IntradayMonitor:
     # ------------------------------------------------------------------
 
     def _is_trading_day(self) -> bool:
-        """Check if today is a trading day for the configured market."""
+        """Check if today is a trading day for the primary configured market.
+        Deprecated in favor of _is_stock_trading_today() for multi-market setups.
+        """
         try:
             from src.core.trading_calendar import is_market_open
-            return is_market_open(self._resolve_market(), date.today())
+            market = self._resolve_primary_market()
+            market_date = self._get_market_query_date(market)
+            market_date_obj = date.fromisoformat(market_date)
+            return is_market_open(market, market_date_obj)
         except Exception as exc:
-            logger.warning("交易日检测异常，按交易日处理: %s", exc)
-        return True  # fail-open
+            fail_open = getattr(self._config, 'intraday_calendar_fail_open', False)
+            if fail_open:
+                logger.warning("交易日检测异常，fail-open 按交易日处理: %s", exc)
+                return True
+            logger.warning("交易日检测异常，fail-closed 跳过: %s", exc)
+            return False
+
+    def _is_stock_trading_today(self, code: str) -> bool:
+        """Check if the market for a specific stock is open today."""
+        market = self._get_market_for_stock(code)
+        if market not in ('cn', 'hk', 'us'):
+            logger.warning("无法识别股票 %s 的市场，按休市处理", code)
+            return False
+        try:
+            from src.core.trading_calendar import is_market_open
+            market_date = self._get_market_query_date(market)
+            market_date_obj = date.fromisoformat(market_date)
+            return is_market_open(market, market_date_obj)
+        except Exception as exc:
+            fail_open = getattr(self._config, 'intraday_calendar_fail_open', False)
+            if fail_open:
+                logger.warning("交易日检测异常 [%s] fail-open: %s", code, exc)
+                return True
+            logger.warning("交易日检测异常 [%s] fail-closed: %s", code, exc)
+            return False
 
     def _get_stock_codes(self) -> List[str]:
         """Get monitored stock codes from config."""
@@ -734,22 +910,28 @@ class IntradayMonitor:
 
     def run_one_shot_snapshot(self) -> None:
         """Standalone snapshot: load yesterday analysis, snapshot, save to SQLite. Does NOT clear today's events."""
-        if not self._is_trading_day():
-            logger.info("非交易日，跳过盘中快照")
-            return
-
         stock_codes = self._get_stock_codes()
         if not stock_codes:
             logger.warning("无监控股票，跳过快照")
             return
 
+        tradable = [c for c in stock_codes if self._is_stock_trading_today(c)]
+        if not tradable:
+            force = getattr(self._config, 'intraday_force_run', False)
+            if not force:
+                logger.info("所有监控股票今日均休市，跳过盘中快照（--force-run 可强制执行）")
+                return
+            logger.warning("非交易日，但 force_run 已启用，仍执行快照")
+            tradable = stock_codes
+
         self._ensure_intraday_table()
         self.load_yesterday_analysis(stock_codes)
 
         now = datetime.now()
-        logger.info("盘中快照(standalone) 开始: %s, %d 支股票", now.strftime("%H:%M:%S"), len(stock_codes))
+        logger.info("盘中快照(standalone) 开始: %s, %d 支股票 (可交易 %d 支)",
+                     now.strftime("%H:%M:%S"), len(stock_codes), len(tradable))
 
-        for code in stock_codes:
+        for code in tradable:
             try:
                 self._snapshot_one_stock(code, now)
             except Exception as exc:
@@ -758,17 +940,32 @@ class IntradayMonitor:
         logger.info("盘中快照(standalone) 完成: %s", now.strftime("%H:%M:%S"))
 
     def run_one_shot_decision(self) -> None:
-        """Standalone decision: snapshot at current price, then run LLM, send email."""
+        """Standalone decision: snapshot at current price, then run LLM, send email.
+        Non-trading day: no events written unless --force-run.
+        """
         self._ensure_intraday_table()
 
         stock_codes = self._get_stock_codes()
-        if stock_codes:
-            self.load_yesterday_analysis(stock_codes)
+        tradable = [c for c in stock_codes if self._is_stock_trading_today(c)]
+        force = getattr(self._config, 'intraday_force_run', False)
+
+        if not tradable and not force:
+            logger.info("所有监控股票今日均休市，跳过盘中决策（--force-run 可强制执行）")
+            return
+
+        if force and not tradable:
+            logger.warning("非交易日，但 force_run 已启用，仍执行决策快照")
+
+        # Only snapshot tradable stocks; under force-run, snapshot all
+        target_codes = stock_codes if force else tradable
+
+        if target_codes:
+            self.load_yesterday_analysis(target_codes)
 
         # Snapshot first to capture latest prices before decision
         now = datetime.now()
-        logger.info("盘中决策前快照(standalone): %s, %d 支股票", now.strftime("%H:%M:%S"), len(stock_codes))
-        for code in stock_codes:
+        logger.info("盘中决策前快照(standalone): %s, %d 支股票", now.strftime("%H:%M:%S"), len(target_codes))
+        for code in target_codes:
             try:
                 self._snapshot_one_stock(code, now)
             except Exception as exc:

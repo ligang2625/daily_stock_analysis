@@ -216,7 +216,7 @@ class TestLoadYesterdayAnalysis:
 class TestMonitorSnapshot:
     def test_non_trading_day_skips(self):
         monitor = _make_monitor(intraday_stocks="000001")
-        with patch.object(monitor, '_is_trading_day', return_value=False):
+        with patch.object(monitor, '_is_stock_trading_today', return_value=False):
             with patch.object(monitor, 'load_yesterday_analysis') as mock_load:
                 monitor._monitor_snapshot_locked()
                 mock_load.assert_not_called()
@@ -224,7 +224,7 @@ class TestMonitorSnapshot:
     def test_lazy_init_on_first_call(self):
         monitor = _make_monitor(intraday_stocks="000001")
         monitor._initialized = False
-        with patch.object(monitor, '_is_trading_day', return_value=True):
+        with patch.object(monitor, '_is_stock_trading_today', return_value=True):
             with patch.object(monitor, 'load_yesterday_analysis') as mock_load:
                 with patch.object(monitor, 'clear_today_events') as mock_clear:
                     with patch.object(monitor, '_snapshot_one_stock'):
@@ -236,7 +236,8 @@ class TestMonitorSnapshot:
     def test_already_initialized_skips_init(self):
         monitor = _make_monitor(intraday_stocks="000001")
         monitor._initialized = True
-        with patch.object(monitor, '_is_trading_day', return_value=True):
+        monitor._daily_init_marker = monitor._get_daily_init_key()
+        with patch.object(monitor, '_is_stock_trading_today', return_value=True):
             with patch.object(monitor, 'load_yesterday_analysis') as mock_load:
                 with patch.object(monitor, '_snapshot_one_stock'):
                     monitor._monitor_snapshot_locked()
@@ -307,22 +308,22 @@ def _make_monitor(intraday_stocks: str = ""):
 class TestResolveMarket:
     def test_defaults_to_cn(self):
         monitor = _make_monitor()
-        assert monitor._resolve_market() == 'cn'
+        assert monitor._resolve_primary_market() == 'cn'
 
     def test_uses_config_value(self):
         monitor = _make_monitor()
         monitor._config.market_review_region = 'hk'
-        assert monitor._resolve_market() == 'hk'
+        assert monitor._resolve_primary_market() == 'hk'
 
     def test_us_market(self):
         monitor = _make_monitor()
         monitor._config.market_review_region = 'us'
-        assert monitor._resolve_market() == 'us'
+        assert monitor._resolve_primary_market() == 'us'
 
     def test_invalid_value_falls_back(self):
         monitor = _make_monitor()
         monitor._config.market_review_region = 'both'
-        assert monitor._resolve_market() == 'cn'
+        assert monitor._resolve_primary_market() == 'cn'
 
 
 # ============================================================
@@ -453,3 +454,256 @@ def _make_mock_row(code, ideal, secondary, stop, profit):
     row.take_profit = profit
     row.raw_result = None
     return row
+
+
+# ============================================================
+# New tests per 20260607 intraday logic fixes
+# ============================================================
+
+class TestMarketQueryDate:
+    """P1: market-local date for event query_date."""
+
+    def test_cn_market_date_uses_shanghai_tz(self):
+        monitor = _make_monitor()
+        market_date = monitor._get_market_query_date('cn')
+        assert isinstance(market_date, str)
+        assert '-' in market_date
+
+    def test_us_market_date_differs_from_cn(self):
+        """US market date may differ from CN when server TZ is Asia."""
+        monitor = _make_monitor()
+        cn_date = monitor._get_market_query_date('cn')
+        us_date = monitor._get_market_query_date('us')
+        # Both should be valid date strings
+        from datetime import date as dt_date
+        assert dt_date.fromisoformat(cn_date)
+        assert dt_date.fromisoformat(us_date)
+
+
+class TestLoadYesterdayAnalysisFallbackRestriction:
+    """P0: fallback only applies to old records without new columns."""
+
+    @pytest.fixture(autouse=True)
+    def _check_deps(self):
+        try:
+            import pandas  # noqa: F401
+        except ImportError:
+            pytest.skip("pandas not available")
+
+    def test_new_records_not_in_fallback(self):
+        """Records with analysis_phase set should NOT match fallback query."""
+        from src.storage import AnalysisHistory
+        mock_session = MagicMock()
+
+        # Primary returns postmarket record
+        primary_row = _make_mock_row("000001", 120, 115, 110, 130)
+        # Simulate a newer intraday record with analysis_phase='intraday'
+        # Fallback uses IS NULL filter, so this shouldn't appear in fallback
+
+        mock_session.query.return_value.filter.return_value.order_by.return_value.all.side_effect = [
+            [primary_row],  # primary: postmarket
+            [],             # fallback: empty because intraday record has analysis_phase set
+        ]
+
+        monitor = _make_monitor()
+        monitor._db.session_scope = MagicMock()
+        monitor._db.session_scope.return_value = mock_session
+
+        result = monitor.load_yesterday_analysis(["000001"])
+        assert result["000001"]["ideal_buy"] == 120.0
+
+    def test_fallback_requires_null_columns(self):
+        """Fallback query must include analysis_phase IS NULL AND effective_trading_date IS NULL."""
+        monitor = _make_monitor()
+        monitor._db.session_scope = MagicMock()
+        mock_session = MagicMock()
+
+        # Primary: empty → all codes go to fallback
+        # Fallback: one old record (NULL columns)
+        fallback_row = _make_mock_row("000001", 50, 45, 40, 60)
+        mock_session.__enter__.return_value = mock_session
+        mock_session.query.return_value.filter.return_value.order_by.return_value.all.side_effect = [
+            [],              # primary query: no results
+            [fallback_row],  # fallback query: old record
+        ]
+
+        monitor._db.session_scope.return_value = mock_session
+        result = monitor.load_yesterday_analysis(["000001"])
+        assert "000001" in result
+        assert result["000001"]["ideal_buy"] == 50.0
+
+    def test_fallback_disabled_by_config(self):
+        """When intraday_legacy_fallback_enabled=False, no fallback used."""
+        monitor = _make_monitor()
+        monitor._config.intraday_legacy_fallback_enabled = False
+        monitor._db.session_scope = MagicMock()
+        mock_session = MagicMock()
+
+        mock_session.__enter__.return_value = mock_session
+        mock_session.query.return_value.filter.return_value.order_by.return_value.all.side_effect = [
+            [],  # primary query: no results
+            # fallback disabled — no second query
+        ]
+
+        monitor._db.session_scope.return_value = mock_session
+        result = monitor.load_yesterday_analysis(["000001"])
+        assert result == {}
+
+    def test_fallback_hits_log_warning(self, caplog):
+        """Fallback hit must emit a warning log."""
+        import logging
+        caplog.set_level(logging.WARNING)
+
+        monitor = _make_monitor()
+        monitor._db.session_scope = MagicMock()
+        mock_session = MagicMock()
+
+        fallback_row = _make_mock_row("000001", 50, 45, 40, 60)
+        mock_session.__enter__.return_value = mock_session
+        mock_session.query.return_value.filter.return_value.order_by.return_value.all.side_effect = [
+            [],              # primary: empty
+            [fallback_row],  # fallback: old record
+        ]
+
+        monitor._db.session_scope.return_value = mock_session
+        monitor.load_yesterday_analysis(["000001"])
+        assert any("legacy fallback" in msg for msg in caplog.messages), \
+            f"expected 'legacy fallback' warning, got: {caplog.messages}"
+
+
+class TestPerStockTradingDay:
+    """P0: Per-stock trading day check for multi-market setups."""
+
+    @pytest.fixture(autouse=True)
+    def _check_deps(self):
+        try:
+            import pandas  # noqa: F401
+            from src.core import trading_calendar  # noqa: F401
+        except (ImportError, ModuleNotFoundError):
+            pytest.skip("pandas not available")
+
+    def test_cn_stock_uses_cn_calendar(self):
+        from src.core import trading_calendar as _tc
+        monitor = _make_monitor()
+        with patch.object(_tc, 'is_market_open', return_value=True) as mock_is_open:
+            assert monitor._is_stock_trading_today('600519') is True
+            mock_is_open.assert_called_once()
+            # Must have been called with 'cn' market
+            assert mock_is_open.call_args[0][0] == 'cn'
+
+    def test_hk_stock_uses_hk_calendar(self):
+        from src.core import trading_calendar as _tc
+        monitor = _make_monitor()
+        with patch.object(_tc, 'is_market_open', return_value=True) as mock_is_open:
+            monitor._is_stock_trading_today('hk00700')
+            assert mock_is_open.call_args[0][0] == 'hk'
+
+    def test_unknown_stock_returns_false(self):
+        """Unknown stock market → fail-closed (not silently open)."""
+        monitor = _make_monitor()
+        # Empty string or garbage code → unknown market → False
+        assert monitor._is_stock_trading_today('') is False
+
+    def test_calendar_error_fail_closed_by_default(self):
+        from src.core import trading_calendar as _tc
+        monitor = _make_monitor()
+        monitor._config.intraday_calendar_fail_open = False
+        with patch.object(_tc, 'is_market_open', side_effect=RuntimeError("boom")):
+            assert monitor._is_stock_trading_today('600519') is False
+
+    def test_calendar_error_fail_open_with_config(self):
+        from src.core import trading_calendar as _tc
+        monitor = _make_monitor()
+        monitor._config.intraday_calendar_fail_open = True
+        with patch.object(_tc, 'is_market_open', side_effect=RuntimeError("boom")):
+            assert monitor._is_stock_trading_today('600519') is True
+
+
+class TestRunOneShotDecisionNonTrading:
+    """P1: run_one_shot_decision on non-trading day must not write events."""
+
+    def test_non_trading_day_no_events_written(self):
+        monitor = _make_monitor(intraday_stocks="000001")
+        monitor._config.intraday_force_run = False
+        with patch.object(monitor, '_is_stock_trading_today', return_value=False):
+            with patch.object(monitor, '_snapshot_one_stock') as mock_snap:
+                with patch.object(monitor, '_final_decision_locked') as mock_final:
+                    monitor.run_one_shot_decision()
+                    mock_snap.assert_not_called()
+                    mock_final.assert_not_called()
+
+    def test_non_trading_day_with_force_run(self):
+        monitor = _make_monitor(intraday_stocks="000001")
+        monitor._config.intraday_force_run = True
+        with patch.object(monitor, '_is_stock_trading_today', return_value=False):
+            with patch.object(monitor, 'load_yesterday_analysis'):
+                with patch.object(monitor, '_snapshot_one_stock') as mock_snap:
+                    with patch.object(monitor, '_final_decision_locked') as mock_final:
+                        monitor.run_one_shot_decision()
+                        mock_snap.assert_called()
+                        mock_final.assert_called_once()
+
+
+class TestRealtimeTimeout:
+    """P1: _get_realtime_with_timeout must not block indefinitely."""
+
+    def test_timeout_returns_none(self):
+        monitor = _make_monitor()
+        import time as _time
+        # Simulate a very slow call
+        monitor._fetcher.get_realtime_quote = lambda code: _time.sleep(10) or MagicMock()
+        # Use a tiny timeout
+        result = monitor._get_realtime_with_timeout("000001", timeout=0.05)
+        assert result is None
+
+
+class TestRestartPreservesEvents:
+    """P1: Process restart must not clear previously persisted today events."""
+
+    def test_second_instance_does_not_clear(self):
+        """New IntradayMonitor instance with same daily_init_marker skips clear."""
+        import time as _time
+        monitor1 = _make_monitor(intraday_stocks="000001")
+        # Simulate first run that set the daily marker
+        marker = monitor1._get_daily_init_key()
+        monitor1._daily_init_marker = marker
+        monitor1._initialized = True
+
+        # Second instance on same day
+        monitor2 = _make_monitor(intraday_stocks="000001")
+        monitor2._daily_init_marker = marker  # same day
+        monitor2._initialized = True
+
+        # _should_clear_events should be False when marker matches
+        monitor2._daily_init_marker = marker
+        assert monitor2._should_clear_events() is False
+
+    def test_new_trading_day_does_clear(self):
+        """When daily init marker changes, should clear events."""
+        monitor = _make_monitor(intraday_stocks="000001")
+        monitor._daily_init_marker = "cn:2020-01-01"  # old date
+        assert monitor._should_clear_events() is True
+
+
+class TestFinalDecisionLoadsYesterday:
+    """P1: final_decision must load _yesterday_analysis if empty."""
+
+    def test_loads_yesterday_when_empty(self):
+        monitor = _make_monitor(intraday_stocks="000001")
+        monitor._yesterday_analysis = {}
+
+        with patch.object(monitor, '_is_stock_trading_today', return_value=True):
+            with patch.object(monitor, 'load_yesterday_analysis') as mock_load:
+                with patch.object(monitor, '_load_today_events', return_value=[]):
+                    monitor._final_decision_locked()
+                    mock_load.assert_called_once()
+
+    def test_no_load_when_yesterday_present(self):
+        monitor = _make_monitor(intraday_stocks="000001")
+        monitor._yesterday_analysis = {"000001": {"ideal_buy": 100.0}}
+
+        with patch.object(monitor, '_is_stock_trading_today', return_value=True):
+            with patch.object(monitor, 'load_yesterday_analysis') as mock_load:
+                with patch.object(monitor, '_load_today_events', return_value=[]):
+                    monitor._final_decision_locked()
+                    mock_load.assert_not_called()

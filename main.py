@@ -978,6 +978,10 @@ def main() -> int:
             fetcher_mgr = DataFetcherManager()
             email_sender = EmailSender(config)
 
+            # Propagate --force-run to intraday monitor config
+            if getattr(args, 'force_run', False):
+                config.intraday_force_run = True
+
             monitor = IntradayMonitor(
                 config=config,
                 fetcher_manager=fetcher_mgr,

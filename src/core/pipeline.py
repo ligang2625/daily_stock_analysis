@@ -305,6 +305,10 @@ class StockAnalysisPipeline:
                 trigger_source=self.query_source,
                 analysis_phase=getattr(self, "analysis_phase", "auto"),
             )
+            # Resolve persisted phase: if caller left "auto", use calendar-inferred phase
+            _persisted_phase = getattr(self, "analysis_phase", "auto")
+            if _persisted_phase == "auto" and market_phase_context.phase.value not in ("unknown", "auto"):
+                _persisted_phase = market_phase_context.phase.value
             market_phase_context_dict = market_phase_context.to_dict()
             market_phase_summary = render_market_phase_summary(market_phase_context_dict)
 
@@ -655,7 +659,7 @@ class StockAnalysisPipeline:
                         news_content=news_context,
                         context_snapshot=context_snapshot,
                         save_snapshot=self.save_context_snapshot,
-                        analysis_phase=getattr(self, "analysis_phase", "auto"),
+                        analysis_phase=_persisted_phase,
                         effective_trading_date=market_phase_context.effective_daily_bar_date
                     )
                     record_history_run(
@@ -1198,6 +1202,12 @@ class StockAnalysisPipeline:
                                 _eff_date = date.fromisoformat(str(_eff_str))
                             except (ValueError, TypeError):
                                 pass
+                    # Resolve persisted phase for agent path
+                    _agent_phase = getattr(self, "analysis_phase", "auto")
+                    if _agent_phase == "auto" and isinstance(market_phase_context, dict):
+                        _ctx_phase = market_phase_context.get("phase", "")
+                        if _ctx_phase and _ctx_phase not in ("unknown", "auto"):
+                            _agent_phase = _ctx_phase
 
                     saved_count = self.db.save_analysis_history(
                         result=result,
@@ -1206,7 +1216,7 @@ class StockAnalysisPipeline:
                         news_content=None,
                         context_snapshot=agent_context_snapshot,
                         save_snapshot=self.save_context_snapshot,
-                        analysis_phase=getattr(self, "analysis_phase", "auto"),
+                        analysis_phase=_agent_phase,
                         effective_trading_date=_eff_date,
                     )
                     record_history_run(
