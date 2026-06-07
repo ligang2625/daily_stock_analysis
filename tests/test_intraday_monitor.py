@@ -132,6 +132,18 @@ class TestCompareWithThresholds:
         types = [e.event_type for e in events]
         assert "unusual_volume" not in types
 
+    def test_take_profit_priority_over_near_buy_zone(self):
+        """take_profit=101, ideal_buy=100, price=101 -> enter_take_profit, not near_buy_zone."""
+        yesterday = {"ideal_buy": 100.0, "secondary_buy": 95.0, "stop_loss": 90.0, "take_profit": 101.0}
+        events = _compare_with_thresholds("000001", "测试", 101.0, 1.0, 2.0, yesterday, self._NOW)
+        assert events[0].event_type == "enter_take_profit"
+
+    def test_near_buy_zone_when_below_take_profit(self):
+        """Price at ideal_buy*1.02 but below take_profit -> near_buy_zone."""
+        yesterday = {"ideal_buy": 100.0, "secondary_buy": 95.0, "stop_loss": 90.0, "take_profit": 115.0}
+        events = _compare_with_thresholds("000001", "测试", 102.0, 1.0, 1.0, yesterday, self._NOW)
+        assert events[0].event_type == "near_buy_zone"
+
 
 # ============================================================
 # IntradayMonitor — load_yesterday_analysis
@@ -226,18 +238,19 @@ class TestMonitorSnapshot:
         monitor._initialized = False
         with patch.object(monitor, '_filter_unknown_market_stocks', side_effect=lambda x: x):
             with patch.object(monitor, '_is_stock_trading_today', return_value=True):
-                with patch.object(monitor, 'load_yesterday_analysis') as mock_load:
-                    with patch.object(monitor, 'clear_today_events') as mock_clear:
-                        with patch.object(monitor, '_snapshot_one_stock'):
-                            monitor._monitor_snapshot_locked()
-                            mock_load.assert_called_once()
-                            mock_clear.assert_called_once()
-                            assert monitor._initialized is True
+                with patch.object(monitor, '_get_stock_markets', return_value={"000001": "cn"}):
+                    with patch.object(monitor, 'load_yesterday_analysis') as mock_load:
+                        with patch.object(monitor, 'clear_today_events') as mock_clear:
+                            with patch.object(monitor, '_snapshot_one_stock'):
+                                monitor._monitor_snapshot_locked()
+                                mock_load.assert_called_once()
+                                mock_clear.assert_called_once()
+                                assert monitor._initialized is True
 
     def test_already_initialized_skips_init(self):
         monitor = _make_monitor(intraday_stocks="000001")
         monitor._initialized = True
-        monitor._daily_init_marker = monitor._get_daily_init_key()
+        monitor._daily_init_marker = monitor._get_daily_init_key("cn")
         with patch.object(monitor, '_filter_unknown_market_stocks', side_effect=lambda x: x):
             with patch.object(monitor, "_should_clear_events", return_value=False):
                 with patch.object(monitor, '_is_stock_trading_today', return_value=True):
@@ -272,18 +285,20 @@ class TestMonitorSnapshot:
 class TestFinalDecision:
     def test_non_trading_day_skips(self):
         monitor = _make_monitor()
-        with patch.object(monitor, '_is_trading_day', return_value=False):
-            with patch.object(monitor, '_load_today_events') as mock_load:
-                monitor._final_decision_locked()
-                mock_load.assert_not_called()
+        with patch.object(monitor, '_is_stock_trading_today', return_value=False):
+            with patch.object(monitor, '_get_stock_codes', return_value=["000001"]):
+                with patch.object(monitor, '_load_today_events') as mock_load:
+                    monitor._final_decision_locked()
+                    mock_load.assert_not_called()
 
     def test_no_events_empty_email(self):
         monitor = _make_monitor()
-        with patch.object(monitor, '_is_trading_day', return_value=True):
-            with patch.object(monitor, '_load_today_events', return_value=[]):
-                with patch.object(monitor, '_send_decision_email') as mock_send:
-                    monitor._final_decision_locked()
-                    mock_send.assert_not_called()
+        with patch.object(monitor, '_is_stock_trading_today', return_value=True):
+            with patch.object(monitor, '_get_stock_codes', return_value=["000001"]):
+                with patch.object(monitor, '_load_today_events', return_value=[]):
+                    with patch.object(monitor, '_send_decision_email') as mock_send:
+                        monitor._final_decision_locked()
+                        mock_send.assert_not_called()
 
 
 # ============================================================
@@ -297,11 +312,12 @@ def _make_monitor(intraday_stocks: str = ""):
     config.llm_model = "test-model"
     config.llm_max_tokens = 500
     config.llm_temperature = 0.3
-    # Explicitly set to False so MagicMock's truthy default doesn't trigger reset
+    # Explicitly set to False so MagicMock's truthy default doesn't trigger unintended behavior
     config.intraday_reset_on_start = False
     config.intraday_calendar_fail_open = False
     config.intraday_legacy_fallback_enabled = False
     config.intraday_unknown_market_policy = "skip"
+    config.intraday_force_run = False
 
     fetcher = MagicMock()
     db = MagicMock()
@@ -333,48 +349,6 @@ class TestResolveMarket:
         monitor = _make_monitor()
         monitor._config.market_review_region = 'both'
         assert monitor._resolve_primary_market() == 'cn'
-
-
-# ============================================================
-# IntradayMonitor — _is_trading_day
-# ============================================================
-
-class TestIsTradingDay:
-    @pytest.fixture(autouse=True)
-    def _check_deps(self):
-        try:
-            import pandas  # noqa: F401
-            from src.core import trading_calendar  # noqa: F401
-        except (ImportError, ModuleNotFoundError):
-            pytest.skip("pandas not available")
-
-    def test_trading_day_returns_true(self):
-        from src.core import trading_calendar as _tc
-        monitor = _make_monitor()
-        with patch.object(_tc, 'is_market_open', return_value=True):
-            assert monitor._is_trading_day() is True
-
-    def test_non_trading_day_returns_false(self):
-        from src.core import trading_calendar as _tc
-        monitor = _make_monitor()
-        with patch.object(_tc, 'is_market_open', return_value=False):
-            assert monitor._is_trading_day() is False
-
-    def test_calendar_error_fail_open(self):
-        from src.core import trading_calendar as _tc
-        monitor = _make_monitor()
-        monitor._config.intraday_calendar_fail_open = True
-        with patch.object(_tc, 'is_market_open', side_effect=RuntimeError("boom")):
-            assert monitor._is_trading_day() is True
-
-    def test_uses_configured_market(self):
-        from datetime import date
-        from src.core import trading_calendar as _tc
-        monitor = _make_monitor()
-        monitor._config.market_review_region = 'us'
-        with patch.object(_tc, 'is_market_open', return_value=True) as mock_is_open:
-            monitor._is_trading_day()
-            mock_is_open.assert_called_once_with('us', date.today())
 
 
 # ============================================================
@@ -681,7 +655,7 @@ class TestRestartPreservesEvents:
     def test_second_instance_does_not_clear(self):
         """New IntradayMonitor instance with same daily_init DB marker skips clear."""
         monitor1 = _make_monitor(intraday_stocks="000001")
-        marker = monitor1._get_daily_init_key()
+        marker = monitor1._get_daily_init_key("cn")
         monitor1._daily_init_marker = marker
         monitor1._initialized = True
 
@@ -692,7 +666,7 @@ class TestRestartPreservesEvents:
         # Mock DB to return today's marker (same as what first run persisted)
         monitor2._db.get_intraday_state = MagicMock(return_value=marker)
 
-        assert monitor2._should_clear_events() is False
+        assert monitor2._should_clear_events("cn") is False
 
     def test_new_trading_day_does_clear(self):
         """When daily init marker changes (DB returns different/None marker), should clear events."""
@@ -701,7 +675,7 @@ class TestRestartPreservesEvents:
         # DB also returns stale marker (or None)
         monitor._db.get_intraday_state = MagicMock(return_value="cn:2020-01-01")
         # Today's key is different (2026-06-07), so should clear
-        assert monitor._should_clear_events() is True
+        assert monitor._should_clear_events("cn") is True
 
 
 class TestFinalDecisionLoadsYesterday:
@@ -774,14 +748,14 @@ class TestPersistentMarkerRestart:
 
     def test_same_day_restart_preserves_events(self):
         monitor = _make_monitor(intraday_stocks="600519")
-        today_key = monitor._get_daily_init_key()
+        today_key = monitor._get_daily_init_key("cn")
         monitor._db.get_intraday_state = MagicMock(return_value=today_key)
-        assert monitor._should_clear_events() is False
+        assert monitor._should_clear_events("cn") is False
 
     def test_new_day_without_marker_clears(self):
         monitor = _make_monitor(intraday_stocks="600519")
         monitor._db.get_intraday_state = MagicMock(return_value=None)
-        assert monitor._should_clear_events() is True
+        assert monitor._should_clear_events("cn") is True
 
     def test_clear_today_events_with_reset_marker(self):
         monitor = _make_monitor(intraday_stocks="600519")
@@ -804,10 +778,11 @@ class TestPersistentMarkerRestart:
         with patch.object(monitor, 'clear_today_events') as mock_clear:
             with patch.object(monitor, 'load_yesterday_analysis'):
                 with patch.object(monitor, '_is_stock_trading_today', return_value=True):
-                    with patch.object(monitor, '_snapshot_one_stock', return_value=[]):
-                        with patch.object(monitor, '_should_clear_events', return_value=False):
-                            monitor._monitor_snapshot_locked()
-                            mock_clear.assert_called_once_with(reset_marker=True)
+                    with patch.object(monitor, '_get_stock_markets', return_value={"600519": "cn"}):
+                        with patch.object(monitor, '_snapshot_one_stock', return_value=[]):
+                            with patch.object(monitor, '_should_clear_events', return_value=False):
+                                monitor._monitor_snapshot_locked()
+                                mock_clear.assert_called_once_with(reset_marker=True)
 
 
 # ============================================================
@@ -827,16 +802,18 @@ class TestUnknownMarketHandling:
         monitor._config.intraday_unknown_market_policy = "skip"
         codes = monitor._get_stock_codes()
         assert "UNKNOWN999" in codes
-        filtered = monitor._filter_unknown_market_stocks(codes)
-        assert "UNKNOWN999" not in filtered
-        assert "600519" in filtered
+        with patch.object(monitor, '_get_market_for_stock', side_effect=lambda c: "cn" if c.isdigit() else None):
+            filtered = monitor._filter_unknown_market_stocks(codes)
+            assert "UNKNOWN999" not in filtered
+            assert "600519" in filtered
 
     def test_cn_compat_mode_keeps_unknown(self):
         monitor = _make_monitor(intraday_stocks="600519,UNKNOWN999")
         monitor._config.intraday_unknown_market_policy = "cn_compat"
         codes = monitor._get_stock_codes()
-        filtered = monitor._filter_unknown_market_stocks(codes)
-        assert "UNKNOWN999" in filtered
+        with patch.object(monitor, '_get_market_for_stock', side_effect=lambda c: "cn" if c.isdigit() else None):
+            filtered = monitor._filter_unknown_market_stocks(codes)
+            assert "UNKNOWN999" in filtered
 
     def test_save_event_skips_unknown_market(self):
         event = IntradayEvent(
@@ -852,9 +829,10 @@ class TestUnknownMarketHandling:
         monitor = _make_monitor(intraday_stocks="UNKNOWN999")
         monitor._config.intraday_unknown_market_policy = "skip"
         monitor._db.session_scope = MagicMock()
-        with patch.object(monitor._db, 'session_scope') as mock_scope:
-            monitor._save_event(event)
-            mock_scope.assert_not_called()
+        with patch.object(monitor, '_get_market_for_stock', return_value=None):
+            with patch.object(monitor._db, 'session_scope') as mock_scope:
+                monitor._save_event(event)
+                mock_scope.assert_not_called()
 
 
 # ============================================================

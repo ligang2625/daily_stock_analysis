@@ -30,6 +30,8 @@ from datetime import datetime, date, timedelta
 import atexit
 from typing import Any, Callable, Dict, List, Optional, Set
 
+from src.core.intraday_prompt import format_intraday_event_time
+
 logger = logging.getLogger(__name__)
 
 # Module-level executor for realtime quote timeout (shared across instances)
@@ -152,17 +154,6 @@ def _compare_with_thresholds(
             event_type="enter_ideal_buy",
             description=f"当前价 {current_price} 进入理想买入区间 ({secondary_buy}, {ideal_buy}]",
         )
-    elif ideal_buy is not None and ideal_buy < current_price <= ideal_buy * 1.02:
-        price_event = IntradayEvent(
-            timestamp=now,
-            stock_code=stock_code,
-            stock_name=stock_name,
-            current_price=current_price,
-            volume_ratio=volume_ratio,
-            change_pct=change_pct,
-            event_type="near_buy_zone",
-            description=f"当前价 {current_price} 接近买入区间 (理想买入 {ideal_buy}, 偏离 {(current_price / ideal_buy - 1) * 100:.1f}%)",
-        )
     elif take_profit is not None and current_price >= take_profit:
         price_event = IntradayEvent(
             timestamp=now,
@@ -173,6 +164,17 @@ def _compare_with_thresholds(
             change_pct=change_pct,
             event_type="enter_take_profit",
             description=f"当前价 {current_price} >= 止盈位 {take_profit}",
+        )
+    elif ideal_buy is not None and ideal_buy < current_price <= ideal_buy * 1.02:
+        price_event = IntradayEvent(
+            timestamp=now,
+            stock_code=stock_code,
+            stock_name=stock_name,
+            current_price=current_price,
+            volume_ratio=volume_ratio,
+            change_pct=change_pct,
+            event_type="near_buy_zone",
+            description=f"当前价 {current_price} 接近买入区间 (理想买入 {ideal_buy}, 偏离 {(current_price / ideal_buy - 1) * 100:.1f}%)",
         )
     else:
         # No threshold hit, record price-only
@@ -185,6 +187,23 @@ def _compare_with_thresholds(
             change_pct=change_pct,
             event_type="price_only",
             description=f"当前价 {current_price}，未触及任何阈值",
+        )
+
+    # --- Anomalous config warnings ---
+    if take_profit is not None and ideal_buy is not None and take_profit <= ideal_buy:
+        logger.warning(
+            "异常阈值配置 [%s]: take_profit(%.2f) <= ideal_buy(%.2f)，止盈可能被买入区间覆盖",
+            stock_code, take_profit, ideal_buy,
+        )
+    if secondary_buy is not None and ideal_buy is not None and secondary_buy >= ideal_buy:
+        logger.warning(
+            "异常阈值配置 [%s]: secondary_buy(%.2f) >= ideal_buy(%.2f)",
+            stock_code, secondary_buy, ideal_buy,
+        )
+    if stop_loss is not None and secondary_buy is not None and stop_loss >= secondary_buy:
+        logger.warning(
+            "异常阈值配置 [%s]: stop_loss(%.2f) >= secondary_buy(%.2f)",
+            stock_code, stop_loss, secondary_buy,
         )
 
     events.append(price_event)
@@ -355,8 +374,12 @@ class IntradayMonitor:
         stock_markets = self._get_stock_markets(stock_codes)
 
         try:
-            from src.core.trading_calendar import get_effective_trading_date
+            from src.core.trading_calendar import (
+                get_intraday_baseline_trading_date,
+                get_effective_trading_date,
+            )
         except Exception:
+            get_intraday_baseline_trading_date = None
             get_effective_trading_date = None
 
         # Group stocks by market (None/unknown → logged, skipped unless cn_compat policy)
@@ -395,9 +418,9 @@ class IntradayMonitor:
                         continue
 
                     # Per-market target trading date
-                    if get_effective_trading_date:
+                    if get_intraday_baseline_trading_date:
                         try:
-                            target_trading_date = get_effective_trading_date(market)
+                            target_trading_date = get_intraday_baseline_trading_date(market)
                         except Exception:
                             target_trading_date = date.today() - timedelta(days=1)
                     else:
@@ -590,12 +613,9 @@ class IntradayMonitor:
         self._yesterday_analysis = result
         return result
 
-    def _get_daily_init_key(self) -> str:
-        """Return a unique key for today's initialization state.
-        Uses the primary market's local date so multi-market setups get a stable key.
-        """
-        primary_market = self._resolve_primary_market()
-        return f"{primary_market}:{self._get_market_query_date(primary_market)}"
+    def _get_daily_init_key(self, market: str) -> str:
+        """Return a unique key for today's initialization state for a given market."""
+        return f"{market}:{self._get_market_query_date(market)}"
 
     def _resolve_primary_market(self) -> str:
         """Determine primary market for global checks (config-driven)."""
@@ -604,14 +624,14 @@ class IntradayMonitor:
             return region
         return 'cn'
 
-    def _should_clear_events(self) -> bool:
-        """Return True only on genuinely new trading day (persistent marker doesn't match).
+    def _should_clear_events(self, market: str) -> bool:
+        """Return True only on genuinely new trading day for a given market (persistent marker doesn't match).
 
         On process restart within same trading day, the persistent marker in DB
         matches today's key → returns False (events preserved).
         """
-        today_key = self._get_daily_init_key()
-        persistent_key = f"daily_init:{self._resolve_primary_market()}"
+        today_key = self._get_daily_init_key(market)
+        persistent_key = f"daily_init:{market}"
         try:
             persistent_value = self._db.get_intraday_state(persistent_key)
         except Exception:
@@ -623,16 +643,16 @@ class IntradayMonitor:
         # Genuinely new trading day (or first-ever run)
         return True
 
-    def _persist_init_marker(self) -> None:
-        """Write persistent init marker so restarts don't re-clear today's events."""
-        today_key = self._get_daily_init_key()
-        persistent_key = f"daily_init:{self._resolve_primary_market()}"
+    def _persist_init_marker(self, market: str) -> None:
+        """Write persistent init marker for a given market so restarts don't re-clear today's events."""
+        today_key = self._get_daily_init_key(market)
+        persistent_key = f"daily_init:{market}"
         try:
             self._db.set_intraday_state(persistent_key, today_key)
             self._daily_init_marker = today_key
-            logger.info("Persisted intraday init marker: %s", today_key)
+            logger.info("Persisted intraday init marker for %s: %s", market, today_key)
         except Exception as exc:
-            logger.warning("Failed to persist intraday init marker: %s", exc)
+            logger.warning("Failed to persist intraday init marker for %s: %s", market, exc)
             self._daily_init_marker = today_key  # Still set memory marker on failure
 
     def clear_today_events(self, markets: Optional[List[str]] = None, reset_marker: bool = False) -> None:
@@ -655,17 +675,19 @@ class IntradayMonitor:
                     )
                 session.commit()
             logger.info("已清空当天盘中事件: markets=%s reset_marker=%s", markets, reset_marker)
-
-            if reset_marker:
-                persistent_key = f"daily_init:{self._resolve_primary_market()}"
-                try:
-                    self._db.set_intraday_state(persistent_key, "")
-                    self._daily_init_marker = None
-                    logger.info("已重置持久化 init marker (--reset-intraday-events)")
-                except Exception as exc:
-                    logger.warning("重置持久化 init marker 失败: %s", exc)
         except Exception as exc:
             logger.warning("清空当天盘中事件失败（可能表不存在）: %s", exc)
+
+        # Reset marker independent of event deletion success
+        if reset_marker:
+            for mkt in ['cn', 'hk', 'us']:
+                persistent_key = f"daily_init:{mkt}"
+                try:
+                    self._db.set_intraday_state(persistent_key, "")
+                except Exception:
+                    pass
+            self._daily_init_marker = None
+            logger.info("已重置所有市场持久化 init marker")
 
     # ------------------------------------------------------------------
     # Snapshot
@@ -713,16 +735,21 @@ class IntradayMonitor:
             except Exception:
                 pass
 
-        # Lazy init on first call of a new trading day
-        if not self._initialized or self._should_clear_events():
+        # Per-market lazy init
+        stock_markets = self._get_stock_markets(stock_codes)
+        markets_seen: set = set()
+        for stock_code in stock_codes:
+            mkt = stock_markets.get(stock_code)
+            if mkt and mkt not in markets_seen:
+                markets_seen.add(mkt)
+                if self._should_clear_events(mkt):
+                    self.clear_today_events(markets=[mkt])
+                    self._persist_init_marker(mkt)
+                elif self._daily_init_marker is None:
+                    self._persist_init_marker(mkt)
+
+        if not self._initialized:
             self.load_yesterday_analysis(stock_codes)
-            # Only clear events on genuinely new trading day (not on restart)
-            if self._should_clear_events():
-                self.clear_today_events()
-                self._persist_init_marker()
-            elif self._daily_init_marker is None:
-                # First call on restart — persist existing marker to avoid future clears
-                self._persist_init_marker()
             self._initialized = True
             logger.info("盘中监控初始化完成，监控 %d 支股票", len(stock_codes))
 
@@ -870,6 +897,7 @@ class IntradayMonitor:
             events=all_events,
             yesterday_analysis=self._yesterday_analysis,
             snapshot_times=self._snapshot_times,
+            markets=markets,
         )
 
         # Call LLM with 3 retries
@@ -918,7 +946,7 @@ class IntradayMonitor:
             vol = f"{e.volume_ratio:.1f}" if e.volume_ratio is not None else "-"
             chg = f"{e.change_pct:+.2f}%" if e.change_pct is not None else "-"
             lines.append(
-                f"| {e.timestamp.strftime('%H:%M')} | {e.stock_name}({e.stock_code}) | "
+                f"| {format_intraday_event_time(e)} | {e.stock_name}({e.stock_code}) | "
                 f"{e.current_price:.2f} | {vol} | {chg} | {e.event_type} | {e.description} |"
             )
         return "\n".join(lines)
@@ -1025,7 +1053,7 @@ class IntradayMonitor:
                 if market:
                     rows = conn.execute(
                         sa_text(
-                            "SELECT timestamp, stock_code, stock_name, current_price, "
+                            "SELECT timestamp, stock_code, stock_name, current_price, market_local_timestamp, "
                             "volume_ratio, change_pct, event_type, description "
                             "FROM intraday_events "
                             "WHERE query_date = :qd AND market = :mkt ORDER BY timestamp"
@@ -1035,7 +1063,7 @@ class IntradayMonitor:
                 else:
                     rows = conn.execute(
                         sa_text(
-                            "SELECT timestamp, stock_code, stock_name, current_price, "
+                            "SELECT timestamp, stock_code, stock_name, current_price, market_local_timestamp, "
                             "volume_ratio, change_pct, event_type, description "
                             "FROM intraday_events WHERE query_date = :qd ORDER BY timestamp"
                         ),
@@ -1051,11 +1079,13 @@ class IntradayMonitor:
                         stock_code=str(row[1] or ""),
                         stock_name=str(row[2] or ""),
                         current_price=float(row[3] or 0),
-                        volume_ratio=float(row[4]) if row[4] is not None else None,
-                        change_pct=float(row[5]) if row[5] is not None else None,
-                        event_type=str(row[6] or "price_only"),
-                        description=str(row[7] or ""),
+                        volume_ratio=float(row[5]) if row[5] is not None else None,
+                        change_pct=float(row[6]) if row[6] is not None else None,
+                        event_type=str(row[7] or "price_only"),
+                        description=str(row[8] or ""),
                     ))
+                    if len(row) > 4 and row[4] is not None:
+                        events[-1].market_local_timestamp = str(row[4])
         except Exception as exc:
             logger.warning("加载盘中事件失败: %s", exc)
 
@@ -1113,24 +1143,6 @@ class IntradayMonitor:
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
-
-    def _is_trading_day(self) -> bool:
-        """Check if today is a trading day for the primary configured market.
-        Deprecated in favor of _is_stock_trading_today() for multi-market setups.
-        """
-        try:
-            from src.core.trading_calendar import is_market_open
-            market = self._resolve_primary_market()
-            market_date = self._get_market_query_date(market)
-            market_date_obj = date.fromisoformat(market_date)
-            return is_market_open(market, market_date_obj)
-        except Exception as exc:
-            fail_open = getattr(self._config, 'intraday_calendar_fail_open', False)
-            if fail_open:
-                logger.warning("交易日检测异常，fail-open 按交易日处理: %s", exc)
-                return True
-            logger.warning("交易日检测异常，fail-closed 跳过: %s", exc)
-            return False
 
     def _is_stock_trading_today(self, code: str) -> bool:
         """Check if the market for a specific stock is open today. Uses strict calendar."""

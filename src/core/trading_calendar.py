@@ -258,6 +258,45 @@ def get_effective_trading_date(
         return fallback_date
 
 
+def get_intraday_baseline_trading_date(
+    market: Optional[str], current_time: Optional[datetime] = None
+) -> date:
+    """
+    Return the trading day whose postmarket analysis is the baseline for intraday monitoring.
+
+    This is ALWAYS the session before the current (or most recent) trading session.
+    Different from get_effective_trading_date() which returns the CURRENT effective session.
+
+    Rules:
+    - Trading day -> previous_session (Mon->Fri, Fri->Thu, Wed->Tue)
+    - Non-trading day -> most_recent_session, then previous (Sat->Thu)
+    - Calendar unavailable -> fallback to yesterday
+    """
+    market_now = get_market_now(market, current_time)
+    fallback = market_now.date() - timedelta(days=1)
+
+    if not _XCALS_AVAILABLE:
+        return fallback
+
+    ex = MARKET_EXCHANGE.get(market or "")
+    tz_name = MARKET_TIMEZONE.get(market or "")
+    if not ex or not tz_name:
+        return fallback
+
+    try:
+        cal = xcals.get_calendar(ex)
+        local_date = market_now.date()
+
+        if cal.is_session(local_date):
+            session = cal.date_to_session(local_date, direction="previous")
+        else:
+            session = cal.date_to_session(local_date, direction="previous")
+
+        return cal.previous_session(session).date()
+    except Exception:
+        return fallback
+
+
 def _as_market_datetime(value: Any, tz_name: str) -> Optional[datetime]:
     """
     Convert exchange-calendar timestamps into market-local datetimes.
