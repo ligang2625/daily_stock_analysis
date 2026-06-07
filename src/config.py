@@ -911,6 +911,16 @@ class Config:
     intraday_monitor_stocks: str = ""
     # 盘中决策时间（HH:MM 格式），14:30 执行最终决策
     intraday_monitor_decision_time: str = "14:30"
+    # 未知市场策略: skip（跳过）, cn_compat（兼容旧行为按A股处理）
+    intraday_unknown_market_policy: str = "skip"
+    # 交易日历不可用时是否继续执行盘中任务（默认 fail-closed）
+    intraday_calendar_fail_open: bool = False
+    # 是否启用旧数据 fallback（默认关闭，避免掩盖主路径问题）
+    intraday_legacy_fallback_enabled: bool = False
+    # 启动时是否强制 reset 当天盘中事件（默认 false，重启不清空）
+    intraday_reset_on_start: bool = False
+    # 强制运行盘中任务（跳过交易日检查）
+    intraday_force_run: bool = False
 
     # === 实时行情增强数据配置 ==="
     # 实时行情开关（关闭后使用历史收盘价进行分析）
@@ -1720,6 +1730,11 @@ class Config:
             intraday_monitor_enabled=os.getenv('INTRADAY_MONITOR_ENABLED', 'false').lower() == 'true',
             intraday_monitor_stocks=os.getenv('INTRADAY_MONITOR_STOCKS', ''),
             intraday_monitor_decision_time=os.getenv('INTRADAY_MONITOR_DECISION_TIME', '14:30'),
+            intraday_unknown_market_policy=os.getenv('INTRADAY_UNKNOWN_MARKET_POLICY', 'skip'),
+            intraday_calendar_fail_open=os.getenv('INTRADAY_CALENDAR_FAIL_OPEN', 'false').lower() == 'true',
+            intraday_legacy_fallback_enabled=os.getenv('INTRADAY_LEGACY_FALLBACK_ENABLED', 'false').lower() == 'true',
+            intraday_reset_on_start=os.getenv('INTRADAY_RESET_ON_START', 'false').lower() == 'true',
+            intraday_force_run=os.getenv('INTRADAY_FORCE_RUN', 'false').lower() == 'true',
             webui_enabled=os.getenv('WEBUI_ENABLED', 'false').lower() == 'true',
             webui_host=os.getenv('WEBUI_HOST', '127.0.0.1'),
             webui_port=parse_env_int(os.getenv('WEBUI_PORT'), 8000, field_name='WEBUI_PORT', minimum=1, maximum=65535),

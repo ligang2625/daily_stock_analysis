@@ -156,6 +156,35 @@ def is_market_open(market: str, check_date: date) -> bool:
         return True
 
 
+def is_market_open_strict(market: str, check_date: date) -> tuple:
+    """
+    Strict trading-day check with explicit status. Never fail-open silently.
+
+    Args:
+        market: 'cn' | 'hk' | 'us'
+        check_date: Date to check
+
+    Returns:
+        Tuple of (is_open: Optional[bool], status: str)
+        status values: "open", "closed", "calendar_unavailable",
+                       "unknown_market", "error"
+    """
+    if not _XCALS_AVAILABLE:
+        return (None, "calendar_unavailable")
+    ex = MARKET_EXCHANGE.get(market)
+    if not ex:
+        return (None, "unknown_market")
+    try:
+        cal = xcals.get_calendar(ex)
+        session = datetime(check_date.year, check_date.month, check_date.day)
+        is_open = cal.is_session(session)
+        return (is_open, "open" if is_open else "closed")
+    except Exception as e:
+        logger.warning("trading_calendar.is_market_open_strict error for %s on %s: %s",
+                       market, check_date, e)
+        return (None, "error")
+
+
 def get_market_now(
     market: Optional[str], current_time: Optional[datetime] = None
 ) -> datetime:

@@ -929,9 +929,52 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
                         "ALTER TABLE analysis_history ADD COLUMN effective_trading_date DATE"
                     ))
                     logger.info("Schema migration: added analysis_history.effective_trading_date")
+
+                # intraday_monitor_state table for persistent restart-safe markers
+                conn.execute(sa_text(
+                    "CREATE TABLE IF NOT EXISTS intraday_monitor_state ("
+                    "  key TEXT PRIMARY KEY,"
+                    "  value TEXT NOT NULL,"
+                    "  updated_at TEXT NOT NULL"
+                    ")"
+                ))
                 session.commit()
         except Exception as exc:
             logger.warning("Schema migration error (non-fatal): %s", exc)
+
+    def get_intraday_state(self, key: str) -> Optional[str]:
+        """Read a persistent state value by key from intraday_monitor_state."""
+        try:
+            with self._SessionLocal() as session:
+                conn = session.connection()
+                from sqlalchemy import text as sa_text
+                row = conn.execute(
+                    sa_text("SELECT value FROM intraday_monitor_state WHERE key = :key"),
+                    {"key": key},
+                ).fetchone()
+                return row[0] if row else None
+        except Exception as exc:
+            logger.warning("get_intraday_state(%r) failed: %s", key, exc)
+            return None
+
+    def set_intraday_state(self, key: str, value: str) -> None:
+        """Upsert a persistent state value with timestamp."""
+        try:
+            from datetime import datetime as dt
+            now_iso = dt.now().isoformat()
+            with self._SessionLocal() as session:
+                conn = session.connection()
+                from sqlalchemy import text as sa_text
+                conn.execute(
+                    sa_text(
+                        "INSERT OR REPLACE INTO intraday_monitor_state (key, value, updated_at) "
+                        "VALUES (:key, :value, :updated_at)"
+                    ),
+                    {"key": key, "value": value, "updated_at": now_iso},
+                )
+                session.commit()
+        except Exception as exc:
+            logger.warning("set_intraday_state(%r) failed: %s", key, exc)
 
     @classmethod
     def get_instance(cls) -> 'DatabaseManager':

@@ -321,6 +321,12 @@ def parse_arguments() -> argparse.Namespace:
     )
 
     parser.add_argument(
+        '--reset-intraday-events',
+        action='store_true',
+        help='清空当天盘中事件后重新开始（覆盖 persistent init marker）'
+    )
+
+    parser.add_argument(
         '--no-run-immediately',
         action='store_true',
         help='定时任务启动时不立即执行一次'
@@ -501,7 +507,8 @@ def _refresh_stock_index_cache_for_analysis(config: Config) -> None:
 def run_full_analysis(
     config: Config,
     args: argparse.Namespace,
-    stock_codes: Optional[List[str]] = None
+    stock_codes: Optional[List[str]] = None,
+    analysis_phase: str = "auto",
 ):
     """
     执行完整的分析流程（个股 + 大盘复盘）
@@ -557,7 +564,8 @@ def run_full_analysis(
             max_workers=args.workers,
             query_id=query_id,
             query_source="cli",
-            save_context_snapshot=save_context_snapshot
+            save_context_snapshot=save_context_snapshot,
+            analysis_phase=analysis_phase,
         )
 
         # 1. 运行个股分析
@@ -982,6 +990,10 @@ def main() -> int:
             if getattr(args, 'force_run', False):
                 config.intraday_force_run = True
 
+            # Propagate --reset-intraday-events to clear persistent marker
+            if getattr(args, 'reset_intraday_events', False):
+                config.intraday_reset_on_start = True
+
             monitor = IntradayMonitor(
                 config=config,
                 fetcher_manager=fetcher_mgr,
@@ -1016,7 +1028,8 @@ def main() -> int:
 
             def scheduled_task():
                 runtime_config = _reload_runtime_config()
-                run_full_analysis(runtime_config, args, scheduled_stock_codes)
+                run_full_analysis(runtime_config, args, scheduled_stock_codes,
+                                  analysis_phase="postmarket")
 
             scheduler = Scheduler(
                 schedule_time=config.schedule_time,

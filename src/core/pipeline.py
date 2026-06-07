@@ -77,6 +77,45 @@ from bot.models import BotMessage
 
 logger = logging.getLogger(__name__)
 
+# Valid persisted analysis phases
+_PERSISTED_ANALYSIS_PHASES = frozenset({"premarket", "intraday", "postmarket", "unknown"})
+_PHASE_OVERRIDABLE = frozenset({"auto", "unknown"})
+
+
+def _resolve_analysis_phase(requested_phase: str, context_phase_value: str) -> str:
+    """Resolve analysis phase for persistence.
+
+    Rules:
+    - If caller passes explicit valid phase (premarket/intraday/postmarket): respect it.
+    - If caller passes "auto": resolve from context (calendar-inferred phase).
+    - If context phase is "unknown" or unresolvable: log warning, return "unknown".
+    - Never return "auto" for persistence.
+
+    Args:
+        requested_phase: Phase value from self.analysis_phase
+        context_phase_value: Phase string from market_phase_context (or dict)
+
+    Returns:
+        Resolved phase string suitable for database persistence
+    """
+    requested = str(requested_phase or "auto").strip().lower()
+    ctx_phase = str(context_phase_value or "").strip().lower()
+
+    if requested in _PERSISTED_ANALYSIS_PHASES:
+        return requested
+
+    # requested == "auto": resolve from context
+    if ctx_phase and ctx_phase not in _PHASE_OVERRIDABLE:
+        return ctx_phase
+
+    # Cannot resolve — log and persist as "unknown"
+    logger.warning(
+        "Cannot resolve analysis_phase: requested=%r context_phase=%r. "
+        "Persisting as 'unknown'. This may cause intraday monitor to miss this analysis.",
+        requested_phase, context_phase_value,
+    )
+    return "unknown"
+
 # 防御性 guard：当实例绕过 __init__（如测试中 __new__）构造时，
 # double-check 初始化 _single_stock_notify_lock 仍然线程安全。
 _SINGLE_STOCK_NOTIFY_LOCK_INIT_GUARD = threading.Lock()
@@ -306,9 +345,10 @@ class StockAnalysisPipeline:
                 analysis_phase=getattr(self, "analysis_phase", "auto"),
             )
             # Resolve persisted phase: if caller left "auto", use calendar-inferred phase
-            _persisted_phase = getattr(self, "analysis_phase", "auto")
-            if _persisted_phase == "auto" and market_phase_context.phase.value not in ("unknown", "auto"):
-                _persisted_phase = market_phase_context.phase.value
+            _persisted_phase = _resolve_analysis_phase(
+                getattr(self, "analysis_phase", "auto"),
+                market_phase_context.phase.value,
+            )
             market_phase_context_dict = market_phase_context.to_dict()
             market_phase_summary = render_market_phase_summary(market_phase_context_dict)
 
@@ -1203,11 +1243,10 @@ class StockAnalysisPipeline:
                             except (ValueError, TypeError):
                                 pass
                     # Resolve persisted phase for agent path
-                    _agent_phase = getattr(self, "analysis_phase", "auto")
-                    if _agent_phase == "auto" and isinstance(market_phase_context, dict):
-                        _ctx_phase = market_phase_context.get("phase", "")
-                        if _ctx_phase and _ctx_phase not in ("unknown", "auto"):
-                            _agent_phase = _ctx_phase
+                    _agent_phase = _resolve_analysis_phase(
+                        getattr(self, "analysis_phase", "auto"),
+                        market_phase_context.get("phase", "") if isinstance(market_phase_context, dict) else "",
+                    )
 
                     saved_count = self.db.save_analysis_history(
                         result=result,
