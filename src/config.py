@@ -921,6 +921,14 @@ class Config:
     intraday_reset_on_start: bool = False
     # 强制运行盘中任务（跳过交易日检查）
     intraday_force_run: bool = False
+    # CN 批量预取: True=启用自动批量获取A股行情
+    intraday_cn_batch_first: bool = True
+    # CN 批量阈值: 监控股票数 >= 此值时触发全市场批量获取
+    intraday_cn_batch_threshold: int = 3
+    # HK 批量主接口超时 (stock_hk_spot_em)
+    intraday_hk_batch_primary_timeout: float = 20.0
+    # HK 批量备用接口超时 (stock_hk_spot)
+    intraday_hk_batch_fallback_timeout: float = 60.0
 
     # === 实时行情增强数据配置 ==="
     # 实时行情开关（关闭后使用历史收盘价进行分析）
@@ -1735,6 +1743,10 @@ class Config:
             intraday_legacy_fallback_enabled=os.getenv('INTRADAY_LEGACY_FALLBACK_ENABLED', 'false').lower() == 'true',
             intraday_reset_on_start=os.getenv('INTRADAY_RESET_ON_START', 'false').lower() == 'true',
             intraday_force_run=os.getenv('INTRADAY_FORCE_RUN', 'false').lower() == 'true',
+            intraday_cn_batch_first=os.getenv('INTRADAY_CN_BATCH_FIRST', 'true').lower() == 'true',
+            intraday_cn_batch_threshold=parse_env_int(os.getenv('INTRADAY_CN_BATCH_THRESHOLD'), 3, field_name='INTRADAY_CN_BATCH_THRESHOLD', minimum=1),
+            intraday_hk_batch_primary_timeout=parse_env_float(os.getenv('INTRADAY_HK_BATCH_PRIMARY_TIMEOUT'), 20.0, field_name='INTRADAY_HK_BATCH_PRIMARY_TIMEOUT', minimum=5.0),
+            intraday_hk_batch_fallback_timeout=parse_env_float(os.getenv('INTRADAY_HK_BATCH_FALLBACK_TIMEOUT'), 60.0, field_name='INTRADAY_HK_BATCH_FALLBACK_TIMEOUT', minimum=10.0),
             webui_enabled=os.getenv('WEBUI_ENABLED', 'false').lower() == 'true',
             webui_host=os.getenv('WEBUI_HOST', '127.0.0.1'),
             webui_port=parse_env_int(os.getenv('WEBUI_PORT'), 8000, field_name='WEBUI_PORT', minimum=1, maximum=65535),

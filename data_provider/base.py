@@ -33,6 +33,13 @@ from .yfinance_fundamental_adapter import YfinanceFundamentalAdapter
 # 配置日志
 logger = logging.getLogger(__name__)
 
+# 每个快照的行情缓存 — 委托给 RealtimeSnapshotCache (realtime_types.py)
+# 保留模块级别名避免破坏现有 import
+_snapshot_cache: Dict[str, Dict[str, Any]] = {}
+_snapshot_cache_lock = RLock()
+
+# 从 realtime_types 导入 RealtimeSnapshotCache
+from .realtime_types import RealtimeSnapshotCache, RealtimeBatchResult, is_bulk_source, BULK_SOURCE_REGISTRY
 
 # === 标准化列名定义 ===
 STANDARD_COLUMNS = ['date', 'open', 'high', 'low', 'close', 'volume', 'amount', 'pct_chg']
@@ -1466,6 +1473,334 @@ class DataFetcherManager:
             "TushareFetcher": "tushare",
         }
         return mapping.get(fetcher_name, fetcher_name.replace("Fetcher", "").lower())
+
+    # -----------------------------------------------------------------------
+    # Batch realtime quote methods (per-snapshot caching)
+    # -----------------------------------------------------------------------
+
+    def get_realtime_quotes_batch(
+        self,
+        codes: List[str],
+        markets: Set[str],
+        snapshot_id: str,
+    ) -> Dict[str, Optional]:
+        """
+        Batch realtime quote fetching with per-market routing.
+
+        Delegates to per-market specialized methods:
+        - HK: get_hk_realtime_quotes_batch (primary+fallback with cache)
+        - CN: get_cn_realtime_quotes_batch (auto batch with threshold)
+        - US: get_us_realtime_quotes_batch_light (light batch)
+        """
+        from collections import OrderedDict
+        result: Dict[str, Optional] = OrderedDict()
+
+        for mkt in markets:
+            if mkt == 'hk':
+                batch = self.get_hk_realtime_quotes_batch(codes, snapshot_id)
+            elif mkt == 'cn':
+                batch = self.get_cn_realtime_quotes_batch(codes, snapshot_id)
+            elif mkt == 'us':
+                batch = self.get_us_realtime_quotes_batch_light(codes, snapshot_id)
+            else:
+                # Unknown market: per-stock
+                batch = {}
+                for code in codes:
+                    batch[code] = self.get_realtime_quote(code, log_final_failure=False)
+
+            if batch:
+                result.update(batch)
+            # Fill in missing stocks as None
+            for code in codes:
+                if code not in result:
+                    result[code] = None
+
+        return result
+
+    def get_hk_realtime_quotes_batch(
+        self,
+        codes: List[str],
+        snapshot_id: str,
+    ) -> Optional[Dict[str, Optional]]:
+        """
+        HK batch-first: primary stock_hk_spot_em -> fallback stock_hk_spot.
+        Cached per snapshot_id so at most 1 call per interface per snapshot.
+        """
+        # Try primary: stock_hk_spot_em
+        primary_key = "hk:akshare_hk_spot_em"
+        cached = RealtimeSnapshotCache.get(snapshot_id, primary_key, ttl=90.0)
+        if cached is not None:
+            logger.info("[批量行情] HK primary cache hit: snapshot=%s key=%s", snapshot_id, primary_key)
+            return cached
+
+        result = self._fetch_hk_batch_primary(codes)
+        if result is not None:
+            RealtimeSnapshotCache.set(snapshot_id, primary_key, result, ttl=90.0)
+            return result
+
+        # Fallback: stock_hk_spot (full market, slower)
+        fallback_key = "hk:akshare_hk_spot"
+        cached = RealtimeSnapshotCache.get(snapshot_id, fallback_key, ttl=90.0)
+        if cached is not None:
+            logger.info("[批量行情] HK fallback cache hit: snapshot=%s key=%s", snapshot_id, fallback_key)
+            return cached
+
+        result = self._fetch_hk_batch(codes, source="stock_hk_spot")
+        if result is not None:
+            RealtimeSnapshotCache.set(snapshot_id, fallback_key, result, ttl=90.0)
+            return result
+
+        return None
+
+    def get_cn_realtime_quotes_batch(
+        self,
+        codes: List[str],
+        snapshot_id: str,
+    ) -> Optional[Dict[str, Optional]]:
+        """
+        CN auto batch: if stock count >= config threshold, use akshare A-share spot.
+        Otherwise falls through to per-stock get_realtime_quote.
+        """
+        # Read config (accessible via self._fetchers context or global config)
+        try:
+            from src.config import get_config
+            config = get_config()
+        except Exception:
+            config = None
+
+        batch_first = True
+        batch_threshold = 3
+        if config is not None:
+            batch_first = getattr(config, 'intraday_cn_batch_first', True)
+            batch_threshold = getattr(config, 'intraday_cn_batch_threshold', 3)
+
+        if not batch_first or len(codes) < batch_threshold:
+            logger.info(
+                "[批量行情] CN batch skipped (batch_first=%s count=%d threshold=%d)",
+                batch_first, len(codes), batch_threshold,
+            )
+            return None
+
+        cache_key = "cn:akshare_cn_spot"
+        cached = RealtimeSnapshotCache.get(snapshot_id, cache_key, ttl=90.0)
+        if cached is not None:
+            logger.info("[批量行情] CN cache hit: snapshot=%s key=%s", snapshot_id, cache_key)
+            return cached
+
+        result = self._fetch_cn_batch(codes)
+        if result is not None:
+            RealtimeSnapshotCache.set(snapshot_id, cache_key, result, ttl=90.0)
+            return result
+
+        return None
+
+    def get_us_realtime_quotes_batch_light(
+        self,
+        codes: List[str],
+        snapshot_id: str,
+    ) -> Optional[Dict[str, Optional]]:
+        """
+        US light batch: yfinance multi-ticker if available.
+        Falls back to per-stock get_realtime_quote.
+        """
+        if len(codes) <= 1:
+            return None
+
+        cache_key = "us:yfinance_batch"
+        cached = RealtimeSnapshotCache.get(snapshot_id, cache_key, ttl=60.0)
+        if cached is not None:
+            return cached
+
+        # Try yfinance.download for multiple tickers
+        import time as _time
+        start = _time.time()
+        try:
+            import yfinance as yf
+            tickers = " ".join(codes)
+            logger.info("[批量行情] 通过 yfinance.download 获取美股行情: %s", tickers)
+            df = yf.download(tickers, period="1d", interval="1m", progress=False, group_by="ticker")
+            api_elapsed = _time.time() - start
+            logger.info("[批量行情] yfinance.download 成功: %d codes, 耗时 %.2fs", len(codes), api_elapsed)
+
+            from .realtime_types import UnifiedRealtimeQuote
+            result: Dict[str, Optional] = {}
+            for code in codes:
+                try:
+                    if isinstance(df.columns, pd.MultiIndex):
+                        if code in df.columns.levels[1]:
+                            price = float(df[('Close', code)].dropna().iloc[-1]) if not df[('Close', code)].dropna().empty else None
+                        else:
+                            result[code] = None
+                            continue
+                    else:
+                        price = float(df['Close'].dropna().iloc[-1]) if not df['Close'].dropna().empty else None
+
+                    result[code] = UnifiedRealtimeQuote(
+                        code=code,
+                        name=code,
+                        price=price,
+                    )
+                except Exception:
+                    result[code] = None
+
+            RealtimeSnapshotCache.set(snapshot_id, cache_key, result, ttl=60.0)
+            return result
+        except Exception as exc:
+            logger.warning("[批量行情] yfinance US batch 失败: %s", exc)
+            return None
+
+    # --- Backward-compat cache static methods (delegate to RealtimeSnapshotCache) ---
+
+    @staticmethod
+    def _get_snapshot_cache(snapshot_id: str, cache_key: str) -> Optional[Dict[str, "UnifiedRealtimeQuote"]]:
+        return RealtimeSnapshotCache.get(snapshot_id, cache_key)
+
+    @staticmethod
+    def _set_snapshot_cache(snapshot_id: str, cache_key: str, data: Dict[str, "UnifiedRealtimeQuote"], ttl: float = 90.0) -> None:
+        RealtimeSnapshotCache.set(snapshot_id, cache_key, data, ttl=ttl)
+
+    @staticmethod
+    def clear_snapshot_cache(snapshot_id: str) -> None:
+        RealtimeSnapshotCache.clear(snapshot_id)
+
+    def _fetch_hk_batch_primary(self, codes: List[str]) -> Optional[Dict[str, Optional]]:
+        """HK primary batch: ak.stock_hk_spot_em (faster, per-stock via EM).
+
+        Returns dict of {code: UnifiedRealtimeQuote or None} for requested codes,
+        or None on complete failure.
+        """
+        import time as _time
+        try:
+            import akshare as ak
+            api_start = _time.time()
+            logger.info("[批量行情] 通过 ak.stock_hk_spot_em() 获取全部港股行情(primary)...")
+            df_spot = ak.stock_hk_spot_em()
+            api_elapsed = _time.time() - api_start
+            logger.info(
+                "[批量行情] ak.stock_hk_spot_em 成功: 返回 %d 只港股, 耗时 %.2fs",
+                len(df_spot), api_elapsed,
+            )
+            return self._extract_hk_spot_results(df_spot, codes, source="stock_hk_spot_em")
+        except Exception as exc:
+            logger.warning("[批量行情] ak.stock_hk_spot_em 失败: %s", exc)
+
+        # No df_spot available; individual per-stock fallback is handled
+        # at the intraday monitor level, not here.
+        return None
+
+    def _fetch_hk_batch(self, codes: List[str], source: str = "stock_hk_spot") -> Optional[Dict[str, Optional]]:
+        """HK fallback batch: ak.stock_hk_spot() (full market, slower).
+
+        Args:
+            codes: list of HK stock codes to extract
+            source: "stock_hk_spot" (current) or caller can pass context
+
+        Returns dict of {code: UnifiedRealtimeQuote or None}, or None on complete failure.
+        """
+        import time as _time
+        try:
+            import akshare as ak
+            api_start = _time.time()
+            logger.info("[批量行情] 通过 ak.stock_hk_spot() 获取全部港股行情(fallback)...")
+            df_spot = ak.stock_hk_spot()
+            api_elapsed = _time.time() - api_start
+            logger.info(
+                "[批量行情] ak.stock_hk_spot 成功: 返回 %d 只港股, 耗时 %.2fs",
+                len(df_spot), api_elapsed,
+            )
+            return self._extract_hk_spot_results(df_spot, codes, source=source)
+        except Exception as exc:
+            logger.warning("[批量行情] ak.stock_hk_spot 失败: %s", exc)
+            return None
+
+    @staticmethod
+    def _extract_hk_spot_results(df_spot, codes: List[str], source: str = "stock_hk_spot") -> Dict[str, Optional]:
+        """Extract requested HK stocks from a full-market HK spot DataFrame.
+
+        Supports both stock_hk_spot_em and stock_hk_spot column naming.
+        """
+        import time as _time
+        from .realtime_types import UnifiedRealtimeQuote
+        result: Dict[str, Optional] = {}
+
+        for code in codes:
+            raw = code.replace("hk", "").zfill(5)
+            # Column name varies by source: '代码' (stock_hk_spot_em) or '代码' (stock_hk_spot)
+            code_col = '代码'
+            if code_col not in df_spot.columns:
+                # Try alternate column names
+                for alt in ['symbol', 'code', '股票代码']:
+                    if alt in df_spot.columns:
+                        code_col = alt
+                        break
+
+            row = df_spot[df_spot[code_col].astype(str) == raw]
+            if row.empty:
+                result[code] = None
+            else:
+                row = row.iloc[0]
+                result[code] = UnifiedRealtimeQuote(
+                    code=code,
+                    name=str(row.get('名称', '')),
+                    price=float(row.get('最新价', 0)) if row.get('最新价') is not None else None,
+                    change_pct=float(row.get('涨跌幅', 0)) if row.get('涨跌幅') is not None else None,
+                    change_amount=float(row.get('涨跌额', 0)) if row.get('涨跌额') is not None else None,
+                    volume=int(row.get('成交量', 0)) if row.get('成交量') is not None else None,
+                    amount=float(row.get('成交额', 0)) if row.get('成交额') is not None else None,
+                    turnover_rate=float(row.get('换手率', 0)) if row.get('换手率') is not None else None,
+                    amplitude=float(row.get('振幅', 0)) if row.get('振幅') is not None else None,
+                    volume_ratio=float(row.get('量比', 0)) if row.get('量比') is not None else None,
+                    high=float(row.get('最高', 0)) if row.get('最高') is not None else None,
+                    low=float(row.get('最低', 0)) if row.get('最低') is not None else None,
+                    open_price=float(row.get('今开', 0)) if row.get('今开') is not None else None,
+                    pre_close=float(row.get('昨收', 0)) if row.get('昨收') is not None else None,
+                )
+        return result
+
+    def _fetch_cn_batch(self, codes: List[str]) -> Optional[Dict[str, Optional]]:
+        """CN batch: ak.stock_zh_a_spot_em() (full A-share market).
+
+        Returns dict of {code: UnifiedRealtimeQuote or None}, or None on complete failure.
+        """
+        import time as _time
+        try:
+            import akshare as ak
+            api_start = _time.time()
+            logger.info("[批量行情] 通过 ak.stock_zh_a_spot_em() 获取全部A股行情...")
+            df_spot = ak.stock_zh_a_spot_em()
+            api_elapsed = _time.time() - api_start
+            logger.info("[批量行情] ak.stock_zh_a_spot_em 成功: 返回 %d 只A股, 耗时 %.2fs", len(df_spot), api_elapsed)
+
+            from .realtime_types import UnifiedRealtimeQuote
+            normalized_targets = {(code.strip().lstrip('shsz').lstrip('SH.').lstrip('SZ.').lstrip('sh').lstrip('SH')): code for code in codes}
+            result: Dict[str, Optional] = {}
+
+            for normalized, original in normalized_targets.items():
+                row = df_spot[df_spot['代码'].astype(str) == normalized]
+                if row.empty:
+                    result[original] = None
+                else:
+                    row = row.iloc[0]
+                    result[original] = UnifiedRealtimeQuote(
+                        code=original,
+                        name=str(row.get('名称', '')),
+                        price=float(row.get('最新价', 0)) if row.get('最新价') is not None else None,
+                        change_pct=float(row.get('涨跌幅', 0)) if row.get('涨跌幅') is not None else None,
+                        change_amount=float(row.get('涨跌额', 0)) if row.get('涨跌额') is not None else None,
+                        volume=int(row.get('成交量', 0)) if row.get('成交量') is not None else None,
+                        amount=float(row.get('成交额', 0)) if row.get('成交额') is not None else None,
+                        turnover_rate=float(row.get('换手率', 0)) if row.get('换手率') is not None else None,
+                        amplitude=float(row.get('振幅', 0)) if row.get('振幅') is not None else None,
+                        volume_ratio=float(row.get('量比', 0)) if row.get('量比') is not None else None,
+                        high=float(row.get('最高', 0)) if row.get('最高') is not None else None,
+                        low=float(row.get('最低', 0)) if row.get('最低') is not None else None,
+                        open_price=float(row.get('今开', 0)) if row.get('今开') is not None else None,
+                        pre_close=float(row.get('昨收', 0)) if row.get('昨收') is not None else None,
+                    )
+            return result
+        except Exception as exc:
+            logger.warning("[批量行情] ak.stock_zh_a_spot_em 失败: %s", exc)
+            return None
 
     def _enrich_realtime_quote(
         self,

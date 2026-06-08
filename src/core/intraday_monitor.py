@@ -28,11 +28,25 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime, date, timedelta
 import atexit
+import os
+import uuid
+from enum import Enum
 from typing import Any, Callable, Dict, List, Optional, Set
 
 from src.core.intraday_prompt import format_intraday_event_time
 
 logger = logging.getLogger(__name__)
+
+
+def _log_ctx(monitor: "IntradayMonitor", **extra) -> dict:
+    """Build structured log context dict."""
+    ctx = {
+        "run_id": getattr(monitor, '_current_run_id', None),
+        "snapshot_id": getattr(monitor, '_current_snapshot_id', None),
+    }
+    ctx.update(extra)
+    return ctx
+
 
 # Module-level executor for realtime quote timeout (shared across instances)
 _QUOTE_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=4)
@@ -73,6 +87,9 @@ class IntradayEvent:
                      # near_buy_zone / enter_take_profit / unusual_volume / price_only
     description: str
     market_local_timestamp: Optional[str] = None  # ISO format in market local timezone
+    snapshot_id: Optional[str] = None
+    run_id: Optional[str] = None
+    snapshot_status: Optional[str] = None  # "valid" | "data_unavailable" | "suspended" | "timeout"
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -85,7 +102,42 @@ class IntradayEvent:
             "event_type": self.event_type,
             "description": self.description,
             "market_local_timestamp": self.market_local_timestamp,
+            "snapshot_id": self.snapshot_id,
+            "run_id": self.run_id,
+            "snapshot_status": self.snapshot_status,
         }
+
+
+@dataclass
+class SnapshotState:
+    snapshot_id: str
+    run_id: str
+    status: str = "running"  # running | completed | partial | expired
+    started_at: datetime = field(default_factory=datetime.now)
+    finished_at: Optional[datetime] = None
+    expected_codes: List[str] = field(default_factory=list)
+    completed_codes: List[str] = field(default_factory=list)
+    valid_quote_codes: List[str] = field(default_factory=list)
+    failed_codes: List[str] = field(default_factory=list)
+
+
+class EmailReportType(Enum):
+    OFFICIAL_DECISION = "official_decision"
+    DATA_QUALITY_ALERT = "data_quality_alert"
+    LLM_FAILURE_ALERT = "llm_failure_alert"
+    NO_BASELINE_ALERT = "no_baseline_alert"
+    SNAPSHOT_INCOMPLETE_ALERT = "snapshot_incomplete_alert"
+
+
+@dataclass
+class LLMResult:
+    status: str  # "success" | "config_error" | "rate_limited" | "network_error" | "empty_response"
+    content: Optional[str] = None
+    error_message: Optional[str] = None
+
+
+class LLMConfigError(Exception):
+    pass
 
 
 # ---------------------------------------------------------------------------
@@ -301,6 +353,9 @@ class IntradayMonitor:
         self._lock = threading.Lock()
         self._snapshot_times: List[str] = []  # record snapshot times for the day
         self._daily_init_marker: Optional[str] = None  # tracks which trading date was initialized
+        self._expired_requests: set = set()
+        self._current_run_id = uuid.uuid4().hex[:12]
+        self._current_snapshot_id: Optional[str] = None
 
     # ------------------------------------------------------------------
     # Market resolution (per-stock)
@@ -314,6 +369,25 @@ class IntradayMonitor:
             return get_market_for_stock(code)
         except Exception:
             return None
+
+    def _resolve_quote_timeout(self, code: str, source_hint: Optional[str] = None) -> float:
+        market = self._get_market_for_stock(code)
+        if market == 'cn':
+            return getattr(self._config, 'intraday_quote_timeout_cn_fast', 12.0)
+        elif market == 'hk':
+            if source_hint in ('stock_hk_spot',):
+                return getattr(self._config, 'intraday_quote_timeout_hk_full', 60.0)
+            return getattr(self._config, 'intraday_quote_timeout_hk_fast', 15.0)
+        elif market == 'us':
+            return getattr(self._config, 'intraday_quote_timeout_us', 15.0)
+        return getattr(self._config, 'intraday_quote_timeout_default', 20.0)
+
+    def _stamp_event(self, event: IntradayEvent, snapshot_status: Optional[str] = None) -> IntradayEvent:
+        """Stamp event with current snapshot_id, run_id, and optional snapshot_status."""
+        event.snapshot_id = self._current_snapshot_id
+        event.run_id = self._current_run_id
+        event.snapshot_status = snapshot_status
+        return event
 
     @staticmethod
     def _get_market_query_date(market: str) -> str:
@@ -695,17 +769,29 @@ class IntradayMonitor:
 
     def monitor_snapshot(self) -> None:
         """Entry point for scheduled snapshot (called by Scheduler)."""
+        if not self._acquire_process_lock("intraday_snapshot", ttl_seconds=120):
+            logger.warning("monitor_snapshot: 无法获取进程锁（另一个实例正在执行），跳过本次快照")
+            return
         acquired = self._lock.acquire(timeout=30)
         if not acquired:
             logger.warning("monitor_snapshot: 无法获取锁（可能 final_decision 正在执行），跳过本次快照")
+            self._release_process_lock("intraday_snapshot")
             return
         try:
             self._monitor_snapshot_locked()
         finally:
             self._lock.release()
+            self._release_process_lock("intraday_snapshot")
 
     def _monitor_snapshot_locked(self) -> None:
         """Snapshot implementation (caller must hold self._lock)."""
+        self._ensure_intraday_table()
+        self._ensure_intraday_snapshots_table()
+
+        snapshot_id = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
+        self._current_snapshot_id = snapshot_id
+        snapshot_start = datetime.now()
+
         stock_codes = self._get_stock_codes()
         if not stock_codes:
             return
@@ -755,38 +841,126 @@ class IntradayMonitor:
 
         now = datetime.now()
         self._snapshot_times.append(now.strftime("%H:%M"))
-        logger.info("盘中快照开始: %s, 候选 %d 支 (可交易 %d 支)",
-                     now.strftime("%H:%M:%S"), len(stock_codes), len(tradable_codes))
+        logger.info(
+            "盘中快照开始: %s, 候选 %d 支 (可交易 %d 支)",
+            now.strftime("%H:%M:%S"), len(stock_codes), len(tradable_codes),
+            extra=_log_ctx(self),
+        )
+
+        # Create snapshot state
+        snapshot_state = SnapshotState(
+            snapshot_id=snapshot_id,
+            run_id=self._current_run_id,
+            expected_codes=list(tradable_codes),
+        )
+        self._persist_snapshot_state(snapshot_state)
+
+        # Group tradable_codes by market for batch fetch
+        stock_markets_all = self._get_stock_markets(tradable_codes)
+        by_market: Dict[str, List[str]] = {}
+        for code in tradable_codes:
+            mkt = stock_markets_all.get(code)
+            if mkt:
+                by_market.setdefault(mkt, []).append(code)
+
+        # Batch fetch per market
+        all_quotes: Dict[str, Any] = {}
+        for mkt, codes_in_market in by_market.items():
+            batch = self._fetcher.get_realtime_quotes_batch(codes_in_market, {mkt}, snapshot_id)
+            if batch:
+                all_quotes.update(batch)
+            # Fill in missing stocks
+            for code in codes_in_market:
+                if code not in all_quotes:
+                    all_quotes[code] = None
+
+        # Separate batch-matched stocks from unmatched for fallback path
+        completed_codes: List[str] = []
+        valid_quote_codes: List[str] = []
+        failed_codes: List[str] = []
+        timeout_count = 0
+        suspended_count = 0
+        batch_matched_count = 0
+        fallback_count = 0
+        batch_matched_sources: set = set()
 
         for code in tradable_codes:
-            try:
-                self._snapshot_one_stock(code, now)
-            except Exception as exc:
-                logger.error("盘中快照异常 [%s]: %s", code, exc)
+            quote = all_quotes.get(code)
+            if quote is not None:
+                # Batch-matched (or individual fetch succeeded from batch path)
+                batch_matched_count += 1
+                try:
+                    self._snapshot_one_stock_with_quote(code, now, quote)
+                    completed_codes.append(code)
+                    if quote.price is not None and quote.price > 0:
+                        valid_quote_codes.append(code)
+                    elif quote.price is None or quote.price <= 0:
+                        suspended_count += 1
+                except Exception as exc:
+                    logger.error("盘中快照异常 [%s]: %s", code, exc)
+                    failed_codes.append(code)
+            else:
+                # Not hit by batch — isolated single-stock fallback without bulk sources
+                fallback_count += 1
+                try:
+                    self._fallback_single_quote_without_bulk_sources(code, now)
+                    completed_codes.append(code)
+                except Exception as exc:
+                    logger.error("盘中快照fallback异常 [%s]: %s", code, exc)
+                    failed_codes.append(code)
 
-        logger.info("盘中快照完成: %s", now.strftime("%H:%M:%S"))
+        # Log batch-first verification
+        logger.info(
+            "batch_first_summary: snapshot=%s market_count=%d "
+            "batch_matched=%d fallback=%d completed=%d valid=%d failed=%d",
+            snapshot_id, len(by_market),
+            batch_matched_count, fallback_count,
+            len(completed_codes), len(valid_quote_codes), len(failed_codes),
+        )
 
-    def _snapshot_one_stock(self, code: str, now: datetime) -> None:
-        """Fetch realtime quote for one stock and compare against thresholds."""
-        # 10s timeout wrapper
-        quote = self._get_realtime_with_timeout(code, timeout=10.0)
+        # Finish snapshot state
+        snapshot_state.status = "completed"
+        snapshot_state.finished_at = datetime.now()
+        snapshot_state.completed_codes = completed_codes
+        snapshot_state.valid_quote_codes = valid_quote_codes
+        snapshot_state.failed_codes = failed_codes
+        self._persist_snapshot_state(snapshot_state)
+
+        # Clear per-snapshot cache
+        try:
+            self._fetcher.clear_snapshot_cache(snapshot_id)
+        except Exception:
+            pass
+
+        # Per-snapshot summary
+        total_elapsed = (datetime.now() - snapshot_start).total_seconds()
+        target_count = len(tradable_codes)
+        success_count = len(valid_quote_codes)
+        failed_count = len(failed_codes)
+        _CI = os.environ.get('CI', '').lower() == 'true' or os.environ.get('GITHUB_ACTIONS', '').lower() == 'true'
+        logger.info(
+            "snapshot_summary: target=%d success=%d failed=%d timeout=%d suspended=%d total_time=%.1fs coverage=%.1f%%",
+            target_count, success_count, failed_count, timeout_count, suspended_count, total_elapsed,
+            (success_count / max(target_count, 1)) * 100,
+            extra=_log_ctx(self),
+        )
+        if _CI:
+            logger.info("[CI] snapshot=%s target=%s done=%s", snapshot_id, target_count, success_count)
+
+    def _snapshot_one_stock_with_quote(self, code: str, now: datetime, quote) -> None:
+        """Process a pre-fetched quote for one stock against thresholds.
+
+        Called for stocks that were hit by batch prefetch.
+        Quote must be a UnifiedRealtimeQuote (not None).
+        """
         if quote is None:
-            logger.warning("盘中快照 [%s]: 实时行情获取失败（超时或不可用），标记 data_unavailable", code)
-            self._save_event(IntradayEvent(
-                timestamp=now,
-                stock_code=code,
-                stock_name="",
-                current_price=0.0,
-                volume_ratio=None,
-                change_pct=None,
-                event_type="data_unavailable",
-                description="实时行情获取超时或所有数据源失败",
-            ))
+            logger.error("_snapshot_one_stock_with_quote called with None quote [%s]", code)
+            self._save_event_unavailable(code, now)
             return
 
         # Suspended detection
         if quote.price is None or quote.price <= 0:
-            self._save_event(IntradayEvent(
+            self._save_event(self._stamp_event(IntradayEvent(
                 timestamp=now,
                 stock_code=code,
                 stock_name=quote.name or "",
@@ -795,10 +969,10 @@ class IntradayMonitor:
                 change_pct=None,
                 event_type="suspended",
                 description="停牌或无有效价格",
-            ))
+            ), snapshot_status="suspended"))
             return
 
-        # Sanitize values for prompt injection prevention
+        # Sanitize values
         price = float(quote.price)
         vol_ratio = float(quote.volume_ratio) if quote.volume_ratio is not None else None
         change = float(quote.change_pct) if quote.change_pct is not None else None
@@ -807,7 +981,6 @@ class IntradayMonitor:
         # Compare with thresholds
         yesterday = self._yesterday_analysis.get(code, {})
         if not any(yesterday.values()):
-            # No yesterday analysis
             event = IntradayEvent(
                 timestamp=now,
                 stock_code=code,
@@ -818,22 +991,105 @@ class IntradayMonitor:
                 event_type="price_only",
                 description=f"当前价 {price}（无昨日分析数据）",
             )
-            self._save_event(event)
+            self._save_event(self._stamp_event(event, snapshot_status="valid"))
             return
 
         events = _compare_with_thresholds(code, name, price, vol_ratio, change, yesterday, now=now)
         for event in events:
-            self._save_event(event)
+            self._save_event(self._stamp_event(event, snapshot_status="valid"))
 
-    def _get_realtime_with_timeout(self, code: str, timeout: float = 10.0):
-        """Call get_realtime_quote with timeout protection.
-        Uses a module-level executor so shutdown does not block on stuck threads.
+    def _fallback_single_quote_without_bulk_sources(self, code: str, now: datetime) -> None:
+        """Fallback for stocks not hit by batch prefetch.
+
+        Uses only single-stock-capable fetchers (no bulk full-market interfaces
+        like stock_hk_spot). Delegates to _get_realtime_with_timeout which calls
+        DataFetcherManager.get_realtime_quote() — this path goes through per-stock
+        fetchers only (AkshareFetcher with source="hk" for HK, not stock_hk_spot).
         """
+        logger.info(
+            "单股逐笔获取 [%s] (batch未命中, 使用单股快接口, 不含全市场批量源)",
+            code, extra=_log_ctx(self),
+        )
+        timeout = self._resolve_quote_timeout(code)
+        quote = self._get_realtime_with_timeout(code, timeout=timeout)
+
+        if quote is None:
+            self._save_event_unavailable(code, now)
+            return
+
+        # Delegate to shared processing (same as batch-matched path)
+        if quote.price is None or quote.price <= 0:
+            self._save_event(self._stamp_event(IntradayEvent(
+                timestamp=now,
+                stock_code=code,
+                stock_name=quote.name or "",
+                current_price=0.0,
+                volume_ratio=None,
+                change_pct=None,
+                event_type="suspended",
+                description="停牌或无有效价格(单股逐笔)",
+            ), snapshot_status="suspended"))
+            return
+
+        price = float(quote.price)
+        vol_ratio = float(quote.volume_ratio) if quote.volume_ratio is not None else None
+        change = float(quote.change_pct) if quote.change_pct is not None else None
+        name = str(quote.name or "")
+
+        yesterday = self._yesterday_analysis.get(code, {})
+        if not any(yesterday.values()):
+            event = IntradayEvent(
+                timestamp=now,
+                stock_code=code,
+                stock_name=name,
+                current_price=price,
+                volume_ratio=vol_ratio,
+                change_pct=change,
+                event_type="price_only",
+                description=f"当前价 {price}（无昨日分析数据, 单股逐笔）",
+            )
+            self._save_event(self._stamp_event(event, snapshot_status="valid"))
+            return
+
+        events = _compare_with_thresholds(code, name, price, vol_ratio, change, yesterday, now=now)
+        for event in events:
+            self._save_event(self._stamp_event(event, snapshot_status="valid"))
+
+    def _save_event_unavailable(self, code: str, now: datetime) -> None:
+        """Save a data_unavailable event for a stock. Shared by batch and fallback paths."""
+        self._save_event(self._stamp_event(IntradayEvent(
+            timestamp=now,
+            stock_code=code,
+            stock_name="",
+            current_price=0.0,
+            volume_ratio=None,
+            change_pct=None,
+            event_type="data_unavailable",
+            description="实时行情获取超时或所有数据源失败",
+        ), snapshot_status="timeout"))
+
+    def _get_realtime_with_timeout(self, code: str, timeout: float = 10.0,
+                                    snapshot_id: Optional[str] = None):
+        """Call get_realtime_quote with timeout protection.
+
+        Uses a module-level executor so shutdown does not block on stuck threads.
+
+        Note: Python Futures cannot be truly cancelled for non-cancellable I/O
+        (e.g. socket operations). The underlying network call may continue
+        running even after timeout. The `_expired_requests` set guards against
+        late results being consumed after timeout.
+        """
+        request_id = f"{snapshot_id or 'nosnap'}:{code}:{time.time()}"
         future = _QUOTE_EXECUTOR.submit(self._fetcher.get_realtime_quote, code)
         try:
-            return future.result(timeout=timeout)
+            result = future.result(timeout=timeout)
+            if request_id in self._expired_requests:
+                logger.warning("get_realtime_quote [%s] late_result_ignored (request_id=%s)", code, request_id)
+                return None
+            return result
         except concurrent.futures.TimeoutError:
-            logger.warning("get_realtime_quote [%s] 超时 (%ss)", code, timeout)
+            self._expired_requests.add(request_id)
+            logger.warning("get_realtime_quote [%s] 超时 (timeout=%ss, request_id=%s)", code, timeout, request_id)
             future.cancel()
             return None
         except Exception as exc:
@@ -846,91 +1102,214 @@ class IntradayMonitor:
 
     def final_decision(self) -> None:
         """14:20 entry point: read today's events → LLM decision → email."""
+        if not self._acquire_process_lock("intraday_decision", ttl_seconds=300):
+            logger.warning("final_decision: 无法获取进程锁（另一个实例正在执行），放弃本次决策")
+            return
         acquired = self._lock.acquire(timeout=60)
         if not acquired:
             logger.error("final_decision: 无法获取锁（monitor_snapshot 可能卡死），放弃本次决策")
+            self._release_process_lock("intraday_decision")
             return
         try:
             self._final_decision_locked()
         finally:
             self._lock.release()
+            self._release_process_lock("intraday_decision")
 
     def _final_decision_locked(self) -> None:
         """Final decision implementation (caller must hold self._lock)."""
-        # Ensure yesterday analysis is loaded for prompt construction
         stock_codes = self._get_stock_codes()
         if stock_codes and not self._yesterday_analysis:
             logger.info("_yesterday_analysis 为空，尝试加载...")
             self.load_yesterday_analysis(stock_codes)
-        if not self._yesterday_analysis:
-            logger.warning(
-                "未加载到昨日盘后基准分析，盘中决策将在无基准的情况下生成"
-            )
 
-        # Per-market trading day check: at least one market must be trading
+        baseline_status = "available" if self._yesterday_analysis else "missing"
+
+        # Check trading day
         tradable = [c for c in stock_codes if self._is_stock_trading_today(c)]
         if not tradable:
             logger.info("所有监控股票对应市场今日均休市，跳过盘中决策")
             if not getattr(self._config, 'intraday_force_run', False):
                 return
 
-        # Load events for all relevant market-local dates (skip unknown markets)
-        markets = set()
-        for c in stock_codes:
-            mkt = self._get_market_for_stock(c)
-            if mkt:
-                markets.add(mkt)
-        all_events: List[IntradayEvent] = []
-        for mkt in markets:
-            mkt_date = self._get_market_query_date(mkt)
-            all_events.extend(self._load_today_events(mkt_date, market=mkt))
-
-        logger.info("盘中决策: 读取到 %d 条事件 (markets=%s)", len(all_events), markets)
-
-        if not all_events:
-            logger.info("无盘中事件，跳过决策邮件")
+        # Get latest completed snapshot
+        snapshot = self._get_latest_completed_snapshot()
+        if snapshot is None:
+            logger.warning("no_completed_snapshot: 当前没有已完成快照，跳过正式决策邮件")
+            # Send incomplete alert
+            self._send_decision_email(
+                content="当日尚无已完成盘中快照，无法生成正式决策报告。",
+                report_type=EmailReportType.SNAPSHOT_INCOMPLETE_ALERT,
+                snapshot_id=None,
+                baseline_status=baseline_status,
+            )
             return
 
-        # Build prompt
+        snapshot_id = snapshot["snapshot_id"]
+        expected_count = len(snapshot["expected_codes"])
+        valid_count = len(snapshot["valid_quote_codes"])
+        coverage_ratio = valid_count / max(expected_count, 1)
+        failed_codes = snapshot["failed_codes"]
+
+        # Coverage gate
+        min_coverage = getattr(self._config, 'intraday_min_quote_coverage', 0.8)
+
+        logger.info(
+            "快照覆盖率检查: snapshot_id=%s expected=%d valid=%d failed=%d coverage=%.1f%% min_coverage=%.0f%%",
+            snapshot_id, expected_count, valid_count, len(failed_codes),
+            coverage_ratio * 100, min_coverage * 100,
+        )
+
+        if coverage_ratio < min_coverage:
+            logger.warning(
+                "行情覆盖率不足: expected_count=%d valid_count=%d failed_count=%d coverage_ratio=%.2f snapshot_id=%s",
+                expected_count, valid_count, len(failed_codes), coverage_ratio, snapshot_id,
+            )
+            self._send_decision_email(
+                content=(
+                    f"行情覆盖率不足，无法生成正式决策报告。\n"
+                    f"目标股票数: {expected_count}, 有效行情: {valid_count}, "
+                    f"失败: {len(failed_codes)}, 覆盖率: {coverage_ratio:.1%}\n"
+                    f"最低覆盖率要求: {min_coverage:.0%}"
+                ),
+                report_type=EmailReportType.DATA_QUALITY_ALERT,
+                snapshot_id=snapshot_id,
+                coverage_ratio=coverage_ratio,
+                valid_count=valid_count,
+                expected_count=expected_count,
+                failed_codes=failed_codes,
+                baseline_status=baseline_status,
+            )
+            return
+
+        # Load events for this completed snapshot
+        all_events = self._load_events_for_snapshot(snapshot_id)
+
+        if not all_events:
+            logger.info("无盘中事件(snapshot=%s)，跳过决策邮件", snapshot_id)
+            return
+
+        # If no baseline, downgrade
+        if baseline_status == "missing":
+            logger.warning("baseline_status=missing: 无昨日基准分析，降级为无基准摘要")
+            raw = self._build_raw_summary(all_events)
+            self._send_decision_email(
+                content=raw,
+                report_type=EmailReportType.NO_BASELINE_ALERT,
+                snapshot_id=snapshot_id,
+                coverage_ratio=coverage_ratio,
+                valid_count=valid_count,
+                expected_count=expected_count,
+                failed_codes=failed_codes,
+                baseline_status=baseline_status,
+            )
+            return
+
+        # Build prompt (filter out data_unavailable)
         from src.core.intraday_prompt import build_intraday_prompt
         prompt = build_intraday_prompt(
             events=all_events,
             yesterday_analysis=self._yesterday_analysis,
             snapshot_times=self._snapshot_times,
-            markets=markets,
+            markets={self._get_market_for_stock(c) for c in stock_codes if self._get_market_for_stock(c)},
         )
 
-        # Call LLM with 3 retries
-        decision_text = self._call_llm_with_retries(prompt)
-        if decision_text is None:
-            # Fallback: send raw data summary
-            decision_text = self._build_raw_summary(all_events)
+        # Call LLM
+        result = self._call_llm_with_retries(prompt)
 
-        # Send email
-        self._send_decision_email(decision_text, all_events)
+        if result.status == "success":
+            self._send_decision_email(
+                content=result.content,
+                report_type=EmailReportType.OFFICIAL_DECISION,
+                snapshot_id=snapshot_id,
+                coverage_ratio=coverage_ratio,
+                valid_count=valid_count,
+                expected_count=expected_count,
+                failed_codes=failed_codes,
+                llm_status="success",
+                baseline_status=baseline_status,
+            )
+        elif result.status == "config_error":
+            logger.error("LLM config error, no email sent: %s", result.error_message)
+            # Optionally: send LLM_FAILURE_ALERT but only if config allows
+            if getattr(self._config, 'intraday_send_llm_failure_alert', True):
+                self._send_decision_email(
+                    content=f"LLM调用失败（配置错误），请检查模型配置。\n错误: {result.error_message}",
+                    report_type=EmailReportType.LLM_FAILURE_ALERT,
+                    snapshot_id=snapshot_id,
+                    coverage_ratio=coverage_ratio,
+                    valid_count=valid_count,
+                    expected_count=expected_count,
+                    llm_status="config_error",
+                    baseline_status=baseline_status,
+                )
+        else:
+            # network_error, rate_limited, empty_response
+            if getattr(self._config, 'intraday_send_llm_failure_alert', True):
+                if getattr(self._config, 'intraday_send_raw_summary_on_llm_failure', False):
+                    raw = self._build_raw_summary(all_events)
+                else:
+                    raw = f"LLM调用失败: {result.status}\n{result.error_message}"
+                self._send_decision_email(
+                    content=raw,
+                    report_type=EmailReportType.LLM_FAILURE_ALERT,
+                    snapshot_id=snapshot_id,
+                    coverage_ratio=coverage_ratio,
+                    valid_count=valid_count,
+                    expected_count=expected_count,
+                    llm_status=result.status,
+                    baseline_status=baseline_status,
+                )
 
-    def _call_llm_with_retries(self, prompt: str) -> Optional[str]:
-        """Call litellm.completion() with 3 retries, 5s interval."""
+    def _call_llm_with_retries(self, prompt: str) -> LLMResult:
+        """Call litellm.completion() with 3 retries, 5s interval. Returns LLMResult."""
         import litellm
+
+        # Resolve model
+        model = self._resolve_llm_model()
+        if not model:
+            return LLMResult(status="config_error", error_message="No LLM model configured (all known fields empty)")
 
         for attempt in range(3):
             try:
                 response = litellm.completion(
-                    model=self._config.llm_model,
+                    model=model,
                     messages=[{"role": "user", "content": prompt}],
                     max_tokens=getattr(self._config, "llm_max_tokens", 2000),
                     temperature=getattr(self._config, "llm_temperature", 0.3),
                 )
                 text = response.choices[0].message.content
+                if not text or not text.strip():
+                    logger.warning("LLM 返回空响应 (attempt %d/3)", attempt + 1)
+                    if attempt < 2:
+                        time.sleep(5)
+                        continue
+                    return LLMResult(status="empty_response", error_message="Empty response after 3 retries")
                 logger.info("LLM 决策成功 (attempt %d/3)", attempt + 1)
-                return str(text)
+                return LLMResult(status="success", content=str(text))
             except Exception as exc:
-                logger.warning("LLM 调用失败 (attempt %d/3): %s", attempt + 1, exc)
+                error_str = str(exc)
+                if "AuthenticationError" in error_str or "auth" in error_str.lower() or "api key" in error_str.lower():
+                    logger.error("LLM 配置错误（不重试）: %s", exc)
+                    return LLMResult(status="config_error", error_message=str(exc))
+                if "rate_limit" in error_str.lower() or "429" in error_str:
+                    logger.warning("LLM 限流 (attempt %d/3): %s", attempt + 1, exc)
+                elif "timeout" in error_str.lower() or "connection" in error_str.lower():
+                    logger.warning("LLM 网络错误 (attempt %d/3): %s", attempt + 1, exc)
+                else:
+                    logger.warning("LLM 调用失败 (attempt %d/3): %s", attempt + 1, exc)
                 if attempt < 2:
                     time.sleep(5)
 
-        logger.error("LLM 调用 3 次均失败，降级发送原始数据摘要")
-        return None
+        return LLMResult(status="network_error", error_message="All 3 retries failed")
+
+    def _resolve_llm_model(self) -> str:
+        """Resolve LLM model name from config, supporting multiple field names."""
+        for attr in ('litellm_model', 'llm_model', 'openai_model', 'model_name', 'ai_model'):
+            val = getattr(self._config, attr, None)
+            if val and isinstance(val, str) and val.strip():
+                return val.strip()
+        return ""
 
     def _build_raw_summary(self, events: List[IntradayEvent]) -> str:
         """Build raw data summary when LLM fails."""
@@ -951,29 +1330,54 @@ class IntradayMonitor:
             )
         return "\n".join(lines)
 
-    def _send_decision_email(self, content: str, events: List[IntradayEvent]) -> None:
-        """Send decision email via EmailSender. Title reflects covered markets and dates."""
+    def _send_decision_email(
+        self,
+        content: str,
+        *,
+        report_type: EmailReportType = EmailReportType.OFFICIAL_DECISION,
+        snapshot_id: Optional[str] = None,
+        coverage_ratio: Optional[float] = None,
+        valid_count: int = 0,
+        expected_count: int = 0,
+        failed_codes: Optional[List[str]] = None,
+        llm_status: Optional[str] = None,
+        baseline_status: Optional[str] = None,
+    ) -> None:
+        """Send decision email via EmailSender with structured params."""
         if self._email_sender is None:
             logger.warning("EmailSender 未配置，跳过邮件发送")
             return
 
-        # Collect per-market local dates from events
-        market_dates: Dict[str, str] = {}
-        for e in events:
-            mkt = self._get_market_for_stock(e.stock_code)
-            if mkt:
-                market_dates.setdefault(mkt, self._get_market_query_date(mkt))
+        # Build subject
+        prefix_map = {
+            EmailReportType.OFFICIAL_DECISION: "盘中监控报告",
+            EmailReportType.DATA_QUALITY_ALERT: "[数据质量告警] 盘中监控",
+            EmailReportType.LLM_FAILURE_ALERT: "[LLM故障告警] 盘中监控",
+            EmailReportType.NO_BASELINE_ALERT: "[无基线告警] 盘中监控",
+            EmailReportType.SNAPSHOT_INCOMPLETE_ALERT: "[快照未完成告警] 盘中监控",
+        }
+        prefix = prefix_map.get(report_type, "盘中监控通知")
+        subject = prefix
 
-        if not market_dates:
+        coverage_str = f" (覆盖率{coverage_ratio:.0%})" if coverage_ratio is not None else ""
+        if report_type == EmailReportType.OFFICIAL_DECISION:
+            # Old-style market/date subject
+            market_dates: Dict[str, str] = {}
             primary_market = self._resolve_primary_market()
-            market_dates[primary_market] = self._get_market_query_date(primary_market)
+            mkt_date = self._get_market_query_date(primary_market)
+            market_dates[primary_market] = mkt_date
+            market_str = " / ".join(sorted(f"{m.upper()}:{d}" for m, d in market_dates.items()))
+            subject = f"{prefix} - {market_str}{coverage_str}"
 
-        if len(market_dates) == 1:
-            mkt, mkt_date = next(iter(market_dates.items()))
-            subject = f"盘中监控报告 - {mkt.upper()}:{mkt_date}"
-        else:
-            parts = sorted(f"{m.upper()}:{d}" for m, d in market_dates.items())
-            subject = f"盘中监控报告 - {' / '.join(parts)}"
+        # Prepend coverage summary for official
+        if report_type == EmailReportType.OFFICIAL_DECISION:
+            summary = (
+                f"> 快照覆盖率: {valid_count}/{expected_count} ({coverage_ratio:.0%})\n"
+                f"> 快照ID: {snapshot_id}\n"
+                f"> LLM状态: {llm_status or 'unknown'}\n"
+                f"> 基线状态: {baseline_status or 'unknown'}\n\n"
+            )
+            content = summary + content
 
         try:
             success = self._email_sender.send_to_email(
@@ -981,11 +1385,14 @@ class IntradayMonitor:
                 subject=subject,
             )
             if success:
-                logger.info("盘中决策邮件发送成功")
+                logger.info(
+                    "盘中决策邮件发送成功: report_type=%s snapshot_id=%s coverage=%.1f%%",
+                    report_type.value, snapshot_id or "none", (coverage_ratio or 0) * 100,
+                )
             else:
-                logger.warning("盘中决策邮件发送失败")
+                logger.warning("盘中决策邮件发送失败: report_type=%s", report_type.value)
         except Exception as exc:
-            logger.exception("盘中决策邮件发送异常: %s", exc)
+            logger.exception("盘中决策邮件发送异常: report_type=%s: %s", report_type.value, exc)
 
     # ------------------------------------------------------------------
     # SQLite helpers
@@ -1021,8 +1428,10 @@ class IntradayMonitor:
                     sa_text(
                         "INSERT INTO intraday_events "
                         "(query_date, market, timestamp, market_local_timestamp, stock_code, stock_name, "
-                        "current_price, volume_ratio, change_pct, event_type, description, raw_quote) "
-                        "VALUES (:qd, :mkt, :ts, :mlt, :sc, :sn, :cp, :vr, :cpct, :et, :desc, :rq)"
+                        "current_price, volume_ratio, change_pct, event_type, description, raw_quote, "
+                        "snapshot_id, run_id, snapshot_status) "
+                        "VALUES (:qd, :mkt, :ts, :mlt, :sc, :sn, :cp, :vr, :cpct, :et, :desc, :rq, "
+                        ":sid, :rid, :ss)"
                     ),
                     {
                         "qd": query_date,
@@ -1037,6 +1446,9 @@ class IntradayMonitor:
                         "et": event.event_type,
                         "desc": event.description,
                         "rq": None,
+                        "sid": event.snapshot_id,
+                        "rid": event.run_id,
+                        "ss": event.snapshot_status,
                     },
                 )
                 session.commit()
@@ -1091,6 +1503,75 @@ class IntradayMonitor:
 
         return events
 
+    def _load_events_for_snapshot(self, snapshot_id: str) -> List[IntradayEvent]:
+        events: List[IntradayEvent] = []
+        try:
+            with self._db.session_scope() as session:
+                conn = session.connection()
+                from sqlalchemy import text as sa_text
+                rows = conn.execute(
+                    sa_text(
+                        "SELECT timestamp, stock_code, stock_name, current_price, market_local_timestamp, "
+                        "volume_ratio, change_pct, event_type, description, snapshot_id, run_id, snapshot_status "
+                        "FROM intraday_events WHERE snapshot_id = :sid ORDER BY timestamp"
+                    ),
+                    {"sid": snapshot_id},
+                ).fetchall()
+                for row in rows:
+                    ts = row[0]
+                    if isinstance(ts, str):
+                        ts = datetime.fromisoformat(ts)
+                    events.append(IntradayEvent(
+                        timestamp=ts,
+                        stock_code=str(row[1] or ""),
+                        stock_name=str(row[2] or ""),
+                        current_price=float(row[3] or 0),
+                        volume_ratio=float(row[5]) if row[5] is not None else None,
+                        change_pct=float(row[6]) if row[6] is not None else None,
+                        event_type=str(row[7] or "price_only"),
+                        description=str(row[8] or ""),
+                        snapshot_id=str(row[9]) if len(row) > 9 and row[9] is not None else None,
+                        run_id=str(row[10]) if len(row) > 10 and row[10] is not None else None,
+                        snapshot_status=str(row[11]) if len(row) > 11 and row[11] is not None else None,
+                    ))
+                    if len(row) > 4 and row[4] is not None:
+                        events[-1].market_local_timestamp = str(row[4])
+        except Exception as exc:
+            logger.warning("加载盘中事件失败(snapshot=%s): %s", snapshot_id, exc)
+        return events
+
+    def _get_latest_completed_snapshot(self, markets=None) -> Optional[dict]:
+        """Return the most recent completed snapshot state dict or None."""
+        try:
+            with self._db.session_scope() as session:
+                conn = session.connection()
+                from sqlalchemy import text as sa_text
+                rows = conn.execute(
+                    sa_text(
+                        "SELECT snapshot_id, run_id, status, started_at, finished_at, "
+                        "expected_codes, completed_codes, valid_quote_codes, failed_codes, query_date "
+                        "FROM intraday_snapshots WHERE status = 'completed' ORDER BY started_at DESC LIMIT 1"
+                    ),
+                ).fetchall()
+                if rows:
+                    import json
+                    row = rows[0]
+                    return {
+                        "snapshot_id": row[0],
+                        "run_id": row[1],
+                        "status": row[2],
+                        "started_at": row[3],
+                        "finished_at": row[4],
+                        "expected_codes": json.loads(row[5]) if row[5] else [],
+                        "completed_codes": json.loads(row[6]) if row[6] else [],
+                        "valid_quote_codes": json.loads(row[7]) if row[7] else [],
+                        "failed_codes": json.loads(row[8]) if row[8] else [],
+                        "query_date": row[9],
+                    }
+        except Exception as exc:
+            logger.warning("获取最新completed快照失败: %s", exc)
+        return None
+
     def _ensure_intraday_table(self) -> None:
         """Create intraday_events table if not exists (with market and market_local_timestamp columns)."""
         try:
@@ -1127,6 +1608,21 @@ class IntradayMonitor:
                         "ALTER TABLE intraday_events ADD COLUMN market_local_timestamp TEXT"
                     ))
                     logger.info("Schema migration: added intraday_events.market_local_timestamp")
+                if 'snapshot_id' not in existing_cols:
+                    conn.execute(sa_text(
+                        "ALTER TABLE intraday_events ADD COLUMN snapshot_id TEXT"
+                    ))
+                    logger.info("Schema migration: added intraday_events.snapshot_id")
+                if 'run_id' not in existing_cols:
+                    conn.execute(sa_text(
+                        "ALTER TABLE intraday_events ADD COLUMN run_id TEXT"
+                    ))
+                    logger.info("Schema migration: added intraday_events.run_id")
+                if 'snapshot_status' not in existing_cols:
+                    conn.execute(sa_text(
+                        "ALTER TABLE intraday_events ADD COLUMN snapshot_status TEXT"
+                    ))
+                    logger.info("Schema migration: added intraday_events.snapshot_status")
                 conn.execute(sa_text(
                     "CREATE INDEX IF NOT EXISTS idx_intraday_date_code "
                     "ON intraday_events(query_date, stock_code)"
@@ -1135,10 +1631,145 @@ class IntradayMonitor:
                     "CREATE INDEX IF NOT EXISTS idx_intraday_date_market "
                     "ON intraday_events(query_date, market)"
                 ))
+                conn.execute(sa_text(
+                    "CREATE INDEX IF NOT EXISTS idx_intraday_snapshot "
+                    "ON intraday_events(snapshot_id)"
+                ))
+                # Process-locks table for cross-instance concurrency control
+                conn.execute(sa_text(
+                    "CREATE TABLE IF NOT EXISTS process_locks ("
+                    "lock_name TEXT PRIMARY KEY, "
+                    "holder TEXT NOT NULL, "
+                    "acquired_at TEXT NOT NULL, "
+                    "expires_at TEXT NOT NULL)"
+                ))
                 session.commit()
                 logger.info("intraday_events 表已就绪")
         except Exception as exc:
             logger.error("创建 intraday_events 表失败: %s", exc)
+
+    def _ensure_intraday_snapshots_table(self) -> None:
+        """Create intraday_snapshots table if not exists."""
+        try:
+            with self._db.session_scope() as session:
+                conn = session.connection()
+                from sqlalchemy import text as sa_text
+                conn.execute(sa_text(
+                    "CREATE TABLE IF NOT EXISTS intraday_snapshots ("
+                    "snapshot_id TEXT PRIMARY KEY, "
+                    "run_id TEXT NOT NULL, "
+                    "status TEXT NOT NULL DEFAULT 'running', "
+                    "started_at TEXT NOT NULL, "
+                    "finished_at TEXT, "
+                    "expected_codes TEXT, "
+                    "completed_codes TEXT, "
+                    "valid_quote_codes TEXT, "
+                    "failed_codes TEXT, "
+                    "query_date TEXT NOT NULL)"
+                ))
+                session.commit()
+        except Exception as exc:
+            logger.error("创建 intraday_snapshots 表失败: %s", exc)
+
+    def _persist_snapshot_state(self, state: SnapshotState) -> None:
+        """Write snapshot state to intraday_snapshots table."""
+        try:
+            with self._db.session_scope() as session:
+                conn = session.connection()
+                from sqlalchemy import text as sa_text
+                conn.execute(
+                    sa_text("INSERT OR REPLACE INTO intraday_snapshots "
+                            "(snapshot_id, run_id, status, started_at, finished_at, "
+                            "expected_codes, completed_codes, valid_quote_codes, failed_codes, query_date) "
+                            "VALUES (:sid, :rid, :st, :sa, :fa, :ec, :cc, :vc, :fc, :qd)"),
+                    {
+                        "sid": state.snapshot_id,
+                        "rid": state.run_id,
+                        "st": state.status,
+                        "sa": state.started_at.isoformat(),
+                        "fa": state.finished_at.isoformat() if state.finished_at else None,
+                        "ec": json.dumps(state.expected_codes),
+                        "cc": json.dumps(state.completed_codes),
+                        "vc": json.dumps(state.valid_quote_codes),
+                        "fc": json.dumps(state.failed_codes),
+                        "qd": state.started_at.strftime("%Y-%m-%d"),
+                    },
+                )
+                session.commit()
+        except Exception as exc:
+            logger.warning("持久化快照状态失败: %s", exc)
+
+    def _update_snapshot_status(self, snapshot_id: str, status: str, finished_at: Optional[datetime] = None) -> None:
+        """Update snapshot status."""
+        try:
+            with self._db.session_scope() as session:
+                conn = session.connection()
+                from sqlalchemy import text as sa_text
+                if finished_at:
+                    conn.execute(
+                        sa_text("UPDATE intraday_snapshots SET status = :st, finished_at = :fa WHERE snapshot_id = :sid"),
+                        {"st": status, "fa": finished_at.isoformat(), "sid": snapshot_id},
+                    )
+                else:
+                    conn.execute(
+                        sa_text("UPDATE intraday_snapshots SET status = :st WHERE snapshot_id = :sid"),
+                        {"st": status, "sid": snapshot_id},
+                    )
+                session.commit()
+        except Exception as exc:
+            logger.warning("更新快照状态失败: %s", exc)
+
+    # ------------------------------------------------------------------
+    # Process-level concurrency control
+    # ------------------------------------------------------------------
+
+    def _acquire_process_lock(self, lock_name: str, ttl_seconds: int = 300) -> bool:
+        import uuid
+        holder = uuid.uuid4().hex[:12]
+        now = datetime.utcnow()
+        expires = now.isoformat()
+        try:
+            with self._db.session_scope() as session:
+                conn = session.connection()
+                from sqlalchemy import text as sa_text
+                # Check if lock exists and is still valid
+                existing = conn.execute(
+                    sa_text("SELECT expires_at, holder FROM process_locks WHERE lock_name = :ln"),
+                    {"ln": lock_name},
+                ).fetchone()
+                if existing:
+                    if existing[0] >= now.isoformat():
+                        # Lock still valid, not ours
+                        return False
+                    # Lock expired: overwrite
+                    conn.execute(
+                        sa_text("DELETE FROM process_locks WHERE lock_name = :ln"),
+                        {"ln": lock_name},
+                    )
+                # Acquire
+                conn.execute(
+                    sa_text("INSERT INTO process_locks (lock_name, holder, acquired_at, expires_at) VALUES (:ln, :h, :aa, :ea)"),
+                    {"ln": lock_name, "h": holder, "aa": now.isoformat(), "ea": (datetime.utcnow() + timedelta(seconds=ttl_seconds)).isoformat()},
+                )
+                session.commit()
+                return True
+        except Exception as exc:
+            logger.warning("_acquire_process_lock(%s) failed: %s", lock_name, exc)
+            return False
+
+    def _release_process_lock(self, lock_name: str) -> None:
+        try:
+            with self._db.session_scope() as session:
+                conn = session.connection()
+                from sqlalchemy import text as sa_text
+                conn.execute(sa_text("DELETE FROM process_locks WHERE lock_name = :ln"), {"ln": lock_name})
+                session.commit()
+        except Exception as exc:
+            logger.warning("_release_process_lock(%s) failed: %s", lock_name, exc)
+
+    def _force_release_process_lock(self, lock_name: str) -> None:
+        self._release_process_lock(lock_name)
+        logger.warning("强制释放进程锁: %s", lock_name)
 
     # ------------------------------------------------------------------
     # Helpers
@@ -1211,7 +1842,7 @@ class IntradayMonitor:
 
         for code in tradable:
             try:
-                self._snapshot_one_stock(code, now)
+                self._fallback_single_quote_without_bulk_sources(code, now)
             except Exception as exc:
                 logger.error("盘中快照异常 [%s]: %s", code, exc)
 
@@ -1245,7 +1876,7 @@ class IntradayMonitor:
         logger.info("盘中决策前快照(standalone): %s, %d 支股票", now.strftime("%H:%M:%S"), len(target_codes))
         for code in target_codes:
             try:
-                self._snapshot_one_stock(code, now)
+                self._fallback_single_quote_without_bulk_sources(code, now)
             except Exception as exc:
                 logger.error("决策前快照异常 [%s]: %s", code, exc)
 

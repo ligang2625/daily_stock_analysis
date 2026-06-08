@@ -14,7 +14,7 @@ on:
 
 # 独立并发组，不阻塞盘后分析
 concurrency:
-  group: intraday-monitor
+  group: intraday-monitor-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:

@@ -18,7 +18,7 @@ import logging
 import time
 from threading import RLock
 from dataclasses import dataclass, field
-from typing import Optional, Dict, Any, Union
+from typing import Optional, Dict, Any, Union, List
 from enum import Enum
 
 logger = logging.getLogger(__name__)
@@ -446,6 +446,131 @@ _chip_circuit_breaker = CircuitBreaker(
     cooldown_seconds=600.0,   # 冷却10分钟
     half_open_max_calls=1
 )
+
+
+# ============================================
+# Batch prefetch types
+# ============================================
+
+
+@dataclass
+class RealtimeBatchResult:
+    """Result of a batch realtime quote fetch for one market in one snapshot."""
+    quotes: Dict[str, Any]  # code -> UnifiedRealtimeQuote or None
+    source: str             # data source identifier, e.g. "akshare_hk_spot"
+    is_bulk: bool           # True if source fetches ALL stocks in market at once
+    market: str             # "cn" | "hk" | "us"
+    elapsed_seconds: float  # total wall-clock time for the batch call
+    requested_count: int    # how many codes were requested
+    matched_count: int      # how many codes got a non-None quote
+
+
+@dataclass
+class RealtimeSourceCapability:
+    """Capability metadata for a realtime data source.
+
+    Used to prevent bulk full-market sources (e.g. stock_hk_spot) from being
+    invoked in per-stock fallback paths after a batch prefetch.
+    """
+    source_name: str
+    market: str = ""                 # "cn" | "hk" | "us"
+    is_bulk: bool = False            # True = fetches ALL stocks in market at once
+    supports_single_stock: bool = True  # True = can do per-stock queries
+    default_timeout: float = 15.0    # recommended timeout for this source
+
+    def __post_init__(self) -> None:
+        if self.is_bulk:
+            self.supports_single_stock = False
+
+
+# Known bulk sources that MUST be excluded from single-stock fallback.
+# Keys are source_name used in logs / cache keys.
+BULK_SOURCE_REGISTRY: Dict[str, RealtimeSourceCapability] = {
+    "akshare_hk_spot_em": RealtimeSourceCapability(
+        source_name="akshare_hk_spot_em",
+        market="hk",
+        is_bulk=True,
+        default_timeout=20.0,
+    ),
+    "akshare_hk_spot": RealtimeSourceCapability(
+        source_name="akshare_hk_spot",
+        market="hk",
+        is_bulk=True,
+        default_timeout=60.0,
+    ),
+    "akshare_cn_spot": RealtimeSourceCapability(
+        source_name="akshare_cn_spot",
+        market="cn",
+        is_bulk=True,
+        default_timeout=30.0,
+    ),
+}
+
+
+def is_bulk_source(source_name: str) -> bool:
+    """Return True if source_name is a known bulk (full-market) source."""
+    cap = BULK_SOURCE_REGISTRY.get(source_name)
+    return cap is not None and cap.is_bulk
+
+
+def get_single_stock_sources(market: str) -> List[str]:
+    """Return source names that support single-stock queries for a given market.
+
+    Excludes bulk sources like stock_hk_spot, stock_zh_a_spot_em, etc.
+    """
+    return [
+        name
+        for name, cap in BULK_SOURCE_REGISTRY.items()
+        if cap.market == market and cap.supports_single_stock
+    ]
+
+
+class RealtimeSnapshotCache:
+    """Per-snapshot cache for batch quote results.
+
+    Prevents redundant full-market fetches within the same snapshot.
+    TTL-based expiry; expired entries return None.
+    Each snapshot has its own namespace; calling clear(snapshot_id) at the
+    end of the snapshot releases memory.
+    """
+
+    _cache: Dict[str, Dict[str, Any]] = {}   # snapshot_id -> {cache_key: {data, fetched_at, ttl}}
+    _lock = RLock()
+
+    @classmethod
+    def get(cls, snapshot_id: str, cache_key: str, ttl: float = 90.0) -> Optional[Dict[str, "UnifiedRealtimeQuote"]]:
+        with cls._lock:
+            snap = cls._cache.get(snapshot_id)
+            if snap is None:
+                return None
+            entry = snap.get(cache_key)
+            if entry is None:
+                return None
+            if time.time() - entry["fetched_at"] > ttl:
+                del snap[cache_key]
+                return None
+            return entry["data"]
+
+    @classmethod
+    def set(cls, snapshot_id: str, cache_key: str, data: Dict[str, "UnifiedRealtimeQuote"], ttl: float = 90.0) -> None:
+        with cls._lock:
+            if snapshot_id not in cls._cache:
+                cls._cache[snapshot_id] = {}
+            cls._cache[snapshot_id][cache_key] = {
+                "data": data,
+                "fetched_at": time.time(),
+                "ttl": ttl,
+            }
+
+    @classmethod
+    def clear(cls, snapshot_id: str) -> None:
+        with cls._lock:
+            cls._cache.pop(snapshot_id, None)
+
+    @classmethod
+    def clear_all(cls) -> None:
+        with cls._lock:
+            cls._cache.clear()
 
 
 def get_realtime_circuit_breaker() -> CircuitBreaker:
