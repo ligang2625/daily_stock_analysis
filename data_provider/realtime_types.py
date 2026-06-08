@@ -91,6 +91,39 @@ def safe_int(val: Any, default: Optional[int] = None) -> Optional[int]:
     return default
 
 
+def normalize_hk_code_for_match(stock_code: str) -> str:
+    """Normalize HK stock code to a 5-digit string for DataFrame matching."""
+    code = str(stock_code).strip().upper()
+    if code.endswith('.HK'):
+        code = code[:-3]
+    if code.startswith('HK'):
+        code = code[2:]
+    if not code:
+        return ""
+    if code.isdigit():
+        return code.zfill(5)
+    return code.zfill(5)
+
+
+def normalize_cn_code_for_match(stock_code: str) -> str:
+    """Normalize CN (A-share) stock code to bare 6-digit string for DataFrame matching."""
+    code = str(stock_code).strip()
+    upper = code.upper()
+    for prefix in ("SH.", "SZ.", "BJ.", "SH", "SZ", "BJ"):
+        if upper.startswith(prefix):
+            code = code[len(prefix):]
+            break
+    else:
+        if '.' in code:
+            base, suffix = code.rsplit('.', 1)
+            if suffix.upper() in ('SH', 'SZ', 'BJ') and base.isdigit():
+                return base
+    if not code:
+        return ""
+    digits = "".join(ch for ch in code if ch.isdigit())
+    return digits.zfill(6)
+
+
 class RealtimeSource(Enum):
     """实时行情数据源"""
     EFINANCE = "efinance"           # 东方财富（efinance库）
@@ -453,6 +486,24 @@ _chip_circuit_breaker = CircuitBreaker(
 # ============================================
 
 
+class SnapshotQuoteStatus(Enum):
+    VALID = "valid"
+    SUSPENDED = "suspended"
+    DATA_UNAVAILABLE = "data_unavailable"
+    TIMEOUT = "timeout"
+    ERROR = "error"
+
+
+@dataclass
+class SnapshotQuoteProcessResult:
+    """Result of processing one stock's quote during a snapshot."""
+    code: str
+    status: SnapshotQuoteStatus
+    event_count: int = 0
+    source: Optional[str] = None
+    message: Optional[str] = None
+
+
 @dataclass
 class RealtimeBatchResult:
     """Result of a batch realtime quote fetch for one market in one snapshot."""
@@ -549,6 +600,7 @@ class RealtimeSnapshotCache:
             if time.time() - entry["fetched_at"] > ttl:
                 del snap[cache_key]
                 return None
+            logger.info("[缓存命中] snapshot=%s key=%s", snapshot_id, cache_key)
             return entry["data"]
 
     @classmethod

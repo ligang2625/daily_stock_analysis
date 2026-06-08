@@ -20,7 +20,7 @@ import time
 from threading import BoundedSemaphore, RLock, Thread
 from abc import ABC, abstractmethod
 from datetime import datetime, timezone
-from typing import Callable, Optional, List, Tuple, Dict, Any
+from typing import Callable, Optional, List, Tuple, Dict, Any, Set
 
 import pandas as pd
 import numpy as np
@@ -39,7 +39,7 @@ _snapshot_cache: Dict[str, Dict[str, Any]] = {}
 _snapshot_cache_lock = RLock()
 
 # 从 realtime_types 导入 RealtimeSnapshotCache
-from .realtime_types import RealtimeSnapshotCache, RealtimeBatchResult, is_bulk_source, BULK_SOURCE_REGISTRY
+from .realtime_types import RealtimeSnapshotCache, RealtimeBatchResult, is_bulk_source, BULK_SOURCE_REGISTRY, normalize_hk_code_for_match, normalize_cn_code_for_match
 
 # === 标准化列名定义 ===
 STANDARD_COLUMNS = ['date', 'open', 'high', 'low', 'close', 'volume', 'amount', 'pct_chg']
@@ -1483,7 +1483,7 @@ class DataFetcherManager:
         codes: List[str],
         markets: Set[str],
         snapshot_id: str,
-    ) -> Dict[str, Optional]:
+    ) -> Optional[RealtimeBatchResult]:
         """
         Batch realtime quote fetching with per-market routing.
 
@@ -1491,7 +1491,11 @@ class DataFetcherManager:
         - HK: get_hk_realtime_quotes_batch (primary+fallback with cache)
         - CN: get_cn_realtime_quotes_batch (auto batch with threshold)
         - US: get_us_realtime_quotes_batch_light (light batch)
+
+        Returns RealtimeBatchResult with .quotes dict, or None if all markets returned None.
         """
+        import time as _time
+        start = _time.time()
         from collections import OrderedDict
         result: Dict[str, Optional] = OrderedDict()
 
@@ -1508,47 +1512,93 @@ class DataFetcherManager:
                 for code in codes:
                     batch[code] = self.get_realtime_quote(code, log_final_failure=False)
 
-            if batch:
-                result.update(batch)
+            if batch is not None:
+                result.update(batch.quotes)
             # Fill in missing stocks as None
             for code in codes:
                 if code not in result:
                     result[code] = None
 
-        return result
+        elapsed = _time.time() - start
+        matched_count = sum(1 for v in result.values() if v is not None)
+        market_label = "mixed" if len(markets) > 1 else (list(markets)[0] if markets else "unknown")
+
+        return RealtimeBatchResult(
+            quotes=result,
+            source=",".join(sorted(markets)),
+            is_bulk=True,
+            market=market_label,
+            elapsed_seconds=elapsed,
+            requested_count=len(codes),
+            matched_count=matched_count,
+        )
 
     def get_hk_realtime_quotes_batch(
         self,
         codes: List[str],
         snapshot_id: str,
-    ) -> Optional[Dict[str, Optional]]:
+    ) -> Optional[RealtimeBatchResult]:
         """
         HK batch-first: primary stock_hk_spot_em -> fallback stock_hk_spot.
-        Cached per snapshot_id so at most 1 call per interface per snapshot.
+        Handles partial miss by merging fallback results for codes primary missed.
+        Caches full-market parsed dict so subsequent calls with different code
+        subsets reuse the same fetched data.
         """
+        import time as _time
+        start = _time.time()
+        requested_count = len(codes)
+
+        def _build_result(quotes: Dict[str, Optional], source: str, elapsed: float) -> RealtimeBatchResult:
+            """Subset full-market dict to requested codes and build result."""
+            subset = self._subset_hk_spot_results(quotes, codes)
+            matched = sum(1 for v in subset.values() if v is not None)
+            return RealtimeBatchResult(
+                quotes=subset, source=source, is_bulk=True, market="hk",
+                elapsed_seconds=elapsed, requested_count=requested_count, matched_count=matched,
+            )
+
         # Try primary: stock_hk_spot_em
         primary_key = "hk:akshare_hk_spot_em"
-        cached = RealtimeSnapshotCache.get(snapshot_id, primary_key, ttl=90.0)
-        if cached is not None:
-            logger.info("[批量行情] HK primary cache hit: snapshot=%s key=%s", snapshot_id, primary_key)
-            return cached
+        cached_full = RealtimeSnapshotCache.get(snapshot_id, primary_key, ttl=90.0)
+        if cached_full is not None:
+            logger.info("[批量行情-primary] HK primary cache hit: snapshot=%s key=%s", snapshot_id, primary_key)
+            return _build_result(cached_full, primary_key, 0.0)
 
-        result = self._fetch_hk_batch_primary(codes)
-        if result is not None:
-            RealtimeSnapshotCache.set(snapshot_id, primary_key, result, ttl=90.0)
-            return result
+        full_result = self._fetch_hk_batch_primary(codes)
+        if full_result is not None:
+            # Cache the full-market dict for future code subsets
+            RealtimeSnapshotCache.set(snapshot_id, primary_key, full_result, ttl=90.0)
+
+            # Check for partial miss on the requested subset
+            subset = self._subset_hk_spot_results(full_result, codes)
+            missing_count = sum(1 for v in subset.values() if v is None)
+            if missing_count > 0:
+                logger.info(
+                    "[批量行情-primary] HK primary partial hit: %d/%d codes found, "
+                    "trying fallback all-market for remaining %d",
+                    requested_count - missing_count, requested_count, missing_count,
+                )
+                fallback_full = self._fetch_hk_batch(codes, source="stock_hk_spot")
+                if fallback_full is not None:
+                    # Merge full-market dicts, then re-subset
+                    merged = self._merge_batch_results(full_result, fallback_full)
+                    full_result = merged
+                    RealtimeSnapshotCache.set(snapshot_id, primary_key, full_result, ttl=90.0)
+            elapsed = _time.time() - start
+            return _build_result(full_result, primary_key, elapsed)
 
         # Fallback: stock_hk_spot (full market, slower)
         fallback_key = "hk:akshare_hk_spot"
-        cached = RealtimeSnapshotCache.get(snapshot_id, fallback_key, ttl=90.0)
-        if cached is not None:
-            logger.info("[批量行情] HK fallback cache hit: snapshot=%s key=%s", snapshot_id, fallback_key)
-            return cached
+        cached_full = RealtimeSnapshotCache.get(snapshot_id, fallback_key, ttl=90.0)
+        if cached_full is not None:
+            logger.info("[批量行情-fallback] HK fallback cache hit: snapshot=%s key=%s", snapshot_id, fallback_key)
+            return _build_result(cached_full, fallback_key, 0.0)
 
-        result = self._fetch_hk_batch(codes, source="stock_hk_spot")
-        if result is not None:
-            RealtimeSnapshotCache.set(snapshot_id, fallback_key, result, ttl=90.0)
-            return result
+        full_result = self._fetch_hk_batch(codes, source="stock_hk_spot")
+        if full_result is not None:
+            RealtimeSnapshotCache.set(snapshot_id, fallback_key, full_result, ttl=90.0)
+            elapsed = _time.time() - start
+            return _build_result(full_result, fallback_key, elapsed)
 
         return None
 
@@ -1556,11 +1606,15 @@ class DataFetcherManager:
         self,
         codes: List[str],
         snapshot_id: str,
-    ) -> Optional[Dict[str, Optional]]:
+    ) -> Optional[RealtimeBatchResult]:
         """
         CN auto batch: if stock count >= config threshold, use akshare A-share spot.
         Otherwise falls through to per-stock get_realtime_quote.
         """
+        import time as _time
+        start = _time.time()
+        requested_count = len(codes)
+
         # Read config (accessible via self._fetchers context or global config)
         try:
             from src.config import get_config
@@ -1585,12 +1639,21 @@ class DataFetcherManager:
         cached = RealtimeSnapshotCache.get(snapshot_id, cache_key, ttl=90.0)
         if cached is not None:
             logger.info("[批量行情] CN cache hit: snapshot=%s key=%s", snapshot_id, cache_key)
-            return cached
+            matched = sum(1 for v in cached.values() if v is not None)
+            return RealtimeBatchResult(
+                quotes=cached, source=cache_key, is_bulk=True, market="cn",
+                elapsed_seconds=0.0, requested_count=requested_count, matched_count=matched,
+            )
 
         result = self._fetch_cn_batch(codes)
         if result is not None:
             RealtimeSnapshotCache.set(snapshot_id, cache_key, result, ttl=90.0)
-            return result
+            matched = sum(1 for v in result.values() if v is not None)
+            elapsed = _time.time() - start
+            return RealtimeBatchResult(
+                quotes=result, source=cache_key, is_bulk=True, market="cn",
+                elapsed_seconds=elapsed, requested_count=requested_count, matched_count=matched,
+            )
 
         return None
 
@@ -1598,22 +1661,28 @@ class DataFetcherManager:
         self,
         codes: List[str],
         snapshot_id: str,
-    ) -> Optional[Dict[str, Optional]]:
+    ) -> Optional[RealtimeBatchResult]:
         """
         US light batch: yfinance multi-ticker if available.
         Falls back to per-stock get_realtime_quote.
         """
+        import time as _time
+        start = _time.time()
+        requested_count = len(codes)
+
         if len(codes) <= 1:
             return None
 
         cache_key = "us:yfinance_batch"
         cached = RealtimeSnapshotCache.get(snapshot_id, cache_key, ttl=60.0)
         if cached is not None:
-            return cached
+            matched = sum(1 for v in cached.values() if v is not None)
+            return RealtimeBatchResult(
+                quotes=cached, source=cache_key, is_bulk=True, market="us",
+                elapsed_seconds=0.0, requested_count=requested_count, matched_count=matched,
+            )
 
         # Try yfinance.download for multiple tickers
-        import time as _time
-        start = _time.time()
         try:
             import yfinance as yf
             tickers = " ".join(codes)
@@ -1644,10 +1713,38 @@ class DataFetcherManager:
                     result[code] = None
 
             RealtimeSnapshotCache.set(snapshot_id, cache_key, result, ttl=60.0)
-            return result
+            matched = sum(1 for v in result.values() if v is not None)
+            elapsed = _time.time() - start
+            return RealtimeBatchResult(
+                quotes=result, source=cache_key, is_bulk=True, market="us",
+                elapsed_seconds=elapsed, requested_count=requested_count, matched_count=matched,
+            )
         except Exception as exc:
             logger.warning("[批量行情] yfinance US batch 失败: %s", exc)
             return None
+
+    def get_realtime_quote_single_only(self, stock_code: str) -> Optional:
+        """
+        Get realtime quote using only single-stock-capable sources.
+        Never routes to full-market bulk sources (stock_hk_spot_em, stock_hk_spot,
+        stock_zh_a_spot_em).
+
+        For HK: delegates to AkshareFetcher._get_hk_realtime_quote_tencent()
+        For CN/US: falls through to regular get_realtime_quote()
+        """
+        from .akshare_fetcher import _is_hk_code as _is_hk
+        from src.config import get_config
+        if _is_hk(stock_code):
+            fetcher = self._get_fetcher_by_name("AkshareFetcher", capability="realtime_quote")
+            if fetcher is not None and hasattr(fetcher, '_get_hk_realtime_quote_tencent'):
+                quote = fetcher._get_hk_realtime_quote_tencent(stock_code)
+                if quote is not None:
+                    return self._enrich_realtime_quote(
+                        quote, fallback_from=None,
+                        realtime_cache_ttl=getattr(get_config(), "realtime_cache_ttl", None),
+                    )
+        # For CN/US and HK fallback, use regular get_realtime_quote
+        return self.get_realtime_quote(stock_code, log_final_failure=False)
 
     # --- Backward-compat cache static methods (delegate to RealtimeSnapshotCache) ---
 
@@ -1663,101 +1760,124 @@ class DataFetcherManager:
     def clear_snapshot_cache(snapshot_id: str) -> None:
         RealtimeSnapshotCache.clear(snapshot_id)
 
-    def _fetch_hk_batch_primary(self, codes: List[str]) -> Optional[Dict[str, Optional]]:
+    def _fetch_hk_batch_primary(self, codes: List[str]) -> Optional[Dict[str, Optional[Any]]]:
         """HK primary batch: ak.stock_hk_spot_em (faster, per-stock via EM).
 
-        Returns dict of {code: UnifiedRealtimeQuote or None} for requested codes,
-        or None on complete failure.
+        Returns full-market dict of {normalized_code: UnifiedRealtimeQuote or None}
+        for ALL codes in the DataFrame, or None on complete failure.
+        Caller is responsible for subsetting via _subset_hk_spot_results().
         """
         import time as _time
         try:
             import akshare as ak
             api_start = _time.time()
-            logger.info("[批量行情] 通过 ak.stock_hk_spot_em() 获取全部港股行情(primary)...")
+            logger.info("[批量行情-primary] 通过 ak.stock_hk_spot_em() 获取全部港股行情...")
             df_spot = ak.stock_hk_spot_em()
             api_elapsed = _time.time() - api_start
             logger.info(
-                "[批量行情] ak.stock_hk_spot_em 成功: 返回 %d 只港股, 耗时 %.2fs",
+                "[批量行情-primary] ak.stock_hk_spot_em 成功: 返回 %d 只港股, 耗时 %.2fs",
                 len(df_spot), api_elapsed,
             )
-            return self._extract_hk_spot_results(df_spot, codes, source="stock_hk_spot_em")
+            return self._parse_hk_spot_dataframe(df_spot, source="stock_hk_spot_em")
         except Exception as exc:
-            logger.warning("[批量行情] ak.stock_hk_spot_em 失败: %s", exc)
+            logger.warning("[批量行情-primary] ak.stock_hk_spot_em 失败: %s", exc)
 
-        # No df_spot available; individual per-stock fallback is handled
-        # at the intraday monitor level, not here.
         return None
 
-    def _fetch_hk_batch(self, codes: List[str], source: str = "stock_hk_spot") -> Optional[Dict[str, Optional]]:
+    def _fetch_hk_batch(self, codes: List[str], source: str = "stock_hk_spot") -> Optional[Dict[str, Optional[Any]]]:
         """HK fallback batch: ak.stock_hk_spot() (full market, slower).
 
         Args:
-            codes: list of HK stock codes to extract
+            codes: list of HK stock codes (ignored — returns full market dict)
             source: "stock_hk_spot" (current) or caller can pass context
 
-        Returns dict of {code: UnifiedRealtimeQuote or None}, or None on complete failure.
+        Returns full-market dict of {normalized_code: UnifiedRealtimeQuote or None}
+        for ALL codes in the DataFrame, or None on complete failure.
         """
         import time as _time
         try:
             import akshare as ak
             api_start = _time.time()
-            logger.info("[批量行情] 通过 ak.stock_hk_spot() 获取全部港股行情(fallback)...")
+            logger.info("[批量行情-fallback] 通过 ak.stock_hk_spot() 获取全部港股行情...")
             df_spot = ak.stock_hk_spot()
             api_elapsed = _time.time() - api_start
             logger.info(
-                "[批量行情] ak.stock_hk_spot 成功: 返回 %d 只港股, 耗时 %.2fs",
+                "[批量行情-fallback] ak.stock_hk_spot 成功: 返回 %d 只港股, 耗时 %.2fs",
                 len(df_spot), api_elapsed,
             )
-            return self._extract_hk_spot_results(df_spot, codes, source=source)
+            return self._parse_hk_spot_dataframe(df_spot, source=source)
         except Exception as exc:
-            logger.warning("[批量行情] ak.stock_hk_spot 失败: %s", exc)
+            logger.warning("[批量行情-fallback] ak.stock_hk_spot 失败: %s", exc)
             return None
 
     @staticmethod
-    def _extract_hk_spot_results(df_spot, codes: List[str], source: str = "stock_hk_spot") -> Dict[str, Optional]:
-        """Extract requested HK stocks from a full-market HK spot DataFrame.
+    def _parse_hk_spot_dataframe(df_spot, source: str = "stock_hk_spot") -> Dict[str, Optional[Any]]:
+        """Parse ALL HK stocks from a full-market HK spot DataFrame into a dict.
 
-        Supports both stock_hk_spot_em and stock_hk_spot column naming.
+        Returns dict of {normalized_code: UnifiedRealtimeQuote or None} for all codes
+        present in the DataFrame. This full dict can be cached and subsetted later.
         """
-        import time as _time
         from .realtime_types import UnifiedRealtimeQuote
         result: Dict[str, Optional] = {}
 
-        for code in codes:
-            raw = code.replace("hk", "").zfill(5)
-            # Column name varies by source: '代码' (stock_hk_spot_em) or '代码' (stock_hk_spot)
-            code_col = '代码'
-            if code_col not in df_spot.columns:
-                # Try alternate column names
-                for alt in ['symbol', 'code', '股票代码']:
-                    if alt in df_spot.columns:
-                        code_col = alt
-                        break
+        # Column name varies by source: '代码' (stock_hk_spot_em) or '代码' (stock_hk_spot)
+        code_col = '代码'
+        if code_col not in df_spot.columns:
+            for alt in ['symbol', 'code', '股票代码']:
+                if alt in df_spot.columns:
+                    code_col = alt
+                    break
 
-            row = df_spot[df_spot[code_col].astype(str) == raw]
-            if row.empty:
-                result[code] = None
-            else:
-                row = row.iloc[0]
-                result[code] = UnifiedRealtimeQuote(
-                    code=code,
-                    name=str(row.get('名称', '')),
-                    price=float(row.get('最新价', 0)) if row.get('最新价') is not None else None,
-                    change_pct=float(row.get('涨跌幅', 0)) if row.get('涨跌幅') is not None else None,
-                    change_amount=float(row.get('涨跌额', 0)) if row.get('涨跌额') is not None else None,
-                    volume=int(row.get('成交量', 0)) if row.get('成交量') is not None else None,
-                    amount=float(row.get('成交额', 0)) if row.get('成交额') is not None else None,
-                    turnover_rate=float(row.get('换手率', 0)) if row.get('换手率') is not None else None,
-                    amplitude=float(row.get('振幅', 0)) if row.get('振幅') is not None else None,
-                    volume_ratio=float(row.get('量比', 0)) if row.get('量比') is not None else None,
-                    high=float(row.get('最高', 0)) if row.get('最高') is not None else None,
-                    low=float(row.get('最低', 0)) if row.get('最低') is not None else None,
-                    open_price=float(row.get('今开', 0)) if row.get('今开') is not None else None,
-                    pre_close=float(row.get('昨收', 0)) if row.get('昨收') is not None else None,
-                )
+        for _, row in df_spot.iterrows():
+            raw_code = str(row.get(code_col, ''))
+            code = normalize_hk_code_for_match(raw_code)
+            if not code:
+                continue
+            result[code] = UnifiedRealtimeQuote(
+                code=code,
+                name=str(row.get('名称', '')),
+                price=float(row.get('最新价', 0)) if row.get('最新价') is not None else None,
+                change_pct=float(row.get('涨跌幅', 0)) if row.get('涨跌幅') is not None else None,
+                change_amount=float(row.get('涨跌额', 0)) if row.get('涨跌额') is not None else None,
+                volume=int(row.get('成交量', 0)) if row.get('成交量') is not None else None,
+                amount=float(row.get('成交额', 0)) if row.get('成交额') is not None else None,
+                turnover_rate=float(row.get('换手率', 0)) if row.get('换手率') is not None else None,
+                amplitude=float(row.get('振幅', 0)) if row.get('振幅') is not None else None,
+                volume_ratio=float(row.get('量比', 0)) if row.get('量比') is not None else None,
+                high=float(row.get('最高', 0)) if row.get('最高') is not None else None,
+                low=float(row.get('最低', 0)) if row.get('最低') is not None else None,
+                open_price=float(row.get('今开', 0)) if row.get('今开') is not None else None,
+                pre_close=float(row.get('昨收', 0)) if row.get('昨收') is not None else None,
+            )
         return result
 
-    def _fetch_cn_batch(self, codes: List[str]) -> Optional[Dict[str, Optional]]:
+    @staticmethod
+    def _subset_hk_spot_results(full_dict: Dict[str, Optional[Any]], codes: List[str]) -> Dict[str, Optional[Any]]:
+        """Extract a subset of codes from a full-market HK spot result dict.
+
+        Returns dict of {original_code: quote or None} for each requested code.
+        If a code is not in the full dict, it is mapped to None.
+        """
+        result: Dict[str, Optional] = {}
+        for code in codes:
+            raw = normalize_hk_code_for_match(code)
+            quote = full_dict.get(raw)
+            result[code] = quote
+        return result
+
+    @staticmethod
+    def _merge_batch_results(
+        primary: Dict[str, Optional[Any]],
+        fallback: Dict[str, Optional[Any]],
+    ) -> Dict[str, Optional[Any]]:
+        """Merge fallback results into primary for codes where primary returned None."""
+        merged = dict(primary)
+        for code, quote in fallback.items():
+            if merged.get(code) is None and quote is not None:
+                merged[code] = quote
+        return merged
+
+    def _fetch_cn_batch(self, codes: List[str]) -> Optional[Dict[str, Optional[Any]]]:
         """CN batch: ak.stock_zh_a_spot_em() (full A-share market).
 
         Returns dict of {code: UnifiedRealtimeQuote or None}, or None on complete failure.
@@ -1766,13 +1886,13 @@ class DataFetcherManager:
         try:
             import akshare as ak
             api_start = _time.time()
-            logger.info("[批量行情] 通过 ak.stock_zh_a_spot_em() 获取全部A股行情...")
+            logger.info("[批量行情-primary] 通过 ak.stock_zh_a_spot_em() 获取全部A股行情...")
             df_spot = ak.stock_zh_a_spot_em()
             api_elapsed = _time.time() - api_start
-            logger.info("[批量行情] ak.stock_zh_a_spot_em 成功: 返回 %d 只A股, 耗时 %.2fs", len(df_spot), api_elapsed)
+            logger.info("[批量行情-primary] ak.stock_zh_a_spot_em 成功: 返回 %d 只A股, 耗时 %.2fs", len(df_spot), api_elapsed)
 
             from .realtime_types import UnifiedRealtimeQuote
-            normalized_targets = {(code.strip().lstrip('shsz').lstrip('SH.').lstrip('SZ.').lstrip('sh').lstrip('SH')): code for code in codes}
+            normalized_targets = {normalize_cn_code_for_match(code): code for code in codes}
             result: Dict[str, Optional] = {}
 
             for normalized, original in normalized_targets.items():
@@ -1799,7 +1919,7 @@ class DataFetcherManager:
                     )
             return result
         except Exception as exc:
-            logger.warning("[批量行情] ak.stock_zh_a_spot_em 失败: %s", exc)
+            logger.warning("[批量行情-primary] ak.stock_zh_a_spot_em 失败: %s", exc)
             return None
 
     def _enrich_realtime_quote(

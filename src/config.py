@@ -929,6 +929,10 @@ class Config:
     intraday_hk_batch_primary_timeout: float = 20.0
     # HK 批量备用接口超时 (stock_hk_spot)
     intraday_hk_batch_fallback_timeout: float = 60.0
+    # 盘中快照进程锁 TTL（秒），默认 10 分钟
+    intraday_snapshot_lock_ttl_seconds: int = 600
+    # 盘中决策进程锁 TTL（秒），默认 5 分钟
+    intraday_decision_lock_ttl_seconds: int = 300
 
     # === 实时行情增强数据配置 ==="
     # 实时行情开关（关闭后使用历史收盘价进行分析）

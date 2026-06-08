@@ -34,6 +34,7 @@ from enum import Enum
 from typing import Any, Callable, Dict, List, Optional, Set
 
 from src.core.intraday_prompt import format_intraday_event_time
+from data_provider.realtime_types import SnapshotQuoteProcessResult, SnapshotQuoteStatus
 
 logger = logging.getLogger(__name__)
 
@@ -769,7 +770,8 @@ class IntradayMonitor:
 
     def monitor_snapshot(self) -> None:
         """Entry point for scheduled snapshot (called by Scheduler)."""
-        if not self._acquire_process_lock("intraday_snapshot", ttl_seconds=120):
+        ttl = getattr(self._config, 'intraday_snapshot_lock_ttl_seconds', 120)
+        if not self._acquire_process_lock("intraday_snapshot", ttl_seconds=ttl):
             logger.warning("monitor_snapshot: 无法获取进程锁（另一个实例正在执行），跳过本次快照")
             return
         acquired = self._lock.acquire(timeout=30)
@@ -863,58 +865,20 @@ class IntradayMonitor:
             if mkt:
                 by_market.setdefault(mkt, []).append(code)
 
-        # Batch fetch per market
-        all_quotes: Dict[str, Any] = {}
-        for mkt, codes_in_market in by_market.items():
-            batch = self._fetcher.get_realtime_quotes_batch(codes_in_market, {mkt}, snapshot_id)
-            if batch:
-                all_quotes.update(batch)
-            # Fill in missing stocks
-            for code in codes_in_market:
-                if code not in all_quotes:
-                    all_quotes[code] = None
+        # Run snapshot for all tradable codes (batch-first with fallback)
+        results = self._run_snapshot_for_codes(tradable_codes, now, snapshot_id)
 
-        # Separate batch-matched stocks from unmatched for fallback path
-        completed_codes: List[str] = []
-        valid_quote_codes: List[str] = []
-        failed_codes: List[str] = []
-        timeout_count = 0
-        suspended_count = 0
-        batch_matched_count = 0
-        fallback_count = 0
-        batch_matched_sources: set = set()
-
-        for code in tradable_codes:
-            quote = all_quotes.get(code)
-            if quote is not None:
-                # Batch-matched (or individual fetch succeeded from batch path)
-                batch_matched_count += 1
-                try:
-                    self._snapshot_one_stock_with_quote(code, now, quote)
-                    completed_codes.append(code)
-                    if quote.price is not None and quote.price > 0:
-                        valid_quote_codes.append(code)
-                    elif quote.price is None or quote.price <= 0:
-                        suspended_count += 1
-                except Exception as exc:
-                    logger.error("盘中快照异常 [%s]: %s", code, exc)
-                    failed_codes.append(code)
-            else:
-                # Not hit by batch — isolated single-stock fallback without bulk sources
-                fallback_count += 1
-                try:
-                    self._fallback_single_quote_without_bulk_sources(code, now)
-                    completed_codes.append(code)
-                except Exception as exc:
-                    logger.error("盘中快照fallback异常 [%s]: %s", code, exc)
-                    failed_codes.append(code)
+        completed_codes = results.get("completed_codes", [])
+        valid_quote_codes = results.get("valid_quote_codes", [])
+        failed_codes = results.get("failed_codes", [])
 
         # Log batch-first verification
         logger.info(
-            "batch_first_summary: snapshot=%s market_count=%d "
-            "batch_matched=%d fallback=%d completed=%d valid=%d failed=%d",
-            snapshot_id, len(by_market),
-            batch_matched_count, fallback_count,
+            "batch_first_summary: snapshot=%s market_count=%d target_count=%d "
+            "batch_hit=%d batch_miss=%d completed=%d valid=%d failed=%d",
+            snapshot_id, len(by_market), len(tradable_codes),
+            results.get("batch_matched_count", 0),
+            results.get("fallback_count", 0),
             len(completed_codes), len(valid_quote_codes), len(failed_codes),
         )
 
@@ -940,23 +904,105 @@ class IntradayMonitor:
         _CI = os.environ.get('CI', '').lower() == 'true' or os.environ.get('GITHUB_ACTIONS', '').lower() == 'true'
         logger.info(
             "snapshot_summary: target=%d success=%d failed=%d timeout=%d suspended=%d total_time=%.1fs coverage=%.1f%%",
-            target_count, success_count, failed_count, timeout_count, suspended_count, total_elapsed,
+            target_count, success_count, failed_count,
+            results.get("timeout_count", 0), results.get("suspended_count", 0),
+            total_elapsed,
             (success_count / max(target_count, 1)) * 100,
             extra=_log_ctx(self),
         )
         if _CI:
             logger.info("[CI] snapshot=%s target=%s done=%s", snapshot_id, target_count, success_count)
 
-    def _snapshot_one_stock_with_quote(self, code: str, now: datetime, quote) -> None:
+    def _run_snapshot_for_codes(
+        self, tradable_codes: List[str], now: datetime, snapshot_id: str,
+    ) -> Dict[str, Any]:
+        """Run batch-first snapshot for a list of stock codes.
+
+        Groups by market, fetches via batch, processes matched stocks via
+        _snapshot_one_stock_with_quote, and runs fallback for unmatched.
+        Shared by _monitor_snapshot_locked, run_one_shot_snapshot, and
+        run_one_shot_decision.
+
+        Returns dict with keys: completed_codes, valid_quote_codes, failed_codes,
+        batch_matched_count, fallback_count.
+        """
+        stock_markets_all = self._get_stock_markets(tradable_codes)
+        by_market: Dict[str, List[str]] = {}
+        for code in tradable_codes:
+            mkt = stock_markets_all.get(code)
+            if mkt:
+                by_market.setdefault(mkt, []).append(code)
+
+        # Batch fetch per market
+        all_quotes: Dict[str, Any] = {}
+        for mkt, codes_in_market in by_market.items():
+            batch = self._fetcher.get_realtime_quotes_batch(codes_in_market, {mkt}, snapshot_id)
+            if batch is not None and batch.quotes:
+                all_quotes.update(batch.quotes)
+            # Fill in missing stocks
+            for code in codes_in_market:
+                if code not in all_quotes:
+                    all_quotes[code] = None
+
+        # Process each code
+        completed_codes: List[str] = []
+        valid_quote_codes: List[str] = []
+        failed_codes: List[str] = []
+        timeout_count = 0
+        suspended_count = 0
+        batch_matched_count = 0
+        fallback_count = 0
+
+        for code in tradable_codes:
+            quote = all_quotes.get(code)
+            if quote is not None:
+                batch_matched_count += 1
+                try:
+                    result = self._snapshot_one_stock_with_quote(code, now, quote)
+                    completed_codes.append(code)
+                    if result.status == SnapshotQuoteStatus.VALID:
+                        valid_quote_codes.append(code)
+                    elif result.status == SnapshotQuoteStatus.SUSPENDED:
+                        suspended_count += 1
+                except Exception as exc:
+                    logger.error("盘中快照异常 [%s]: %s", code, exc)
+                    failed_codes.append(code)
+            else:
+                fallback_count += 1
+                try:
+                    result = self._fallback_single_quote_without_bulk_sources(code, now)
+                    completed_codes.append(code)
+                    if result.status == SnapshotQuoteStatus.VALID:
+                        valid_quote_codes.append(code)
+                except Exception as exc:
+                    logger.error("盘中快照fallback异常 [%s]: %s", code, exc)
+                    failed_codes.append(code)
+
+        return {
+            "completed_codes": completed_codes,
+            "valid_quote_codes": valid_quote_codes,
+            "failed_codes": failed_codes,
+            "timeout_count": timeout_count,
+            "suspended_count": suspended_count,
+            "batch_matched_count": batch_matched_count,
+            "fallback_count": fallback_count,
+        }
+
+    def _snapshot_one_stock_with_quote(self, code: str, now: datetime, quote) -> SnapshotQuoteProcessResult:
         """Process a pre-fetched quote for one stock against thresholds.
 
         Called for stocks that were hit by batch prefetch.
         Quote must be a UnifiedRealtimeQuote (not None).
+
+        Returns SnapshotQuoteProcessResult with status and event count.
         """
         if quote is None:
             logger.error("_snapshot_one_stock_with_quote called with None quote [%s]", code)
             self._save_event_unavailable(code, now)
-            return
+            return SnapshotQuoteProcessResult(
+                code=code, status=SnapshotQuoteStatus.ERROR,
+                message="None quote passed to method",
+            )
 
         # Suspended detection
         if quote.price is None or quote.price <= 0:
@@ -970,7 +1016,10 @@ class IntradayMonitor:
                 event_type="suspended",
                 description="停牌或无有效价格",
             ), snapshot_status="suspended"))
-            return
+            return SnapshotQuoteProcessResult(
+                code=code, status=SnapshotQuoteStatus.SUSPENDED,
+                source=getattr(quote, 'source', None),
+            )
 
         # Sanitize values
         price = float(quote.price)
@@ -980,6 +1029,7 @@ class IntradayMonitor:
 
         # Compare with thresholds
         yesterday = self._yesterday_analysis.get(code, {})
+        event_count = 0
         if not any(yesterday.values()):
             event = IntradayEvent(
                 timestamp=now,
@@ -992,30 +1042,44 @@ class IntradayMonitor:
                 description=f"当前价 {price}（无昨日分析数据）",
             )
             self._save_event(self._stamp_event(event, snapshot_status="valid"))
-            return
+            event_count = 1
+            return SnapshotQuoteProcessResult(
+                code=code, status=SnapshotQuoteStatus.VALID, event_count=event_count,
+                source=getattr(quote, 'source', None),
+            )
 
         events = _compare_with_thresholds(code, name, price, vol_ratio, change, yesterday, now=now)
         for event in events:
             self._save_event(self._stamp_event(event, snapshot_status="valid"))
+            event_count += 1
 
-    def _fallback_single_quote_without_bulk_sources(self, code: str, now: datetime) -> None:
+        return SnapshotQuoteProcessResult(
+            code=code, status=SnapshotQuoteStatus.VALID, event_count=event_count,
+            source=getattr(quote, 'source', None),
+        )
+
+    def _fallback_single_quote_without_bulk_sources(self, code: str, now: datetime) -> SnapshotQuoteProcessResult:
         """Fallback for stocks not hit by batch prefetch.
 
-        Uses only single-stock-capable fetchers (no bulk full-market interfaces
-        like stock_hk_spot). Delegates to _get_realtime_with_timeout which calls
-        DataFetcherManager.get_realtime_quote() — this path goes through per-stock
-        fetchers only (AkshareFetcher with source="hk" for HK, not stock_hk_spot).
+        Uses only single-stock-capable fetchers via get_realtime_quote_single_only
+        (no bulk full-market interfaces like stock_hk_spot).
         """
         logger.info(
-            "单股逐笔获取 [%s] (batch未命中, 使用单股快接口, 不含全市场批量源)",
+            "[单股行情] 单股逐笔获取 [%s] (batch未命中, 使用单股快接口, 不含全市场批量源)",
             code, extra=_log_ctx(self),
         )
         timeout = self._resolve_quote_timeout(code)
-        quote = self._get_realtime_with_timeout(code, timeout=timeout)
+        quote = self._get_realtime_with_timeout(
+            code, timeout=timeout,
+            fetch_fn=self._fetcher.get_realtime_quote_single_only,
+        )
 
         if quote is None:
             self._save_event_unavailable(code, now)
-            return
+            return SnapshotQuoteProcessResult(
+                code=code, status=SnapshotQuoteStatus.TIMEOUT,
+                message="single-stock fallback returned None",
+            )
 
         # Delegate to shared processing (same as batch-matched path)
         if quote.price is None or quote.price <= 0:
@@ -1029,7 +1093,10 @@ class IntradayMonitor:
                 event_type="suspended",
                 description="停牌或无有效价格(单股逐笔)",
             ), snapshot_status="suspended"))
-            return
+            return SnapshotQuoteProcessResult(
+                code=code, status=SnapshotQuoteStatus.SUSPENDED,
+                source=getattr(quote, 'source', None),
+            )
 
         price = float(quote.price)
         vol_ratio = float(quote.volume_ratio) if quote.volume_ratio is not None else None
@@ -1037,6 +1104,7 @@ class IntradayMonitor:
         name = str(quote.name or "")
 
         yesterday = self._yesterday_analysis.get(code, {})
+        event_count = 0
         if not any(yesterday.values()):
             event = IntradayEvent(
                 timestamp=now,
@@ -1049,11 +1117,21 @@ class IntradayMonitor:
                 description=f"当前价 {price}（无昨日分析数据, 单股逐笔）",
             )
             self._save_event(self._stamp_event(event, snapshot_status="valid"))
-            return
+            event_count = 1
+            return SnapshotQuoteProcessResult(
+                code=code, status=SnapshotQuoteStatus.VALID, event_count=event_count,
+                source=getattr(quote, 'source', None),
+            )
 
         events = _compare_with_thresholds(code, name, price, vol_ratio, change, yesterday, now=now)
         for event in events:
             self._save_event(self._stamp_event(event, snapshot_status="valid"))
+            event_count += 1
+
+        return SnapshotQuoteProcessResult(
+            code=code, status=SnapshotQuoteStatus.VALID, event_count=event_count,
+            source=getattr(quote, 'source', None),
+        )
 
     def _save_event_unavailable(self, code: str, now: datetime) -> None:
         """Save a data_unavailable event for a stock. Shared by batch and fallback paths."""
@@ -1069,18 +1147,26 @@ class IntradayMonitor:
         ), snapshot_status="timeout"))
 
     def _get_realtime_with_timeout(self, code: str, timeout: float = 10.0,
-                                    snapshot_id: Optional[str] = None):
-        """Call get_realtime_quote with timeout protection.
+                                    snapshot_id: Optional[str] = None,
+                                    fetch_fn: Optional[Callable[[str], Any]] = None):
+        """Call get_realtime_quote (or custom fetch_fn) with timeout protection.
 
         Uses a module-level executor so shutdown does not block on stuck threads.
+
+        Args:
+            code: stock code to fetch
+            timeout: max wait seconds
+            snapshot_id: optional snapshot context for logging
+            fetch_fn: optional callable to use instead of self._fetcher.get_realtime_quote
 
         Note: Python Futures cannot be truly cancelled for non-cancellable I/O
         (e.g. socket operations). The underlying network call may continue
         running even after timeout. The `_expired_requests` set guards against
         late results being consumed after timeout.
         """
+        fn = fetch_fn or self._fetcher.get_realtime_quote
         request_id = f"{snapshot_id or 'nosnap'}:{code}:{time.time()}"
-        future = _QUOTE_EXECUTOR.submit(self._fetcher.get_realtime_quote, code)
+        future = _QUOTE_EXECUTOR.submit(fn, code)
         try:
             result = future.result(timeout=timeout)
             if request_id in self._expired_requests:
@@ -1102,7 +1188,8 @@ class IntradayMonitor:
 
     def final_decision(self) -> None:
         """14:20 entry point: read today's events → LLM decision → email."""
-        if not self._acquire_process_lock("intraday_decision", ttl_seconds=300):
+        ttl = getattr(self._config, 'intraday_decision_lock_ttl_seconds', 300)
+        if not self._acquire_process_lock("intraday_decision", ttl_seconds=ttl):
             logger.warning("final_decision: 无法获取进程锁（另一个实例正在执行），放弃本次决策")
             return
         acquired = self._lock.acquire(timeout=60)
@@ -1837,16 +1924,17 @@ class IntradayMonitor:
         self.load_yesterday_analysis(stock_codes)
 
         now = datetime.now()
+        snapshot_id = f"{now.strftime('%Y%m%d_%H%M%S')}_standalone"
         logger.info("盘中快照(standalone) 开始: %s, %d 支股票 (可交易 %d 支)",
                      now.strftime("%H:%M:%S"), len(stock_codes), len(tradable))
 
-        for code in tradable:
-            try:
-                self._fallback_single_quote_without_bulk_sources(code, now)
-            except Exception as exc:
-                logger.error("盘中快照异常 [%s]: %s", code, exc)
-
-        logger.info("盘中快照(standalone) 完成: %s", now.strftime("%H:%M:%S"))
+        results = self._run_snapshot_for_codes(tradable, now, snapshot_id)
+        logger.info(
+            "盘中快照(standalone) 完成: batch_hit=%d fallback=%d completed=%d valid=%d failed=%d",
+            results.get("batch_matched_count", 0), results.get("fallback_count", 0),
+            len(results.get("completed_codes", [])), len(results.get("valid_quote_codes", [])),
+            len(results.get("failed_codes", [])),
+        )
 
     def run_one_shot_decision(self) -> None:
         """Standalone decision: snapshot at current price, then run LLM, send email.
@@ -1873,11 +1961,13 @@ class IntradayMonitor:
 
         # Snapshot first to capture latest prices before decision
         now = datetime.now()
+        snapshot_id = f"{now.strftime('%Y%m%d_%H%M%S')}_decision"
         logger.info("盘中决策前快照(standalone): %s, %d 支股票", now.strftime("%H:%M:%S"), len(target_codes))
-        for code in target_codes:
-            try:
-                self._fallback_single_quote_without_bulk_sources(code, now)
-            except Exception as exc:
-                logger.error("决策前快照异常 [%s]: %s", code, exc)
+        results = self._run_snapshot_for_codes(target_codes, now, snapshot_id)
+        logger.info(
+            "决策前快照完成(standalone): batch_hit=%d fallback=%d completed=%d valid=%d",
+            results.get("batch_matched_count", 0), results.get("fallback_count", 0),
+            len(results.get("completed_codes", [])), len(results.get("valid_quote_codes", [])),
+        )
 
         self._final_decision_locked()

@@ -48,7 +48,8 @@ from .base import BaseFetcher, DataFetchError, RateLimitError, STANDARD_COLUMNS,
 from .realtime_types import (
     UnifiedRealtimeQuote, ChipDistribution, RealtimeSource,
     get_realtime_circuit_breaker, get_chip_circuit_breaker,
-    safe_float, safe_int  # 使用统一的类型转换函数
+    safe_float, safe_int,  # 使用统一的类型转换函数
+    normalize_hk_code_for_match,
 )
 from .us_index_mapping import is_us_index_code, is_us_stock_code
 
@@ -827,7 +828,7 @@ class AkshareFetcher(BaseFetcher):
         self._enforce_rate_limit()
         
         # 确保代码格式正确（5位数字）
-        code = stock_code.lower().replace('hk', '').zfill(5)
+        code = normalize_hk_code_for_match(stock_code)
         
         logger.info(f"[API调用] ak.stock_hk_hist(symbol={code}, period=daily, "
                    f"start_date={start_date.replace('-', '')}, end_date={end_date.replace('-', '')}, adjust=qfq)")
@@ -1477,12 +1478,7 @@ class AkshareFetcher(BaseFetcher):
         self._enforce_rate_limit()
 
         # 确保代码格式正确（5位数字）
-        raw_code = stock_code.strip().lower()
-        if raw_code.endswith('.hk'):
-            raw_code = raw_code[:-3]
-        if raw_code.startswith('hk'):
-            raw_code = raw_code[2:]
-        code = raw_code.zfill(5)
+        code = normalize_hk_code_for_match(stock_code)
 
         # --- 主数据源：东方财富 ---
         if circuit_breaker.is_available(em_key):
@@ -1572,6 +1568,118 @@ class AkshareFetcher(BaseFetcher):
             circuit_breaker.record_failure(sina_key, str(e))
             return None
     
+    def _get_hk_realtime_quote_tencent(self, stock_code: str) -> Optional[UnifiedRealtimeQuote]:
+        """
+        Get HK realtime quote using ONLY single-stock Tencent API.
+        Must NOT call stock_hk_spot_em() or stock_hk_spot() (full-market bulk).
+
+        Uses: http://qt.gtimg.cn/q=hkXXXXX (Tencent single-stock endpoint)
+        """
+        code = normalize_hk_code_for_match(stock_code)
+        symbol = f"hk{code}"
+        url = f"http://{TENCENT_REALTIME_ENDPOINT}={symbol}"
+        api_start = time.time()
+
+        try:
+            headers = {
+                'Referer': 'http://finance.qq.com',
+                'User-Agent': random.choice(USER_AGENTS)
+            }
+
+            logger.info(
+                "[单股行情] 腾讯单股接口获取港股 %s 实时行情: symbol=%s",
+                stock_code, symbol,
+            )
+
+            self._enforce_rate_limit()
+            response = requests.get(url, headers=headers, timeout=10)
+            response.encoding = 'gbk'
+            api_elapsed = time.time() - api_start
+
+            if response.status_code != 200:
+                logger.warning("[单股行情] 腾讯港股 %s HTTP %d", stock_code, response.status_code)
+                return None
+
+            content = response.text.strip()
+            if '=""' in content or not content:
+                logger.info("[单股行情] 腾讯港股 %s 返回空数据", stock_code)
+                return None
+
+            # Extract data from the response
+            data_start = content.find('"')
+            data_end = content.rfind('"')
+            if data_start == -1 or data_end == -1:
+                logger.info("[单股行情] 腾讯港股 %s 数据格式异常", stock_code)
+                return None
+
+            data_str = content[data_start+1:data_end]
+            fields = data_str.split('~')
+
+            if len(fields) < 40:
+                logger.info("[单股行情] 腾讯港股 %s 字段不足: %d", stock_code, len(fields))
+                return None
+
+            # Tencent fields for HK stocks:
+            # 1: name, 2: code, 3: price, 4: pre_close, 5: open
+            # 6: volume, 7: bid, 8: ask
+            # 31: change_amount, 32: change_pct, 33: high, 34: low
+            # 38: turnover_rate, 39: pe_ratio, 44: circ_mv(yi), 45: total_mv(yi)
+            # 46: pb_ratio, 49: volume_ratio
+            price = safe_float(fields[3])
+            pre_close = safe_float(fields[4])
+            change_pct = safe_float(fields[32]) if len(fields) > 32 else None
+            change_amount = safe_float(fields[31]) if len(fields) > 31 else None
+
+            # If no explicit change pct, compute from price
+            if change_pct is None and price is not None and pre_close is not None and pre_close > 0:
+                change_amount = price - pre_close
+                change_pct = (change_amount / pre_close) * 100
+
+            quote = UnifiedRealtimeQuote(
+                code=stock_code,
+                name=fields[1] if len(fields) > 1 else "",
+                source=RealtimeSource.TENCENT,
+                price=price,
+                change_pct=change_pct,
+                change_amount=change_amount,
+                volume=_normalize_tencent_volume(fields),
+                open_price=safe_float(fields[5]) if len(fields) > 5 else None,
+                high=safe_float(fields[33]) if len(fields) > 33 else None,
+                low=safe_float(fields[34]) if len(fields) > 34 else None,
+                pre_close=pre_close,
+                turnover_rate=safe_float(fields[38]) if len(fields) > 38 else None,
+                amplitude=safe_float(fields[43]) if len(fields) > 43 else None,
+                volume_ratio=safe_float(fields[49]) if len(fields) > 49 else None,
+                pe_ratio=safe_float(fields[39]) if len(fields) > 39 else None,
+                pb_ratio=safe_float(fields[46]) if len(fields) > 46 else None,
+                circ_mv=safe_float(fields[44]) * 100000000 if len(fields) > 44 and fields[44] else None,
+                total_mv=safe_float(fields[45]) * 100000000 if len(fields) > 45 and fields[45] else None,
+            )
+
+            logger.info(
+                "[单股行情] 腾讯港股 %s %s: 价格=%s, 涨跌=%s%%, 耗时 %.2fs",
+                stock_code, quote.name, quote.price, quote.change_pct, api_elapsed,
+            )
+            return quote
+
+        except Exception as e:
+            api_elapsed = time.time() - api_start
+            logger.warning("[单股行情] 腾讯港股 %s 异常: %s (%.2fs)", stock_code, e, api_elapsed)
+            return None
+
+    def get_realtime_quote_single_only(self, stock_code: str) -> Optional[UnifiedRealtimeQuote]:
+        """
+        Get realtime quote using only single-stock-capable sources.
+        Never routes to full-market bulk sources (stock_hk_spot_em, stock_hk_spot).
+
+        For HK codes: uses _get_hk_realtime_quote_tencent() (single-stock Tencent API)
+        For CN/US: falls through to default get_realtime_quote()
+        """
+        if _is_hk_code(stock_code):
+            return self._get_hk_realtime_quote_tencent(stock_code)
+        # CN/US: fall through to default get_realtime_quote
+        return self.get_realtime_quote(stock_code)
+
     def get_chip_distribution(self, stock_code: str) -> Optional[ChipDistribution]:
         """
         获取筹码分布数据
