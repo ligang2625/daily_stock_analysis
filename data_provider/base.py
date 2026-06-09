@@ -1497,7 +1497,7 @@ class DataFetcherManager:
         import time as _time
         start = _time.time()
         from collections import OrderedDict
-        result: Dict[str, Optional] = OrderedDict()
+        result: Dict[str, Optional[Any]] = OrderedDict()
 
         for mkt in markets:
             if mkt == 'hk':
@@ -1548,7 +1548,7 @@ class DataFetcherManager:
         start = _time.time()
         requested_count = len(codes)
 
-        def _build_result(quotes: Dict[str, Optional], source: str, elapsed: float) -> RealtimeBatchResult:
+        def _build_result(quotes: Dict[str, Optional[Any]], source: str, elapsed: float) -> RealtimeBatchResult:
             """Subset full-market dict to requested codes and build result."""
             subset = self._subset_hk_spot_results(quotes, codes)
             matched = sum(1 for v in subset.values() if v is not None)
@@ -1692,7 +1692,7 @@ class DataFetcherManager:
             logger.info("[批量行情] yfinance.download 成功: %d codes, 耗时 %.2fs", len(codes), api_elapsed)
 
             from .realtime_types import UnifiedRealtimeQuote
-            result: Dict[str, Optional] = {}
+            result: Dict[str, Optional[Any]] = {}
             for code in codes:
                 try:
                     if isinstance(df.columns, pd.MultiIndex):
@@ -1818,7 +1818,7 @@ class DataFetcherManager:
         present in the DataFrame. This full dict can be cached and subsetted later.
         """
         from .realtime_types import UnifiedRealtimeQuote
-        result: Dict[str, Optional] = {}
+        result: Dict[str, Optional[Any]] = {}
 
         # Column name varies by source: '代码' (stock_hk_spot_em) or '代码' (stock_hk_spot)
         code_col = '代码'
@@ -1858,7 +1858,7 @@ class DataFetcherManager:
         Returns dict of {original_code: quote or None} for each requested code.
         If a code is not in the full dict, it is mapped to None.
         """
-        result: Dict[str, Optional] = {}
+        result: Dict[str, Optional[Any]] = {}
         for code in codes:
             raw = normalize_hk_code_for_match(code)
             quote = full_dict.get(raw)
@@ -1893,7 +1893,7 @@ class DataFetcherManager:
 
             from .realtime_types import UnifiedRealtimeQuote
             normalized_targets = {normalize_cn_code_for_match(code): code for code in codes}
-            result: Dict[str, Optional] = {}
+            result: Dict[str, Optional[Any]] = {}
 
             for normalized, original in normalized_targets.items():
                 row = df_spot[df_spot['代码'].astype(str) == normalized]
