@@ -2157,3 +2157,274 @@ class TestSnapshotOneStockWithQuote:
                 saved = mock_save.call_args[0][0]
                 assert saved.event_type == "enter_ideal_buy"
                 assert saved.stock_code == "000001"
+
+
+# ============================================================
+# Snapshot state persistence tests
+# ============================================================
+
+class TestSnapshotStatePersistence:
+    """Tests for snapshot state creation, persistence, and defensive handling."""
+
+    @staticmethod
+    def _setup_persist_mock(monitor, stored_rows=None):
+        """Set up mock session_scope with in-memory store for snapshot state round-trip.
+
+        Returns (patcher, stored_dict) where stored_dict["rows"] is the mutable list of
+        rows that INSERT will push to and SELECT will read from.
+        """
+        import json as _json
+        stored = {"rows": []}
+        if stored_rows:
+            stored["rows"] = list(stored_rows)
+
+        mock_conn = MagicMock()
+
+        def _execute_side_effect(query, params=None):
+            result = MagicMock()
+            query_text = str(query) if query is not None else ""
+            params = params if params else {}
+
+            if "INSERT OR REPLACE INTO intraday_snapshots" in query_text and params:
+                stored["rows"] = [r for r in stored["rows"] if r[0] != params.get("sid")]
+                # _persist_snapshot_state already json.dumps() the list fields before
+                # passing them as params, so store them as-is (they are JSON strings).
+                stored["rows"].append((
+                    params.get("sid"),
+                    params.get("rid"),
+                    params.get("st"),
+                    params.get("sa"),
+                    params.get("fa"),
+                    params.get("ec"),
+                    params.get("cc"),
+                    params.get("vc"),
+                    params.get("fc"),
+                    params.get("qd"),
+                ))
+            elif "SELECT" in query_text and "WHERE status = 'completed'" in query_text:
+                result.fetchall.return_value = [r for r in stored["rows"] if r[2] == "completed"]
+            elif "SELECT" in query_text:
+                result.fetchall.return_value = stored["rows"][:]
+            # CREATE TABLE IF NOT EXISTS passes silently
+            return result
+
+        mock_conn.execute.side_effect = _execute_side_effect
+
+        mock_session = MagicMock()
+        mock_session.__enter__.return_value = mock_session
+        mock_session.connection.return_value = mock_conn
+
+        patcher = patch.object(monitor._db, 'session_scope', return_value=mock_session)
+        patcher.start()
+        return patcher, stored
+
+    def test_ensure_snapshots_table_creates_on_empty_db(self):
+        """_ensure_intraday_snapshots_table works on empty DB."""
+        monitor = _make_monitor()
+        self._setup_persist_mock(monitor)
+        # Must not raise
+        monitor._ensure_intraday_snapshots_table()
+        # After ensure, query should work without exception
+        result = monitor._get_latest_completed_snapshot()
+        assert result is None  # no rows yet
+
+    def test_get_latest_completed_snapshot_none_when_no_completed(self):
+        """Returns None when no completed rows exist (table exists)."""
+        monitor = _make_monitor()
+        self._setup_persist_mock(monitor)
+        monitor._ensure_intraday_snapshots_table()
+        from src.core.intraday_monitor import SnapshotState
+        state = SnapshotState(
+            snapshot_id="test-snap-running",
+            run_id="run-001",
+            status="running",
+            expected_codes=["600519"],
+        )
+        monitor._persist_snapshot_state(state)
+        result = monitor._get_latest_completed_snapshot()
+        assert result is None
+
+    def test_snapshot_state_persist_and_readback(self):
+        """Snapshot state round-trips through persist and readback."""
+        monitor = _make_monitor()
+        self._setup_persist_mock(monitor)
+        monitor._ensure_intraday_snapshots_table()
+        state = SnapshotState(
+            snapshot_id="test-snap-002",
+            run_id="run-002",
+            status="completed",
+            expected_codes=["600519", "000001"],
+            completed_codes=["600519", "000001"],
+            valid_quote_codes=["600519"],
+            failed_codes=["000001"],
+        )
+        monitor._persist_snapshot_state(state)
+        result = monitor._get_latest_completed_snapshot()
+        assert result is not None
+        assert result["snapshot_id"] == "test-snap-002"
+        assert result["status"] == "completed"
+        assert result["expected_codes"] == ["600519", "000001"]
+        assert result["valid_quote_codes"] == ["600519"]
+        assert result["failed_codes"] == ["000001"]
+
+    def test_snapshot_state_persist_all_fields(self):
+        """Completed snapshot has all required fields non-null."""
+        monitor = _make_monitor()
+        self._setup_persist_mock(monitor)
+        monitor._ensure_intraday_snapshots_table()
+        state = SnapshotState(
+            snapshot_id="test-snap-all-fields",
+            run_id="run-all-fields",
+            status="completed",
+            started_at=datetime(2026, 6, 10, 10, 0, 0),
+            finished_at=datetime(2026, 6, 10, 10, 1, 0),
+            expected_codes=["600519", "000001"],
+            completed_codes=["600519", "000001"],
+            valid_quote_codes=["600519"],
+            failed_codes=["000001"],
+        )
+        monitor._persist_snapshot_state(state)
+        result = monitor._get_latest_completed_snapshot()
+        assert result is not None
+        assert result["snapshot_id"] == "test-snap-all-fields"
+        assert result["status"] == "completed"
+        assert result["expected_codes"] == ["600519", "000001"]
+        assert result["completed_codes"] == ["600519", "000001"]
+        assert result["valid_quote_codes"] == ["600519"]
+        assert result["failed_codes"] == ["000001"]
+
+    def test_run_one_shot_snapshot_creates_completed_snapshot(self):
+        """run_one_shot_snapshot creates completed snapshot with all fields."""
+        monitor = _make_monitor(intraday_stocks="600519,000001")
+        monitor._config.intraday_force_run = True
+        self._setup_persist_mock(monitor)
+        monitor._ensure_intraday_snapshots_table()
+
+        with patch.object(monitor, '_is_stock_trading_today', return_value=True):
+            with patch.object(monitor, 'load_yesterday_analysis'):
+                with patch.object(monitor, '_run_snapshot_for_codes') as mock_run:
+                    mock_run.return_value = {
+                        "completed_codes": ["600519", "000001"],
+                        "valid_quote_codes": ["600519", "000001"],
+                        "failed_codes": [],
+                        "timeout_count": 0,
+                        "suspended_count": 0,
+                        "batch_matched_count": 2,
+                        "fallback_count": 0,
+                    }
+                    monitor.run_one_shot_snapshot()
+
+        result = monitor._get_latest_completed_snapshot()
+        assert result is not None
+        assert result["status"] == "completed"
+        assert "600519" in result["expected_codes"]
+        assert "000001" in result["expected_codes"]
+        assert len(result["valid_quote_codes"]) == 2
+        assert len(result["failed_codes"]) == 0
+        assert result["snapshot_id"] is not None
+        assert "standalone" in result["snapshot_id"]
+
+    def test_run_one_shot_decision_creates_completed_snapshot(self):
+        """run_one_shot_decision pre-decision snapshot creates completed record."""
+        monitor = _make_monitor(intraday_stocks="600519")
+        monitor._config.intraday_force_run = True
+        self._setup_persist_mock(monitor)
+        monitor._ensure_intraday_snapshots_table()
+
+        with patch.object(monitor, '_is_stock_trading_today', return_value=True):
+            with patch.object(monitor, 'load_yesterday_analysis'):
+                with patch.object(monitor, '_run_snapshot_for_codes') as mock_run:
+                    mock_run.return_value = {
+                        "completed_codes": ["600519"],
+                        "valid_quote_codes": ["600519"],
+                        "failed_codes": [],
+                        "timeout_count": 0,
+                        "suspended_count": 0,
+                        "batch_matched_count": 1,
+                        "fallback_count": 0,
+                    }
+                    with patch.object(monitor, '_final_decision_locked'):
+                        monitor.run_one_shot_decision()
+
+        result = monitor._get_latest_completed_snapshot()
+        assert result is not None
+        assert result["status"] == "completed"
+        assert result["expected_codes"] == ["600519"]
+        assert result["valid_quote_codes"] == ["600519"]
+        assert "decision" in result["snapshot_id"]
+
+    def test_snapshot_coverage_all_valid(self):
+        """100% valid coverage when all codes valid."""
+        monitor = _make_monitor()
+        self._setup_persist_mock(monitor)
+        monitor._ensure_intraday_snapshots_table()
+        state = SnapshotState(
+            snapshot_id="test-cov-full",
+            run_id="run-cov",
+            status="completed",
+            expected_codes=["600519", "000001", "000002"],
+            completed_codes=["600519", "000001", "000002"],
+            valid_quote_codes=["600519", "000001", "000002"],
+            failed_codes=[],
+        )
+        monitor._persist_snapshot_state(state)
+        result = monitor._get_latest_completed_snapshot()
+        assert result is not None
+        expected = len(result["expected_codes"])
+        valid = len(result["valid_quote_codes"])
+        assert valid / expected == 1.0
+
+    def test_snapshot_coverage_partial(self):
+        """Partial valid coverage is correctly calculated."""
+        monitor = _make_monitor()
+        self._setup_persist_mock(monitor)
+        monitor._ensure_intraday_snapshots_table()
+        state = SnapshotState(
+            snapshot_id="test-cov-partial",
+            run_id="run-cov",
+            status="completed",
+            expected_codes=["600519", "000001", "hk00700"],
+            completed_codes=["600519", "000001"],
+            valid_quote_codes=["600519"],
+            failed_codes=["000001", "hk00700"],
+        )
+        monitor._persist_snapshot_state(state)
+        result = monitor._get_latest_completed_snapshot()
+        assert result is not None
+        expected = len(result["expected_codes"])
+        valid = len(result["valid_quote_codes"])
+        assert valid / expected == 1.0 / 3.0
+
+    def test_run_snapshot_with_state_persistence_creates_running_then_completed(self):
+        """_run_snapshot_with_state_persistence creates running then completed state."""
+        monitor = _make_monitor()
+        self._setup_persist_mock(monitor)
+        monitor._ensure_intraday_snapshots_table()
+
+        mock_results = {
+            "completed_codes": ["600519"],
+            "valid_quote_codes": ["600519"],
+            "failed_codes": [],
+            "timeout_count": 0,
+            "suspended_count": 0,
+            "batch_matched_count": 1,
+            "fallback_count": 0,
+        }
+        with patch.object(monitor, '_run_snapshot_for_codes', return_value=mock_results):
+            results, state = monitor._run_snapshot_with_state_persistence(
+                codes=["600519"],
+                now=datetime(2026, 6, 10, 10, 30, 0),
+                snapshot_id="test-shared-method",
+                source="test",
+            )
+
+        assert state.status == "completed"
+        assert state.expected_codes == ["600519"]
+        assert state.completed_codes == ["600519"]
+        assert state.valid_quote_codes == ["600519"]
+        assert state.failed_codes == []
+        assert state.finished_at is not None
+
+        result = monitor._get_latest_completed_snapshot()
+        assert result is not None
+        assert result["snapshot_id"] == "test-shared-method"

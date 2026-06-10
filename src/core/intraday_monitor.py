@@ -30,8 +30,9 @@ from datetime import datetime, date, timedelta
 import atexit
 import os
 import uuid
+import sqlite3
 from enum import Enum
-from typing import Any, Callable, Dict, List, Optional, Set
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 from src.core.intraday_prompt import format_intraday_event_time
 from data_provider.realtime_types import SnapshotQuoteProcessResult, SnapshotQuoteStatus
@@ -770,6 +771,8 @@ class IntradayMonitor:
 
     def monitor_snapshot(self) -> None:
         """Entry point for scheduled snapshot (called by Scheduler)."""
+        self._ensure_intraday_table()
+        self._ensure_intraday_snapshots_table()
         ttl = getattr(self._config, 'intraday_snapshot_lock_ttl_seconds', 120)
         if not self._acquire_process_lock("intraday_snapshot", ttl_seconds=ttl):
             logger.warning("monitor_snapshot: 无法获取进程锁（另一个实例正在执行），跳过本次快照")
@@ -787,8 +790,6 @@ class IntradayMonitor:
 
     def _monitor_snapshot_locked(self) -> None:
         """Snapshot implementation (caller must hold self._lock)."""
-        self._ensure_intraday_table()
-        self._ensure_intraday_snapshots_table()
 
         snapshot_id = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
         self._current_snapshot_id = snapshot_id
@@ -849,13 +850,13 @@ class IntradayMonitor:
             extra=_log_ctx(self),
         )
 
-        # Create snapshot state
-        snapshot_state = SnapshotState(
-            snapshot_id=snapshot_id,
-            run_id=self._current_run_id,
-            expected_codes=list(tradable_codes),
+        # Run snapshot with state persistence
+        results, snapshot_state = self._run_snapshot_with_state_persistence(
+            codes=tradable_codes, now=now, snapshot_id=snapshot_id, source="monitor",
         )
-        self._persist_snapshot_state(snapshot_state)
+        completed_codes = results.get("completed_codes", [])
+        valid_quote_codes = results.get("valid_quote_codes", [])
+        failed_codes = results.get("failed_codes", [])
 
         # Group tradable_codes by market for batch fetch
         stock_markets_all = self._get_stock_markets(tradable_codes)
@@ -864,13 +865,6 @@ class IntradayMonitor:
             mkt = stock_markets_all.get(code)
             if mkt:
                 by_market.setdefault(mkt, []).append(code)
-
-        # Run snapshot for all tradable codes (batch-first with fallback)
-        results = self._run_snapshot_for_codes(tradable_codes, now, snapshot_id)
-
-        completed_codes = results.get("completed_codes", [])
-        valid_quote_codes = results.get("valid_quote_codes", [])
-        failed_codes = results.get("failed_codes", [])
 
         # Log batch-first verification
         logger.info(
@@ -881,14 +875,6 @@ class IntradayMonitor:
             results.get("fallback_count", 0),
             len(completed_codes), len(valid_quote_codes), len(failed_codes),
         )
-
-        # Finish snapshot state
-        snapshot_state.status = "completed"
-        snapshot_state.finished_at = datetime.now()
-        snapshot_state.completed_codes = completed_codes
-        snapshot_state.valid_quote_codes = valid_quote_codes
-        snapshot_state.failed_codes = failed_codes
-        self._persist_snapshot_state(snapshot_state)
 
         # Clear per-snapshot cache
         try:
@@ -936,9 +922,12 @@ class IntradayMonitor:
         # Batch fetch per market
         all_quotes: Dict[str, Any] = {}
         for mkt, codes_in_market in by_market.items():
-            batch = self._fetcher.get_realtime_quotes_batch(codes_in_market, {mkt}, snapshot_id)
-            if batch is not None and batch.quotes:
-                all_quotes.update(batch.quotes)
+            try:
+                batch = self._fetcher.get_realtime_quotes_batch(codes_in_market, {mkt}, snapshot_id)
+                if batch is not None and batch.quotes:
+                    all_quotes.update(batch.quotes)
+            except Exception:
+                logger.exception("批量行情获取失败 [market=%s], 该市场股票将逐个 fallback 到单股接口", mkt)
             # Fill in missing stocks
             for code in codes_in_market:
                 if code not in all_quotes:
@@ -987,6 +976,71 @@ class IntradayMonitor:
             "batch_matched_count": batch_matched_count,
             "fallback_count": fallback_count,
         }
+
+    def _run_snapshot_with_state_persistence(
+        self,
+        codes: List[str],
+        now: datetime,
+        snapshot_id: Optional[str] = None,
+        source: str = "monitor",
+    ) -> Tuple[Dict[str, Any], "SnapshotState"]:
+        """Run snapshot with full state persistence lifecycle.
+
+        Creates SnapshotState (running) -> persists -> runs snapshot -> updates to
+        completed -> persists. On exception, persists failed/partial state, then re-raises.
+
+        Returns tuple of (snapshot_results_dict, SnapshotState).
+        """
+        if snapshot_id is None:
+            snapshot_id = f"{now.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
+        self._current_snapshot_id = snapshot_id
+
+        snapshot_state = SnapshotState(
+            snapshot_id=snapshot_id,
+            run_id=self._current_run_id,
+            expected_codes=list(codes),
+        )
+        self._persist_snapshot_state(snapshot_state)
+
+        logger.info(
+            "快照状态已持久化: snapshot_id=%s status=%s expected=%d source=%s",
+            snapshot_id, snapshot_state.status, len(codes), source,
+        )
+
+        results: Dict[str, Any] = {}
+        try:
+            results = self._run_snapshot_for_codes(codes, now, snapshot_id)
+        except Exception as exc:
+            snapshot_state.status = "failed"
+            snapshot_state.finished_at = datetime.now()
+            snapshot_state.completed_codes = results.get("completed_codes", [])
+            snapshot_state.valid_quote_codes = results.get("valid_quote_codes", [])
+            snapshot_state.failed_codes = results.get("failed_codes", []) or list(codes)
+            self._persist_snapshot_state(snapshot_state)
+            logger.error(
+                "快照状态已持久化: snapshot_id=%s status=failed expected=%d error=%s",
+                snapshot_id, len(codes), exc,
+            )
+            raise
+
+        completed_codes = results.get("completed_codes", [])
+        valid_quote_codes = results.get("valid_quote_codes", [])
+        failed_codes = results.get("failed_codes", [])
+
+        snapshot_state.status = "completed"
+        snapshot_state.finished_at = datetime.now()
+        snapshot_state.completed_codes = completed_codes
+        snapshot_state.valid_quote_codes = valid_quote_codes
+        snapshot_state.failed_codes = failed_codes
+        self._persist_snapshot_state(snapshot_state)
+
+        coverage = len(valid_quote_codes) / max(len(codes), 1)
+        logger.info(
+            "快照状态已持久化: snapshot_id=%s status=completed expected=%d valid=%d failed=%d coverage=%.1f%% source=%s",
+            snapshot_id, len(codes), len(valid_quote_codes), len(failed_codes), coverage * 100, source,
+        )
+
+        return results, snapshot_state
 
     def _snapshot_one_stock_with_quote(self, code: str, now: datetime, quote) -> SnapshotQuoteProcessResult:
         """Process a pre-fetched quote for one stock against thresholds.
@@ -1188,6 +1242,8 @@ class IntradayMonitor:
 
     def final_decision(self) -> None:
         """14:20 entry point: read today's events → LLM decision → email."""
+        self._ensure_intraday_table()
+        self._ensure_intraday_snapshots_table()
         ttl = getattr(self._config, 'intraday_decision_lock_ttl_seconds', 300)
         if not self._acquire_process_lock("intraday_decision", ttl_seconds=ttl):
             logger.warning("final_decision: 无法获取进程锁（另一个实例正在执行），放弃本次决策")
@@ -1221,6 +1277,15 @@ class IntradayMonitor:
 
         # Get latest completed snapshot
         snapshot = self._get_latest_completed_snapshot()
+        if snapshot is not None:
+            expected_count = len(snapshot["expected_codes"])
+            valid_count = len(snapshot["valid_quote_codes"])
+            logger.info(
+                "决策使用快照: snapshot_id=%s expected=%d valid=%d coverage=%.1f%%",
+                snapshot["snapshot_id"], expected_count,
+                valid_count,
+                (valid_count / max(expected_count, 1)) * 100,
+            )
         if snapshot is None:
             logger.warning("no_completed_snapshot: 当前没有已完成快照，跳过正式决策邮件")
             # Send incomplete alert
@@ -1629,6 +1694,7 @@ class IntradayMonitor:
 
     def _get_latest_completed_snapshot(self, markets=None) -> Optional[dict]:
         """Return the most recent completed snapshot state dict or None."""
+        self._ensure_intraday_snapshots_table()
         try:
             with self._db.session_scope() as session:
                 conn = session.connection()
@@ -1643,7 +1709,7 @@ class IntradayMonitor:
                 if rows:
                     import json
                     row = rows[0]
-                    return {
+                    snapshot = {
                         "snapshot_id": row[0],
                         "run_id": row[1],
                         "status": row[2],
@@ -1655,6 +1721,27 @@ class IntradayMonitor:
                         "failed_codes": json.loads(row[8]) if row[8] else [],
                         "query_date": row[9],
                     }
+                    expected_count = len(snapshot["expected_codes"])
+                    valid_count = len(snapshot["valid_quote_codes"])
+                    coverage = valid_count / max(expected_count, 1)
+                    logger.info(
+                        "获取最新completed快照成功: snapshot_id=%s expected=%d valid=%d coverage=%.1f%%",
+                        snapshot["snapshot_id"], expected_count, valid_count, coverage * 100,
+                    )
+                    return snapshot
+                logger.info("无 completed 快照记录（表存在但无 completed 行）")
+        except sqlite3.OperationalError as exc:
+            error_text = str(exc).lower()
+            if "no such table" in error_text:
+                logger.warning("intraday_snapshots 表不存在（schema bug），自动建表后重查")
+                self._ensure_intraday_snapshots_table()
+                try:
+                    return self._get_latest_completed_snapshot(markets)
+                except RecursionError:
+                    logger.warning("_get_latest_completed_snapshot 重查递归溢出，放弃")
+                    return None
+            else:
+                logger.warning("获取最新completed快照失败 (OperationalError): %s", exc)
         except Exception as exc:
             logger.warning("获取最新completed快照失败: %s", exc)
         return None
@@ -1755,6 +1842,7 @@ class IntradayMonitor:
                     "query_date TEXT NOT NULL)"
                 ))
                 session.commit()
+            logger.info("intraday_snapshots 表已就绪")
         except Exception as exc:
             logger.error("创建 intraday_snapshots 表失败: %s", exc)
 
@@ -1921,14 +2009,20 @@ class IntradayMonitor:
             tradable = stock_codes
 
         self._ensure_intraday_table()
+        self._ensure_intraday_snapshots_table()
         self.load_yesterday_analysis(stock_codes)
 
         now = datetime.now()
         snapshot_id = f"{now.strftime('%Y%m%d_%H%M%S')}_standalone"
+        self._current_snapshot_id = snapshot_id
+
         logger.info("盘中快照(standalone) 开始: %s, %d 支股票 (可交易 %d 支)",
                      now.strftime("%H:%M:%S"), len(stock_codes), len(tradable))
 
-        results = self._run_snapshot_for_codes(tradable, now, snapshot_id)
+        results, snapshot_state = self._run_snapshot_with_state_persistence(
+            codes=tradable, now=now, snapshot_id=snapshot_id, source="standalone",
+        )
+
         logger.info(
             "盘中快照(standalone) 完成: batch_hit=%d fallback=%d completed=%d valid=%d failed=%d",
             results.get("batch_matched_count", 0), results.get("fallback_count", 0),
@@ -1941,6 +2035,7 @@ class IntradayMonitor:
         Non-trading day: no events written unless --force-run.
         """
         self._ensure_intraday_table()
+        self._ensure_intraday_snapshots_table()
 
         stock_codes = self._get_stock_codes()
         tradable = [c for c in stock_codes if self._is_stock_trading_today(c)]
@@ -1962,8 +2057,14 @@ class IntradayMonitor:
         # Snapshot first to capture latest prices before decision
         now = datetime.now()
         snapshot_id = f"{now.strftime('%Y%m%d_%H%M%S')}_decision"
+        self._current_snapshot_id = snapshot_id
+
         logger.info("盘中决策前快照(standalone): %s, %d 支股票", now.strftime("%H:%M:%S"), len(target_codes))
-        results = self._run_snapshot_for_codes(target_codes, now, snapshot_id)
+
+        results, snapshot_state = self._run_snapshot_with_state_persistence(
+            codes=target_codes, now=now, snapshot_id=snapshot_id, source="decision",
+        )
+
         logger.info(
             "决策前快照完成(standalone): batch_hit=%d fallback=%d completed=%d valid=%d",
             results.get("batch_matched_count", 0), results.get("fallback_count", 0),

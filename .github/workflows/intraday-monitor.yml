@@ -121,4 +121,5 @@ jobs:
           name: intraday-${{ github.run_number }}
           path: |
             logs/
+            data/stock_analysis.db
           retention-days: 3
