@@ -16,18 +16,27 @@ from datetime import datetime, date
 from typing import Any, Dict, List, Optional
 
 
-def format_intraday_event_time(event: Any) -> str:
+def format_intraday_event_time(event: Any, include_market: bool = False) -> str:
     """Format event time: prefer market_local_timestamp, fallback to event timestamp."""
     mlt = getattr(event, 'market_local_timestamp', None)
+    time_str = "--:--"
     if mlt:
         try:
             dt = datetime.fromisoformat(str(mlt))
-            return dt.strftime("%H:%M")
+            time_str = dt.strftime("%H:%M")
         except (ValueError, TypeError):
             pass
-    if hasattr(event, 'timestamp') and event.timestamp:
-        return event.timestamp.strftime("%H:%M")
-    return "--:--"
+    if time_str == "--:--" and hasattr(event, 'timestamp') and event.timestamp:
+        time_str = event.timestamp.strftime("%H:%M")
+
+    if include_market:
+        market = getattr(event, 'market', None)
+        if market:
+            market_label = market.upper()
+            if market == 'us':
+                return f"{market_label} {time_str} ET"
+            return f"{market_label} {time_str}"
+    return time_str
 
 
 def build_intraday_prompt(
@@ -132,7 +141,7 @@ def build_intraday_prompt(
             vol = f"{e.volume_ratio:.1f}" if e.volume_ratio is not None else "-"
             chg = f"{e.change_pct:+.2f}%" if e.change_pct is not None else "-"
             lines.append(
-                f"| {format_intraday_event_time(e)} | {e.stock_name}({e.stock_code}) | "
+                f"| {format_intraday_event_time(e, include_market=is_mixed)} | {e.stock_name}({e.stock_code}) | "
                 f"{e.current_price:.2f} | {vol} | {chg} | {e.event_type} | {e.description} |"
             )
     else:

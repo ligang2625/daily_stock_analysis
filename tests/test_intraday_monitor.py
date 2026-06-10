@@ -978,21 +978,16 @@ class TestMarketLocalTimestamp:
     def test_send_decision_email_single_market_title(self):
         monitor = _make_monitor(intraday_stocks="600519")
         monitor._email_sender = MagicMock()
-        events = [
-            IntradayEvent(
-                stock_code="600519",
-                stock_name="茅台",
-                timestamp=datetime(2026, 6, 7, 14, 30),
-                current_price=1800.0,
-                volume_ratio=1.0,
-                change_pct=0.0,
-                event_type="test",
-                description="test",
-            )
-        ]
         with patch.object(monitor, '_get_market_query_date', return_value="2026-06-07"):
             with patch.object(monitor, '_get_market_for_stock', return_value="cn"):
-                monitor._send_decision_email("test content", events)
+                monitor._send_decision_email(
+                    content="test content",
+                    report_type=EmailReportType.OFFICIAL_DECISION,
+                    snapshot_id="test-snap-001",
+                    coverage_ratio=0.9,
+                    valid_count=9,
+                    expected_count=10,
+                )
         call_args = monitor._email_sender.send_to_email.call_args
         subject = call_args[1]["subject"]
         assert "CN:2026-06-07" in subject
@@ -1000,35 +995,21 @@ class TestMarketLocalTimestamp:
     def test_send_decision_email_multi_market_title(self):
         monitor = _make_monitor(intraday_stocks="600519,hk00700")
         monitor._email_sender = MagicMock()
-        events = [
-            IntradayEvent(
-                stock_code="600519",
-                stock_name="茅台",
-                timestamp=datetime(2026, 6, 7, 14, 30),
-                current_price=1800.0,
-                volume_ratio=1.0,
-                change_pct=0.0,
-                event_type="test",
-                description="test",
-            ),
-            IntradayEvent(
-                stock_code="hk00700",
-                stock_name="腾讯",
-                timestamp=datetime(2026, 6, 7, 14, 30),
-                current_price=400.0,
-                volume_ratio=1.0,
-                change_pct=0.0,
-                event_type="test",
-                description="test",
-            ),
-        ]
 
         def mock_query_date(mkt):
             return {"cn": "2026-06-07", "hk": "2026-06-07"}.get(mkt, "2026-06-07")
 
         with patch.object(monitor, '_get_market_query_date', side_effect=mock_query_date):
             with patch.object(monitor, '_get_market_for_stock', side_effect=lambda c: "cn" if c == "600519" else "hk"):
-                monitor._send_decision_email("test content", events)
+                monitor._send_decision_email(
+                    content="test content",
+                    report_type=EmailReportType.OFFICIAL_DECISION,
+                    snapshot_id="test-snap-001",
+                    coverage_ratio=0.9,
+                    valid_count=9,
+                    expected_count=10,
+                    market_dates={"cn": "2026-06-07", "hk": "2026-06-07"},
+                )
         call_args = monitor._email_sender.send_to_email.call_args
         subject = call_args[1]["subject"]
         assert "CN" in subject
@@ -2428,3 +2409,287 @@ class TestSnapshotStatePersistence:
         result = monitor._get_latest_completed_snapshot()
         assert result is not None
         assert result["snapshot_id"] == "test-shared-method"
+
+
+# ============================================================
+# SnapshotState — integration tests with real SQLite
+# ============================================================
+
+import contextlib
+import json as _test_json
+import os as _test_os
+import sqlite3 as _test_sqlite3
+
+
+class _SimpleResult:
+    def __init__(self, cursor):
+        self._cursor = cursor
+
+    def fetchall(self):
+        return [list(row) for row in self._cursor.fetchall()]
+
+
+class _SimpleConnection:
+    def __init__(self, conn):
+        self._conn = conn
+
+    def execute(self, query, params=None):
+        sql = str(query) if query is not None else ""
+        if params:
+            return _SimpleResult(self._conn.execute(sql, params))
+        return _SimpleResult(self._conn.execute(sql))
+
+
+class _SimpleSession:
+    def __init__(self, conn):
+        self._conn = conn
+
+    def connection(self):
+        return _SimpleConnection(self._conn)
+
+    def commit(self):
+        self._conn.commit()
+
+
+@contextlib.contextmanager
+def _real_session_scope(db_path):
+    conn = _test_sqlite3.connect(str(db_path))
+    conn.row_factory = _test_sqlite3.Row
+    try:
+        yield _SimpleSession(conn)
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+class _RealDbManager:
+    def __init__(self, db_path):
+        self.db_path = db_path
+
+    def session_scope(self):
+        return _real_session_scope(self.db_path)
+
+
+def _make_monitor_with_real_db(tmp_path, intraday_stocks=""):
+    db_path = str(tmp_path / "test_stock_analysis.db")
+    config = MagicMock()
+    config.intraday_monitor_stocks = intraday_stocks
+    config.litellm_model = "test-model"
+    config.llm_max_tokens = 500
+    config.llm_temperature = 0.3
+    config.intraday_reset_on_start = False
+    config.intraday_calendar_fail_open = False
+    config.intraday_legacy_fallback_enabled = False
+    config.intraday_unknown_market_policy = "skip"
+    config.intraday_force_run = False
+    config.intraday_quote_timeout_cn_fast = 12.0
+    config.intraday_quote_timeout_hk_full = 60.0
+    config.intraday_quote_timeout_hk_fast = 15.0
+    config.intraday_quote_timeout_us = 15.0
+    config.intraday_quote_timeout_default = 20.0
+    config.intraday_min_quote_coverage = 0.8
+    config.intraday_send_llm_failure_alert = True
+    config.intraday_send_raw_summary_on_llm_failure = False
+
+    db_mgr = _RealDbManager(db_path)
+    fetcher = MagicMock()
+    email = MagicMock()
+    return IntradayMonitor(config=config, fetcher_manager=fetcher, db_manager=db_mgr, email_sender=email)
+
+
+class TestSnapshotIntegrationSQLite:
+    """Integration tests using real SQLite database."""
+
+    def test_empty_db_lifecycle(self, tmp_path):
+        """Create table, persist state, read back — all on real SQLite."""
+        monitor = _make_monitor_with_real_db(tmp_path)
+        monitor._ensure_intraday_snapshots_table()
+
+        state = SnapshotState(
+            snapshot_id="test-lifecycle",
+            run_id="run-001",
+            status="completed",
+            started_at=datetime(2026, 6, 10, 10, 0, 0),
+            finished_at=datetime(2026, 6, 10, 10, 1, 0),
+            expected_codes=["600519", "000001"],
+            completed_codes=["600519", "000001"],
+            valid_quote_codes=["600519"],
+            failed_codes=["000001"],
+        )
+        with patch.object(monitor, '_get_market_query_date', return_value="2026-06-10"):
+            monitor._persist_snapshot_state(state)
+
+        result = monitor._get_latest_completed_snapshot()
+        assert result is not None
+        assert result["snapshot_id"] == "test-lifecycle"
+        assert result["status"] == "completed"
+        assert result["expected_codes"] == ["600519", "000001"]
+        assert result["valid_quote_codes"] == ["600519"]
+        assert result["failed_codes"] == ["000001"]
+
+    def test_preferred_snapshot_id_binding(self, tmp_path):
+        """Multiple snapshots: _get_completed_snapshot_by_id returns correct one."""
+        monitor = _make_monitor_with_real_db(tmp_path)
+        monitor._ensure_intraday_snapshots_table()
+
+        states = [
+            SnapshotState(snapshot_id="snap-A", run_id="r1", status="completed",
+                          started_at=datetime(2026, 6, 10, 10, 0, 0),
+                          finished_at=datetime(2026, 6, 10, 10, 1, 0),
+                          expected_codes=["600519"], completed_codes=["600519"],
+                          valid_quote_codes=["600519"], failed_codes=[]),
+            SnapshotState(snapshot_id="snap-B", run_id="r2", status="completed",
+                          started_at=datetime(2026, 6, 10, 10, 30, 0),
+                          finished_at=datetime(2026, 6, 10, 10, 31, 0),
+                          expected_codes=["600519", "000001"],
+                          completed_codes=["600519", "000001"],
+                          valid_quote_codes=["600519", "000001"], failed_codes=[]),
+        ]
+        with patch.object(monitor, '_get_market_query_date', return_value="2026-06-10"):
+            for s in states:
+                monitor._persist_snapshot_state(s)
+
+        snap_a = monitor._get_completed_snapshot_by_id("snap-A")
+        assert snap_a is not None
+        assert snap_a["expected_codes"] == ["600519"]
+
+        snap_b = monitor._get_completed_snapshot_by_id("snap-B")
+        assert snap_b is not None
+        assert snap_b["expected_codes"] == ["600519", "000001"]
+
+        # Non-existent should return None
+        assert monitor._get_completed_snapshot_by_id("snap-C") is None
+
+    def test_old_schema_compatibility(self, tmp_path):
+        """Old schema without markets/market_dates gets migrated."""
+        db_path = str(tmp_path / "test_old_schema.db")
+        conn = _test_sqlite3.connect(db_path)
+        conn.execute(
+            "CREATE TABLE intraday_snapshots ("
+            "snapshot_id TEXT PRIMARY KEY, "
+            "run_id TEXT NOT NULL, "
+            "status TEXT NOT NULL DEFAULT 'running', "
+            "started_at TEXT NOT NULL, "
+            "finished_at TEXT, "
+            "expected_codes TEXT, "
+            "completed_codes TEXT, "
+            "valid_quote_codes TEXT, "
+            "failed_codes TEXT, "
+            "query_date TEXT NOT NULL"
+            ")"
+        )
+        conn.commit()
+        conn.close()
+
+        monitor = _make_monitor_with_real_db(tmp_path)
+        # Override db path to use the pre-created one
+        monitor._db.db_path = db_path
+        monitor._ensure_intraday_snapshots_table()
+
+        # Verify columns exist
+        conn = _test_sqlite3.connect(db_path)
+        info = conn.execute("PRAGMA table_info('intraday_snapshots')").fetchall()
+        existing_cols = {row[1] for row in info}
+        assert 'markets' in existing_cols
+        assert 'market_dates' in existing_cols
+        conn.close()
+
+    def test_low_quality_snapshot_status(self, tmp_path):
+        """0 valid → failed, partial valid → partial status."""
+        monitor = _make_monitor_with_real_db(tmp_path)
+        monitor._ensure_intraday_snapshots_table()
+        monitor._current_run_id = "run-low-quality"
+
+        codes = ["600519", "000001", "hk00700"]
+        now = datetime(2026, 6, 10, 10, 30, 0)
+
+        # Mock _run_snapshot_for_codes to return 0 valid
+        with patch.object(monitor, '_run_snapshot_for_codes') as mock_run:
+            mock_run.return_value = {
+                "completed_codes": [],
+                "valid_quote_codes": [],
+                "failed_codes": codes,
+                "timeout_count": 3,
+                "suspended_count": 0,
+                "batch_matched_count": 0,
+                "fallback_count": 0,
+            }
+            with patch.object(monitor, '_get_market_for_stock', return_value='cn'):
+                with patch.object(monitor, '_get_market_query_date', return_value="2026-06-10"):
+                    results, state = monitor._run_snapshot_with_state_persistence(
+                        codes=codes, now=now, snapshot_id="test-low-zero",
+                        source="test",
+                    )
+        assert state.status == "failed"
+
+        # Partial valid
+        with patch.object(monitor, '_run_snapshot_for_codes') as mock_run:
+            mock_run.return_value = {
+                "completed_codes": ["600519"],
+                "valid_quote_codes": ["600519"],
+                "failed_codes": ["000001", "hk00700"],
+                "timeout_count": 2,
+                "suspended_count": 0,
+                "batch_matched_count": 1,
+                "fallback_count": 0,
+            }
+            with patch.object(monitor, '_get_market_for_stock', return_value='cn'):
+                with patch.object(monitor, '_get_market_query_date', return_value="2026-06-10"):
+                    results, state = monitor._run_snapshot_with_state_persistence(
+                        codes=codes, now=now, snapshot_id="test-low-partial",
+                        source="test",
+                    )
+        assert state.status == "partial"
+
+        # All valid
+        with patch.object(monitor, '_run_snapshot_for_codes') as mock_run:
+            mock_run.return_value = {
+                "completed_codes": ["600519", "000001", "hk00700"],
+                "valid_quote_codes": ["600519", "000001", "hk00700"],
+                "failed_codes": [],
+                "timeout_count": 0,
+                "suspended_count": 0,
+                "batch_matched_count": 3,
+                "fallback_count": 0,
+            }
+            with patch.object(monitor, '_get_market_for_stock', return_value='cn'):
+                with patch.object(monitor, '_get_market_query_date', return_value="2026-06-10"):
+                    results, state = monitor._run_snapshot_with_state_persistence(
+                        codes=codes, now=now, snapshot_id="test-low-full",
+                        source="test",
+                    )
+        assert state.status == "completed"
+
+    def test_cli_one_shot_snapshot_basic(self, tmp_path):
+        """run_one_shot_snapshot with real SQLite."""
+        monitor = _make_monitor_with_real_db(tmp_path, intraday_stocks="600519,000001")
+        monitor._config.intraday_force_run = True
+
+        with patch.object(monitor, '_is_stock_trading_today', return_value=True):
+            with patch.object(monitor, 'load_yesterday_analysis'):
+                with patch.object(monitor, '_get_market_for_stock', return_value='cn'):
+                    with patch.object(monitor, '_get_market_query_date', return_value="2026-06-10"):
+                        with patch.object(monitor, '_run_snapshot_for_codes') as mock_run:
+                            mock_run.return_value = {
+                                "completed_codes": ["600519", "000001"],
+                                "valid_quote_codes": ["600519", "000001"],
+                                "failed_codes": [],
+                                "timeout_count": 0,
+                                "suspended_count": 0,
+                                "batch_matched_count": 2,
+                                "fallback_count": 0,
+                            }
+                            with patch.object(monitor, '_save_event'):
+                                monitor.run_one_shot_snapshot()
+
+        result = monitor._get_latest_completed_snapshot()
+        assert result is not None
+        assert result["status"] == "completed"
+        assert "600519" in result["expected_codes"]
+        assert "000001" in result["expected_codes"]
+        assert len(result["valid_quote_codes"]) == 2
+        assert result["snapshot_id"] is not None
+        assert "standalone" in result["snapshot_id"]

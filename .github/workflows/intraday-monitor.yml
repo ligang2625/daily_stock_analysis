@@ -52,6 +52,26 @@ jobs:
           restore-keys: |
             intraday-data-${{ runner.os }}-
 
+      - name: 数据库状态摘要
+        run: |
+          if [ -f data/stock_analysis.db ]; then
+            echo "=== intraday_snapshots ==="
+            sqlite3 data/stock_analysis.db \
+              "SELECT snapshot_id, status, started_at, json_array_length(expected_codes),
+                      json_array_length(valid_quote_codes), json_array_length(failed_codes), query_date
+               FROM intraday_snapshots
+               ORDER BY started_at DESC LIMIT 5;"
+            echo ""
+            echo "=== intraday_events ==="
+            sqlite3 data/stock_analysis.db \
+              "SELECT query_date, market, count(*) as events
+               FROM intraday_events
+               GROUP BY query_date, market
+               ORDER BY query_date DESC LIMIT 10;"
+          else
+            echo "（数据库不存在）"
+          fi
+
       - name: 执行盘中任务
         env:
           # AI 配置

@@ -89,6 +89,7 @@ class IntradayEvent:
                      # near_buy_zone / enter_take_profit / unusual_volume / price_only
     description: str
     market_local_timestamp: Optional[str] = None  # ISO format in market local timezone
+    market: Optional[str] = None
     snapshot_id: Optional[str] = None
     run_id: Optional[str] = None
     snapshot_status: Optional[str] = None  # "valid" | "data_unavailable" | "suspended" | "timeout"
@@ -104,6 +105,7 @@ class IntradayEvent:
             "event_type": self.event_type,
             "description": self.description,
             "market_local_timestamp": self.market_local_timestamp,
+            "market": self.market,
             "snapshot_id": self.snapshot_id,
             "run_id": self.run_id,
             "snapshot_status": self.snapshot_status,
@@ -121,6 +123,8 @@ class SnapshotState:
     completed_codes: List[str] = field(default_factory=list)
     valid_quote_codes: List[str] = field(default_factory=list)
     failed_codes: List[str] = field(default_factory=list)
+    markets: List[str] = field(default_factory=list)
+    market_dates: Dict[str, str] = field(default_factory=dict)
 
 
 class EmailReportType(Enum):
@@ -1000,6 +1004,16 @@ class IntradayMonitor:
             run_id=self._current_run_id,
             expected_codes=list(codes),
         )
+        # Compute markets and market_dates from monitored stock codes
+        markets_set: set = set()
+        for code in codes:
+            mkt = self._get_market_for_stock(code)
+            if mkt:
+                markets_set.add(mkt)
+        snapshot_state.markets = sorted(markets_set)
+        snapshot_state.market_dates = {
+            mkt: self._get_market_query_date(mkt) for mkt in sorted(markets_set)
+        }
         self._persist_snapshot_state(snapshot_state)
 
         logger.info(
@@ -1027,7 +1041,14 @@ class IntradayMonitor:
         valid_quote_codes = results.get("valid_quote_codes", [])
         failed_codes = results.get("failed_codes", [])
 
-        snapshot_state.status = "completed"
+        expected = len(codes)
+        valid = len(valid_quote_codes)
+        if valid == 0:
+            snapshot_state.status = "failed"
+        elif valid < expected:
+            snapshot_state.status = "partial"
+        else:
+            snapshot_state.status = "completed"
         snapshot_state.finished_at = datetime.now()
         snapshot_state.completed_codes = completed_codes
         snapshot_state.valid_quote_codes = valid_quote_codes
@@ -1036,8 +1057,8 @@ class IntradayMonitor:
 
         coverage = len(valid_quote_codes) / max(len(codes), 1)
         logger.info(
-            "快照状态已持久化: snapshot_id=%s status=completed expected=%d valid=%d failed=%d coverage=%.1f%% source=%s",
-            snapshot_id, len(codes), len(valid_quote_codes), len(failed_codes), coverage * 100, source,
+            "快照状态已持久化: snapshot_id=%s status=%s expected=%d valid=%d failed=%d coverage=%.1f%% source=%s",
+            snapshot_id, snapshot_state.status, len(codes), len(valid_quote_codes), len(failed_codes), coverage * 100, source,
         )
 
         return results, snapshot_state
@@ -1259,7 +1280,7 @@ class IntradayMonitor:
             self._lock.release()
             self._release_process_lock("intraday_decision")
 
-    def _final_decision_locked(self) -> None:
+    def _final_decision_locked(self, preferred_snapshot_id: Optional[str] = None) -> None:
         """Final decision implementation (caller must hold self._lock)."""
         stock_codes = self._get_stock_codes()
         if stock_codes and not self._yesterday_analysis:
@@ -1275,8 +1296,16 @@ class IntradayMonitor:
             if not getattr(self._config, 'intraday_force_run', False):
                 return
 
-        # Get latest completed snapshot
-        snapshot = self._get_latest_completed_snapshot()
+        # Get snapshot: preferred first, then latest completed
+        snapshot = None
+        if preferred_snapshot_id:
+            snapshot = self._get_completed_snapshot_by_id(preferred_snapshot_id)
+            if snapshot:
+                logger.info("使用本次决策快照: snapshot_id=%s", preferred_snapshot_id)
+            else:
+                logger.warning("本次决策快照 %s 不存在或未completed，降级查询最新completed", preferred_snapshot_id)
+        if snapshot is None:
+            snapshot = self._get_latest_completed_snapshot()
         if snapshot is not None:
             expected_count = len(snapshot["expected_codes"])
             valid_count = len(snapshot["valid_quote_codes"])
@@ -1294,6 +1323,7 @@ class IntradayMonitor:
                 report_type=EmailReportType.SNAPSHOT_INCOMPLETE_ALERT,
                 snapshot_id=None,
                 baseline_status=baseline_status,
+                market_dates=None,
             )
             return
 
@@ -1302,6 +1332,7 @@ class IntradayMonitor:
         valid_count = len(snapshot["valid_quote_codes"])
         coverage_ratio = valid_count / max(expected_count, 1)
         failed_codes = snapshot["failed_codes"]
+        snapshot_market_dates = snapshot.get("market_dates") if snapshot else None
 
         # Coverage gate
         min_coverage = getattr(self._config, 'intraday_min_quote_coverage', 0.8)
@@ -1331,6 +1362,7 @@ class IntradayMonitor:
                 expected_count=expected_count,
                 failed_codes=failed_codes,
                 baseline_status=baseline_status,
+                market_dates=snapshot_market_dates,
             )
             return
 
@@ -1344,7 +1376,8 @@ class IntradayMonitor:
         # If no baseline, downgrade
         if baseline_status == "missing":
             logger.warning("baseline_status=missing: 无昨日基准分析，降级为无基准摘要")
-            raw = self._build_raw_summary(all_events)
+            no_baseline_markets = {self._get_market_for_stock(c) for c in stock_codes if self._get_market_for_stock(c)}
+            raw = self._build_raw_summary(all_events, markets=no_baseline_markets)
             self._send_decision_email(
                 content=raw,
                 report_type=EmailReportType.NO_BASELINE_ALERT,
@@ -1354,6 +1387,7 @@ class IntradayMonitor:
                 expected_count=expected_count,
                 failed_codes=failed_codes,
                 baseline_status=baseline_status,
+                market_dates=snapshot_market_dates,
             )
             return
 
@@ -1380,6 +1414,7 @@ class IntradayMonitor:
                 failed_codes=failed_codes,
                 llm_status="success",
                 baseline_status=baseline_status,
+                market_dates=snapshot_market_dates,
             )
         elif result.status == "config_error":
             logger.error("LLM config error, no email sent: %s", result.error_message)
@@ -1394,12 +1429,14 @@ class IntradayMonitor:
                     expected_count=expected_count,
                     llm_status="config_error",
                     baseline_status=baseline_status,
+                    market_dates=snapshot_market_dates,
                 )
         else:
             # network_error, rate_limited, empty_response
             if getattr(self._config, 'intraday_send_llm_failure_alert', True):
                 if getattr(self._config, 'intraday_send_raw_summary_on_llm_failure', False):
-                    raw = self._build_raw_summary(all_events)
+                    llm_fail_markets = {self._get_market_for_stock(c) for c in stock_codes if self._get_market_for_stock(c)}
+                    raw = self._build_raw_summary(all_events, markets=llm_fail_markets)
                 else:
                     raw = f"LLM调用失败: {result.status}\n{result.error_message}"
                 self._send_decision_email(
@@ -1411,6 +1448,7 @@ class IntradayMonitor:
                     expected_count=expected_count,
                     llm_status=result.status,
                     baseline_status=baseline_status,
+                    market_dates=snapshot_market_dates,
                 )
 
     def _call_llm_with_retries(self, prompt: str) -> LLMResult:
@@ -1463,8 +1501,9 @@ class IntradayMonitor:
                 return val.strip()
         return ""
 
-    def _build_raw_summary(self, events: List[IntradayEvent]) -> str:
+    def _build_raw_summary(self, events: List[IntradayEvent], markets: Optional[set] = None) -> str:
         """Build raw data summary when LLM fails."""
+        is_mixed = len(markets) > 1 if markets else False
         lines = [
             "# 盘中监控原始数据摘要",
             "",
@@ -1477,7 +1516,7 @@ class IntradayMonitor:
             vol = f"{e.volume_ratio:.1f}" if e.volume_ratio is not None else "-"
             chg = f"{e.change_pct:+.2f}%" if e.change_pct is not None else "-"
             lines.append(
-                f"| {format_intraday_event_time(e)} | {e.stock_name}({e.stock_code}) | "
+                f"| {format_intraday_event_time(e, include_market=is_mixed)} | {e.stock_name}({e.stock_code}) | "
                 f"{e.current_price:.2f} | {vol} | {chg} | {e.event_type} | {e.description} |"
             )
         return "\n".join(lines)
@@ -1494,6 +1533,7 @@ class IntradayMonitor:
         failed_codes: Optional[List[str]] = None,
         llm_status: Optional[str] = None,
         baseline_status: Optional[str] = None,
+        market_dates: Optional[Dict[str, str]] = None,
     ) -> None:
         """Send decision email via EmailSender with structured params."""
         if self._email_sender is None:
@@ -1512,14 +1552,13 @@ class IntradayMonitor:
         subject = prefix
 
         coverage_str = f" (覆盖率{coverage_ratio:.0%})" if coverage_ratio is not None else ""
-        if report_type == EmailReportType.OFFICIAL_DECISION:
-            # Old-style market/date subject
-            market_dates: Dict[str, str] = {}
+        # Use provided market_dates or fallback to primary market
+        if not market_dates:
             primary_market = self._resolve_primary_market()
             mkt_date = self._get_market_query_date(primary_market)
-            market_dates[primary_market] = mkt_date
-            market_str = " / ".join(sorted(f"{m.upper()}:{d}" for m, d in market_dates.items()))
-            subject = f"{prefix} - {market_str}{coverage_str}"
+            market_dates = {primary_market: mkt_date}
+        market_str = " / ".join(sorted(f"{m.upper()}:{d}" for m, d in market_dates.items()))
+        subject = f"{prefix} - {market_str}{coverage_str}"
 
         # Prepend coverage summary for official
         if report_type == EmailReportType.OFFICIAL_DECISION:
@@ -1618,7 +1657,7 @@ class IntradayMonitor:
                     rows = conn.execute(
                         sa_text(
                             "SELECT timestamp, stock_code, stock_name, current_price, market_local_timestamp, "
-                            "volume_ratio, change_pct, event_type, description "
+                            "volume_ratio, change_pct, event_type, description, market "
                             "FROM intraday_events "
                             "WHERE query_date = :qd AND market = :mkt ORDER BY timestamp"
                         ),
@@ -1628,7 +1667,7 @@ class IntradayMonitor:
                     rows = conn.execute(
                         sa_text(
                             "SELECT timestamp, stock_code, stock_name, current_price, market_local_timestamp, "
-                            "volume_ratio, change_pct, event_type, description "
+                            "volume_ratio, change_pct, event_type, description, market "
                             "FROM intraday_events WHERE query_date = :qd ORDER BY timestamp"
                         ),
                         {"qd": query_date},
@@ -1650,6 +1689,8 @@ class IntradayMonitor:
                     ))
                     if len(row) > 4 and row[4] is not None:
                         events[-1].market_local_timestamp = str(row[4])
+                    if len(row) > 9 and row[9] is not None:
+                        events[-1].market = str(row[9])
         except Exception as exc:
             logger.warning("加载盘中事件失败: %s", exc)
 
@@ -1663,31 +1704,33 @@ class IntradayMonitor:
                 from sqlalchemy import text as sa_text
                 rows = conn.execute(
                     sa_text(
-                        "SELECT timestamp, stock_code, stock_name, current_price, market_local_timestamp, "
-                        "volume_ratio, change_pct, event_type, description, snapshot_id, run_id, snapshot_status "
+                        "SELECT query_date, timestamp, stock_code, stock_name, current_price, market_local_timestamp, "
+                        "volume_ratio, change_pct, event_type, description, snapshot_id, run_id, snapshot_status, market "
                         "FROM intraday_events WHERE snapshot_id = :sid ORDER BY timestamp"
                     ),
                     {"sid": snapshot_id},
                 ).fetchall()
                 for row in rows:
-                    ts = row[0]
+                    ts = row[1]
                     if isinstance(ts, str):
                         ts = datetime.fromisoformat(ts)
                     events.append(IntradayEvent(
                         timestamp=ts,
-                        stock_code=str(row[1] or ""),
-                        stock_name=str(row[2] or ""),
-                        current_price=float(row[3] or 0),
-                        volume_ratio=float(row[5]) if row[5] is not None else None,
-                        change_pct=float(row[6]) if row[6] is not None else None,
-                        event_type=str(row[7] or "price_only"),
-                        description=str(row[8] or ""),
-                        snapshot_id=str(row[9]) if len(row) > 9 and row[9] is not None else None,
-                        run_id=str(row[10]) if len(row) > 10 and row[10] is not None else None,
-                        snapshot_status=str(row[11]) if len(row) > 11 and row[11] is not None else None,
+                        stock_code=str(row[2] or ""),
+                        stock_name=str(row[3] or ""),
+                        current_price=float(row[4] or 0),
+                        volume_ratio=float(row[6]) if row[6] is not None else None,
+                        change_pct=float(row[7]) if row[7] is not None else None,
+                        event_type=str(row[8] or "price_only"),
+                        description=str(row[9] or ""),
+                        snapshot_id=str(row[10]) if len(row) > 10 and row[10] is not None else None,
+                        run_id=str(row[11]) if len(row) > 11 and row[11] is not None else None,
+                        snapshot_status=str(row[12]) if len(row) > 12 and row[12] is not None else None,
                     ))
-                    if len(row) > 4 and row[4] is not None:
-                        events[-1].market_local_timestamp = str(row[4])
+                    if len(row) > 5 and row[5] is not None:
+                        events[-1].market_local_timestamp = str(row[5])
+                    if len(row) > 13 and row[13] is not None:
+                        events[-1].market = str(row[13])
         except Exception as exc:
             logger.warning("加载盘中事件失败(snapshot=%s): %s", snapshot_id, exc)
         return events
@@ -1702,7 +1745,8 @@ class IntradayMonitor:
                 rows = conn.execute(
                     sa_text(
                         "SELECT snapshot_id, run_id, status, started_at, finished_at, "
-                        "expected_codes, completed_codes, valid_quote_codes, failed_codes, query_date "
+                        "expected_codes, completed_codes, valid_quote_codes, failed_codes, query_date, "
+                        "markets, market_dates "
                         "FROM intraday_snapshots WHERE status = 'completed' ORDER BY started_at DESC LIMIT 1"
                     ),
                 ).fetchall()
@@ -1720,6 +1764,8 @@ class IntradayMonitor:
                         "valid_quote_codes": json.loads(row[7]) if row[7] else [],
                         "failed_codes": json.loads(row[8]) if row[8] else [],
                         "query_date": row[9],
+                        "markets": json.loads(row[10]) if len(row) > 10 and row[10] else [],
+                        "market_dates": json.loads(row[11]) if len(row) > 11 and row[11] else {},
                     }
                     expected_count = len(snapshot["expected_codes"])
                     valid_count = len(snapshot["valid_quote_codes"])
@@ -1744,6 +1790,42 @@ class IntradayMonitor:
                 logger.warning("获取最新completed快照失败 (OperationalError): %s", exc)
         except Exception as exc:
             logger.warning("获取最新completed快照失败: %s", exc)
+        return None
+
+    def _get_completed_snapshot_by_id(self, snapshot_id: str) -> Optional[dict]:
+        """Return completed snapshot by exact snapshot_id, or None."""
+        self._ensure_intraday_snapshots_table()
+        try:
+            with self._db.session_scope() as session:
+                conn = session.connection()
+                from sqlalchemy import text as sa_text
+                rows = conn.execute(
+                    sa_text(
+                        "SELECT snapshot_id, run_id, status, started_at, finished_at, "
+                        "expected_codes, completed_codes, valid_quote_codes, failed_codes, query_date, "
+                        "markets, market_dates "
+                        "FROM intraday_snapshots WHERE snapshot_id = :sid AND status = 'completed'"
+                    ),
+                    {"sid": snapshot_id},
+                ).fetchall()
+                if rows:
+                    import json
+                    row = rows[0]
+                    return {
+                        "snapshot_id": row[0], "run_id": row[1], "status": row[2],
+                        "started_at": row[3], "finished_at": row[4],
+                        "expected_codes": json.loads(row[5]) if row[5] else [],
+                        "completed_codes": json.loads(row[6]) if row[6] else [],
+                        "valid_quote_codes": json.loads(row[7]) if row[7] else [],
+                        "failed_codes": json.loads(row[8]) if row[8] else [],
+                        "query_date": row[9],
+                        "markets": json.loads(row[10]) if len(row) > 10 and row[10] else [],
+                        "market_dates": json.loads(row[11]) if len(row) > 11 and row[11] else {},
+                    }
+        except sqlite3.OperationalError as exc:
+            logger.warning("按ID查询快照失败: %s", exc)
+        except Exception as exc:
+            logger.warning("按ID查询快照失败: %s", exc)
         return None
 
     def _ensure_intraday_table(self) -> None:
@@ -1839,8 +1921,24 @@ class IntradayMonitor:
                     "completed_codes TEXT, "
                     "valid_quote_codes TEXT, "
                     "failed_codes TEXT, "
-                    "query_date TEXT NOT NULL)"
+                    "query_date TEXT NOT NULL, "
+                    "markets TEXT, "
+                    "market_dates TEXT)"
                 ))
+                session.commit()
+                # Schema migration: add markets/market_dates if missing
+                info = conn.execute(sa_text("PRAGMA table_info('intraday_snapshots')")).fetchall()
+                existing_cols = {row[1] for row in info}
+                if 'markets' not in existing_cols:
+                    conn.execute(sa_text(
+                        "ALTER TABLE intraday_snapshots ADD COLUMN markets TEXT"
+                    ))
+                    logger.info("Schema migration: added intraday_snapshots.markets")
+                if 'market_dates' not in existing_cols:
+                    conn.execute(sa_text(
+                        "ALTER TABLE intraday_snapshots ADD COLUMN market_dates TEXT"
+                    ))
+                    logger.info("Schema migration: added intraday_snapshots.market_dates")
                 session.commit()
             logger.info("intraday_snapshots 表已就绪")
         except Exception as exc:
@@ -1852,11 +1950,18 @@ class IntradayMonitor:
             with self._db.session_scope() as session:
                 conn = session.connection()
                 from sqlalchemy import text as sa_text
+                # Compute query_date: use first market's local date if available, else fallback
+                query_date = state.started_at.strftime("%Y-%m-%d")
+                if state.markets:
+                    first_mkt = state.markets[0]
+                    query_date = self._get_market_query_date(first_mkt)
                 conn.execute(
                     sa_text("INSERT OR REPLACE INTO intraday_snapshots "
                             "(snapshot_id, run_id, status, started_at, finished_at, "
-                            "expected_codes, completed_codes, valid_quote_codes, failed_codes, query_date) "
-                            "VALUES (:sid, :rid, :st, :sa, :fa, :ec, :cc, :vc, :fc, :qd)"),
+                            "expected_codes, completed_codes, valid_quote_codes, failed_codes, query_date, "
+                            "markets, market_dates) "
+                            "VALUES (:sid, :rid, :st, :sa, :fa, :ec, :cc, :vc, :fc, :qd, "
+                            ":mkts, :mdates)"),
                     {
                         "sid": state.snapshot_id,
                         "rid": state.run_id,
@@ -1867,7 +1972,9 @@ class IntradayMonitor:
                         "cc": json.dumps(state.completed_codes),
                         "vc": json.dumps(state.valid_quote_codes),
                         "fc": json.dumps(state.failed_codes),
-                        "qd": state.started_at.strftime("%Y-%m-%d"),
+                        "qd": query_date,
+                        "mkts": json.dumps(state.markets) if state.markets else None,
+                        "mdates": json.dumps(state.market_dates) if state.market_dates else None,
                     },
                 )
                 session.commit()
@@ -2030,6 +2137,10 @@ class IntradayMonitor:
             len(results.get("failed_codes", [])),
         )
 
+        now_str = now.strftime("%H:%M")
+        if not self._snapshot_times or self._snapshot_times[-1] != now_str:
+            self._snapshot_times.append(now_str)
+
     def run_one_shot_decision(self) -> None:
         """Standalone decision: snapshot at current price, then run LLM, send email.
         Non-trading day: no events written unless --force-run.
@@ -2071,4 +2182,8 @@ class IntradayMonitor:
             len(results.get("completed_codes", [])), len(results.get("valid_quote_codes", [])),
         )
 
-        self._final_decision_locked()
+        now_str = now.strftime("%H:%M")
+        if not self._snapshot_times or self._snapshot_times[-1] != now_str:
+            self._snapshot_times.append(now_str)
+
+        self._final_decision_locked(preferred_snapshot_id=snapshot_state.snapshot_id)
