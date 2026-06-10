@@ -321,8 +321,9 @@ class TestFinalDecision:
             with patch.object(monitor, '_get_stock_codes', return_value=["000001"]):
                 with patch.object(monitor, '_load_today_events', return_value=[]):
                     with patch.object(monitor, '_send_decision_email') as mock_send:
-                        with patch.object(monitor, '_get_latest_completed_snapshot', return_value={
+                        with patch.object(monitor, '_get_latest_usable_snapshot', return_value={
                             "snapshot_id": "snap_test",
+                            "status": "completed",
                             "expected_codes": ["000001"],
                             "valid_quote_codes": ["000001"],
                             "failed_codes": [],
@@ -1401,7 +1402,7 @@ class TestCoverageGate:
 
         with patch.object(monitor, '_is_stock_trading_today', return_value=True):
             with patch.object(monitor, '_get_stock_codes', return_value=["600519", "000001", "000002"]):
-                with patch.object(monitor, '_get_latest_completed_snapshot') as mock_snap:
+                with patch.object(monitor, '_get_latest_usable_snapshot') as mock_snap:
                     mock_snap.return_value = {
                         "snapshot_id": "snap_cov",
                         "expected_codes": ["600519", "000001", "000002"],
@@ -1443,7 +1444,7 @@ class TestCoverageGate:
 
         with patch.object(monitor, '_is_stock_trading_today', return_value=True):
             with patch.object(monitor, '_get_stock_codes', return_value=["600519", "000001", "000002", "000003", "000004"]):
-                with patch.object(monitor, '_get_latest_completed_snapshot') as mock_snap:
+                with patch.object(monitor, '_get_latest_usable_snapshot') as mock_snap:
                     mock_snap.return_value = {
                         "snapshot_id": "snap_partial",
                         "expected_codes": ["600519", "000001", "000002", "000003", "000004"],

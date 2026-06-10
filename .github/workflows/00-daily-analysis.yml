@@ -459,13 +459,51 @@ jobs:
 
           # 执行分析
           if [ "$MODE" = "market-only" ]; then
-            python main.py --market-review $FORCE_RUN_ARG
+            python main.py --market-review $FORCE_RUN_ARG --analysis-phase postmarket
           elif [ "$MODE" = "stocks-only" ]; then
-            python main.py --no-market-review $FORCE_RUN_ARG
+            python main.py --no-market-review $FORCE_RUN_ARG --analysis-phase postmarket
           else
-            python main.py $FORCE_RUN_ARG
+            python main.py $FORCE_RUN_ARG --analysis-phase postmarket
           fi
-      
+
+      - name: 保存数据库缓存（供盘中 workflow 复用）
+        uses: actions/cache/save@v4
+        if: always()
+        with:
+          path: data/
+          key: dsa-data-${{ runner.os }}-${{ github.run_id }}
+
+      - name: 上传业务数据库
+        uses: actions/upload-artifact@v6
+        if: always()
+        with:
+          name: stock-analysis-db-${{ github.run_number }}
+          path: data/stock_analysis.db
+          retention-days: 7
+
+      - name: 数据库状态摘要
+        if: always()
+        run: |
+          if [ -f data/stock_analysis.db ]; then
+            echo "=== analysis_history (recent by phase) ==="
+            sqlite3 data/stock_analysis.db \
+              "SELECT analysis_phase, effective_trading_date, count(*) as records,
+                      count(DISTINCT code) as stocks
+               FROM analysis_history
+               WHERE created_at > datetime('now', '-7 days')
+               GROUP BY analysis_phase, effective_trading_date
+               ORDER BY effective_trading_date DESC, analysis_phase
+               LIMIT 20;"
+            echo "=== analysis_history (latest 5) ==="
+            sqlite3 data/stock_analysis.db \
+              "SELECT code, name, analysis_phase, effective_trading_date,
+                      sentiment_score, created_at
+               FROM analysis_history
+               ORDER BY created_at DESC LIMIT 5;"
+          else
+            echo "（数据库不存在，跳过摘要）"
+          fi
+
       - name: 上传分析报告
         uses: actions/upload-artifact@v6
         if: always()

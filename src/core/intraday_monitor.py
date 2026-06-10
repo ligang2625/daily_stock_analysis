@@ -687,6 +687,13 @@ class IntradayMonitor:
             logger.info("加载昨日分析: %d 支股票 (primary=%d, fallback=%d, markets=%s)",
                          len(result), len(all_primary), len(all_fallback),
                          ", ".join(f"{m}={len(c)}" for m, c in by_market.items()))
+            full_sniper = sum(1 for v in result.values() if all(v.values()))
+            partial_sniper = sum(1 for v in result.values() if any(v.values()) and not all(v.values()))
+            no_sniper = sum(1 for v in result.values() if not any(v.values()))
+            logger.info(
+                "昨日分析详情: full_sniper=%d partial_sniper=%d no_sniper=%d total=%d",
+                full_sniper, partial_sniper, no_sniper, len(result),
+            )
         except Exception as exc:
             logger.exception("加载昨日分析失败: %s", exc)
 
@@ -1296,16 +1303,31 @@ class IntradayMonitor:
             if not getattr(self._config, 'intraday_force_run', False):
                 return
 
+        logger.info(
+            "决策摘要: stock_codes=%d tradable=%d baseline=%s",
+            len(stock_codes), len(tradable), baseline_status,
+        )
+
+        # 数据库状态摘要
+        if self._db and self._db.session_scope:
+            try:
+                with self._db.session_scope() as session:
+                    ah_count = session.execute("SELECT COUNT(*) FROM analysis_history").scalar()
+                    snap_count = session.execute("SELECT COUNT(*) FROM intraday_snapshots").scalar()
+                    logger.info("数据库状态: analysis_history=%d intraday_snapshots=%d", ah_count, snap_count)
+            except Exception:
+                pass
+
         # Get snapshot: preferred first, then latest completed
         snapshot = None
         if preferred_snapshot_id:
-            snapshot = self._get_completed_snapshot_by_id(preferred_snapshot_id)
+            snapshot = self._get_usable_snapshot_by_id(preferred_snapshot_id)
             if snapshot:
                 logger.info("使用本次决策快照: snapshot_id=%s", preferred_snapshot_id)
             else:
-                logger.warning("本次决策快照 %s 不存在或未completed，降级查询最新completed", preferred_snapshot_id)
+                logger.warning("本次决策快照 %s 不存在或未completed，降级查询最新可用快照", preferred_snapshot_id)
         if snapshot is None:
-            snapshot = self._get_latest_completed_snapshot()
+            snapshot = self._get_latest_usable_snapshot()
         if snapshot is not None:
             expected_count = len(snapshot["expected_codes"])
             valid_count = len(snapshot["valid_quote_codes"])
@@ -1316,10 +1338,10 @@ class IntradayMonitor:
                 (valid_count / max(expected_count, 1)) * 100,
             )
         if snapshot is None:
-            logger.warning("no_completed_snapshot: 当前没有已完成快照，跳过正式决策邮件")
+            logger.warning("no_usable_snapshot: 当前没有可用快照，跳过正式决策邮件")
             # Send incomplete alert
             self._send_decision_email(
-                content="当日尚无已完成盘中快照，无法生成正式决策报告。",
+                content="当日尚无可用盘中快照，无法生成正式决策报告。",
                 report_type=EmailReportType.SNAPSHOT_INCOMPLETE_ALERT,
                 snapshot_id=None,
                 baseline_status=baseline_status,
@@ -1365,6 +1387,15 @@ class IntradayMonitor:
                 market_dates=snapshot_market_dates,
             )
             return
+
+        # 决策状态摘要
+        report_type = "pending"
+        logger.info(
+            "决策状态摘要: baseline=%s snapshot_id=%s status=%s expected=%d valid=%d coverage=%.1f%% report_type=%s",
+            baseline_status, snapshot["snapshot_id"], snapshot["status"],
+            expected_count, valid_count, coverage_ratio * 100,
+            report_type,
+        )
 
         # Load events for this completed snapshot
         all_events = self._load_events_for_snapshot(snapshot_id)
@@ -1792,6 +1823,64 @@ class IntradayMonitor:
             logger.warning("获取最新completed快照失败: %s", exc)
         return None
 
+    def _get_latest_usable_snapshot(self, markets=None) -> Optional[dict]:
+        """Return the most recent usable (completed or partial) snapshot state dict or None."""
+        self._ensure_intraday_snapshots_table()
+        try:
+            with self._db.session_scope() as session:
+                conn = session.connection()
+                from sqlalchemy import text as sa_text
+                rows = conn.execute(
+                    sa_text(
+                        "SELECT snapshot_id, run_id, status, started_at, finished_at, "
+                        "expected_codes, completed_codes, valid_quote_codes, failed_codes, query_date, "
+                        "markets, market_dates "
+                        "FROM intraday_snapshots WHERE status IN ('completed', 'partial') "
+                        "ORDER BY CASE WHEN status = 'completed' THEN 0 ELSE 1 END, started_at DESC LIMIT 1"
+                    ),
+                ).fetchall()
+                if rows:
+                    import json
+                    row = rows[0]
+                    snapshot = {
+                        "snapshot_id": row[0],
+                        "run_id": row[1],
+                        "status": row[2],
+                        "started_at": row[3],
+                        "finished_at": row[4],
+                        "expected_codes": json.loads(row[5]) if row[5] else [],
+                        "completed_codes": json.loads(row[6]) if row[6] else [],
+                        "valid_quote_codes": json.loads(row[7]) if row[7] else [],
+                        "failed_codes": json.loads(row[8]) if row[8] else [],
+                        "query_date": row[9],
+                        "markets": json.loads(row[10]) if len(row) > 10 and row[10] else [],
+                        "market_dates": json.loads(row[11]) if len(row) > 11 and row[11] else {},
+                    }
+                    expected_count = len(snapshot["expected_codes"])
+                    valid_count = len(snapshot["valid_quote_codes"])
+                    coverage = valid_count / max(expected_count, 1)
+                    logger.info(
+                        "获取最新可用快照成功: snapshot_id=%s expected=%d valid=%d coverage=%.1f%%",
+                        snapshot["snapshot_id"], expected_count, valid_count, coverage * 100,
+                    )
+                    return snapshot
+                logger.info("无 可用快照记录（表存在但无 completed/partial 行）")
+        except sqlite3.OperationalError as exc:
+            error_text = str(exc).lower()
+            if "no such table" in error_text:
+                logger.warning("intraday_snapshots 表不存在（schema bug），自动建表后重查")
+                self._ensure_intraday_snapshots_table()
+                try:
+                    return self._get_latest_usable_snapshot(markets)
+                except RecursionError:
+                    logger.warning("_get_latest_usable_snapshot 重查递归溢出，放弃")
+                    return None
+            else:
+                logger.warning("获取最新可用快照失败 (OperationalError): %s", exc)
+        except Exception as exc:
+            logger.warning("获取最新可用快照失败: %s", exc)
+        return None
+
     def _get_completed_snapshot_by_id(self, snapshot_id: str) -> Optional[dict]:
         """Return completed snapshot by exact snapshot_id, or None."""
         self._ensure_intraday_snapshots_table()
@@ -1826,6 +1915,42 @@ class IntradayMonitor:
             logger.warning("按ID查询快照失败: %s", exc)
         except Exception as exc:
             logger.warning("按ID查询快照失败: %s", exc)
+        return None
+
+    def _get_usable_snapshot_by_id(self, snapshot_id: str) -> Optional[dict]:
+        """Return usable (completed or partial) snapshot by exact snapshot_id, or None."""
+        self._ensure_intraday_snapshots_table()
+        try:
+            with self._db.session_scope() as session:
+                conn = session.connection()
+                from sqlalchemy import text as sa_text
+                rows = conn.execute(
+                    sa_text(
+                        "SELECT snapshot_id, run_id, status, started_at, finished_at, "
+                        "expected_codes, completed_codes, valid_quote_codes, failed_codes, query_date, "
+                        "markets, market_dates "
+                        "FROM intraday_snapshots WHERE snapshot_id = :sid AND status IN ('completed', 'partial')"
+                    ),
+                    {"sid": snapshot_id},
+                ).fetchall()
+                if rows:
+                    import json
+                    row = rows[0]
+                    return {
+                        "snapshot_id": row[0], "run_id": row[1], "status": row[2],
+                        "started_at": row[3], "finished_at": row[4],
+                        "expected_codes": json.loads(row[5]) if row[5] else [],
+                        "completed_codes": json.loads(row[6]) if row[6] else [],
+                        "valid_quote_codes": json.loads(row[7]) if row[7] else [],
+                        "failed_codes": json.loads(row[8]) if row[8] else [],
+                        "query_date": row[9],
+                        "markets": json.loads(row[10]) if len(row) > 10 and row[10] else [],
+                        "market_dates": json.loads(row[11]) if len(row) > 11 and row[11] else {},
+                    }
+        except sqlite3.OperationalError as exc:
+            logger.warning("按ID查询可用快照失败: %s", exc)
+        except Exception as exc:
+            logger.warning("按ID查询可用快照失败: %s", exc)
         return None
 
     def _ensure_intraday_table(self) -> None:

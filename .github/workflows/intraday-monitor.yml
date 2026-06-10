@@ -44,13 +44,13 @@ jobs:
         run: |
           mkdir -p data logs reports
 
-      - name: 恢复盘中数据缓存
+      - name: 恢复业务数据库缓存
         uses: actions/cache@v4
         with:
           path: data/
-          key: intraday-data-${{ runner.os }}-${{ github.run_id }}
+          key: dsa-data-${{ runner.os }}-${{ github.run_id }}
           restore-keys: |
-            intraday-data-${{ runner.os }}-
+            dsa-data-${{ runner.os }}-
 
       - name: 数据库状态摘要
         run: |
@@ -76,6 +76,7 @@ jobs:
         env:
           # AI 配置
           LITELLM_CONFIG: ${{ vars.LITELLM_CONFIG || secrets.LITELLM_CONFIG }}
+          LITELLM_CONFIG_YAML: ${{ vars.LITELLM_CONFIG_YAML || secrets.LITELLM_CONFIG_YAML }}
           LITELLM_API_KEY: ${{ secrets.LITELLM_API_KEY }}
           LITELLM_MODEL: ${{ vars.LITELLM_MODEL || secrets.LITELLM_MODEL }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
@@ -110,6 +111,13 @@ jobs:
           STOCK_LIST: ${{ vars.STOCK_LIST || secrets.STOCK_LIST || '600519' }}
 
         run: |
+          if [ -n "$LITELLM_CONFIG_YAML" ] && [ -n "$LITELLM_CONFIG" ]; then
+            echo "使用 GitHub Actions Secrets/Variables 中的 LITELLM_CONFIG_YAML 配置"
+            mkdir -p "$(dirname "$LITELLM_CONFIG")"
+            echo "$LITELLM_CONFIG_YAML" > "$LITELLM_CONFIG"
+            echo "LITELLM 配置文件已写入: $LITELLM_CONFIG"
+          fi
+
           # 判断执行动作：手动触发用输入参数，定时触发用 UTC 时间
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             ACTION="${{ github.event.inputs.action }}"

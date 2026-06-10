@@ -351,6 +351,14 @@ def parse_arguments() -> argparse.Namespace:
     )
 
     parser.add_argument(
+        '--analysis-phase',
+        type=str,
+        default=None,
+        choices=['premarket', 'intraday', 'postmarket', 'auto'],
+        help='分析阶段: premarket/intraday/postmarket/auto（默认 auto，由交易日历推断）'
+    )
+
+    parser.add_argument(
         '--webui',
         action='store_true',
         help='启动 Web 管理界面'
@@ -1113,7 +1121,8 @@ def main() -> int:
 
         # 模式3: 正常单次运行
         if config.run_immediately:
-            run_full_analysis(config, args, stock_codes)
+            analysis_phase = args.analysis_phase or "auto"
+            run_full_analysis(config, args, stock_codes, analysis_phase=analysis_phase)
         else:
             logger.info("配置为不立即运行分析 (RUN_IMMEDIATELY=false)")
 
