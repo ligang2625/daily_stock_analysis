@@ -54,23 +54,53 @@ jobs:
 
       - name: 数据库状态摘要
         run: |
-          if [ -f data/stock_analysis.db ]; then
-            echo "=== intraday_snapshots ==="
-            sqlite3 data/stock_analysis.db \
-              "SELECT snapshot_id, status, started_at, json_array_length(expected_codes),
-                      json_array_length(valid_quote_codes), json_array_length(failed_codes), query_date
-               FROM intraday_snapshots
-               ORDER BY started_at DESC LIMIT 5;"
-            echo ""
-            echo "=== intraday_events ==="
-            sqlite3 data/stock_analysis.db \
-              "SELECT query_date, market, count(*) as events
-               FROM intraday_events
-               GROUP BY query_date, market
-               ORDER BY query_date DESC LIMIT 10;"
-          else
-            echo "（数据库不存在）"
-          fi
+          python - <<'PY'
+          import os
+          import sqlite3
+
+          db = "data/stock_analysis.db"
+          print("DB exists:", os.path.exists(db), db)
+          if not os.path.exists(db):
+              raise SystemExit(0)
+
+          conn = sqlite3.connect(db)
+          cur = conn.cursor()
+
+          for table in ["analysis_history", "intraday_snapshots", "intraday_events"]:
+              try:
+                  cur.execute(f"SELECT COUNT(*) FROM {table}")
+                  print(table, "count=", cur.fetchone()[0])
+              except Exception as exc:
+                  print(table, "not ready:", exc)
+
+          try:
+              cur.execute("""
+                  SELECT code, analysis_phase, effective_trading_date, created_at
+                  FROM analysis_history
+                  ORDER BY created_at DESC
+                  LIMIT 10
+              """)
+              print("recent analysis_history:")
+              for row in cur.fetchall():
+                  print(row)
+          except Exception as exc:
+              print("analysis_history recent rows not ready:", exc)
+
+          try:
+              cur.execute("""
+                  SELECT snapshot_id, status, started_at, finished_at, query_date
+                  FROM intraday_snapshots
+                  ORDER BY started_at DESC
+                  LIMIT 5
+              """)
+              print("recent intraday_snapshots:")
+              for row in cur.fetchall():
+                  print(row)
+          except Exception as exc:
+              print("intraday_snapshots recent rows not ready:", exc)
+
+          conn.close()
+          PY
 
       - name: 执行盘中任务
         env:

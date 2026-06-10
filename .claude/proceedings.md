@@ -42,3 +42,38 @@
 ## 遗留
 - Issue 6（常驻 scheduler 14:30 snapshot/decision 冲突）暂缓
 - `actions/cache` 长期迁移到 artifact/外部存储未完成（中期方案）
+
+---
+
+# Session 2026-06-10: Intraday/Postmarket Workflow Phase 4 — 手动触发链路补完
+
+## 改动概要
+
+本轮修复 P0×1 + P1×1，核心方向：盘中 DB 摘要非阻断化、preferred snapshot 不可用时禁止静默 fallback。
+
+## 循环前提确认
+
+验证了 Phase 3 以下改动已就位（未回退，未重复修改）：
+- `--analysis-phase postmarket` 已存在于 3 个 workflow 分支
+- `data/` cache save/restore 已使用 `dsa-data-*` 前缀（两 workflow 统一）
+- `data/stock_analysis.db` artifact 已上传
+- `--analysis-phase` CLI 参数已存在，plumbing 正确
+- `pipeline.py` 的 `_resolve_analysis_phase()` 正确保留非 auto 值
+- snapshot 状态已使用 failed/partial/completed 分级
+- `run_one_shot_decision()` 已调用 `_final_decision_locked(preferred_snapshot_id=...)`
+
+## 修改文件
+
+**`.github/workflows/intraday-monitor.yml`** (+48/-19):
+- `数据库状态摘要` 步骤从 sqlite3 CLI 改为 Python try/except
+- 每张表（analysis_history / intraday_snapshots / intraday_events）单独 try/except
+- 缺表时打印 `not ready` 不阻断 workflow
+
+**`src/core/intraday_monitor.py`** (+12/-5):
+- `_final_decision_locked()` 新增分支：preferred_snapshot_id 指定但不可用时，发送 `SNAPSHOT_INCOMPLETE_ALERT` 邮件并 return
+- 不传入 preferred_snapshot_id 时仍 fallback 到 `_get_latest_usable_snapshot()`
+
+## 验证
+- 104 passed, 1 预存失败（test_expired_cache_returns_none）
+- FinalDecision + CoverageGate 测试：7 passed, 0 failed
+- 编译检查：OK

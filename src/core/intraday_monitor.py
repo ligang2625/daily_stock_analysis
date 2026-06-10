@@ -1318,15 +1318,28 @@ class IntradayMonitor:
             except Exception:
                 pass
 
-        # Get snapshot: preferred first, then latest completed
+        # Get snapshot: preferred if provided, otherwise latest completed.
+        # When preferred_snapshot_id is specified but the snapshot is not usable,
+        # alert immediately instead of silently falling back to an older snapshot.
         snapshot = None
         if preferred_snapshot_id:
             snapshot = self._get_usable_snapshot_by_id(preferred_snapshot_id)
             if snapshot:
                 logger.info("使用本次决策快照: snapshot_id=%s", preferred_snapshot_id)
             else:
-                logger.warning("本次决策快照 %s 不存在或未completed，降级查询最新可用快照", preferred_snapshot_id)
-        if snapshot is None:
+                logger.warning(
+                    "本次决策快照不可用，不使用旧快照替代: snapshot_id=%s",
+                    preferred_snapshot_id,
+                )
+                self._send_decision_email(
+                    content=f"本次决策快照不可用，无法生成正式决策报告。snapshot_id={preferred_snapshot_id}",
+                    report_type=EmailReportType.SNAPSHOT_INCOMPLETE_ALERT,
+                    snapshot_id=preferred_snapshot_id,
+                    baseline_status=baseline_status,
+                    market_dates=None,
+                )
+                return
+        else:
             snapshot = self._get_latest_usable_snapshot()
         if snapshot is not None:
             expected_count = len(snapshot["expected_codes"])
