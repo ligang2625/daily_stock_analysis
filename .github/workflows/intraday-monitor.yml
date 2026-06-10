@@ -20,7 +20,7 @@ concurrency:
 jobs:
   monitor:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 30
 
     steps:
       - name: 随机延迟（避免固定时间访问）
@@ -72,6 +72,30 @@ jobs:
                   print(table, "count=", cur.fetchone()[0])
               except Exception as exc:
                   print(table, "not ready:", exc)
+
+          try:
+              cur.execute("""
+                  SELECT COUNT(*)
+                  FROM analysis_history
+                  WHERE analysis_phase = 'postmarket'
+              """)
+              print("postmarket analysis_history count=", cur.fetchone()[0])
+          except Exception as exc:
+              print("postmarket analysis_history count not ready:", exc)
+
+          try:
+              cur.execute("""
+                  SELECT code, analysis_phase, effective_trading_date, created_at
+                  FROM analysis_history
+                  WHERE analysis_phase = 'postmarket'
+                  ORDER BY created_at DESC
+                  LIMIT 10
+              """)
+              print("recent postmarket analysis_history:")
+              for row in cur.fetchall():
+                  print(row)
+          except Exception as exc:
+              print("postmarket analysis_history recent rows not ready:", exc)
 
           try:
               cur.execute("""

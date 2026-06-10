@@ -77,3 +77,32 @@
 - 104 passed, 1 预存失败（test_expired_cache_returns_none）
 - FinalDecision + CoverageGate 测试：7 passed, 0 failed
 - 编译检查：OK
+
+---
+
+# Session 2026-06-10: Refinement-Executor Review — 确认全部 review 项已完成
+
+## 改动概要
+
+本轮由 `/refinement-executor` 审查 review 文档 6 项 issue，确认 Phase 3/4 已覆盖全部 critical + major 项。2 项剩余 edit（timeout-minutes、postmarket DB 摘要）已在磁盘但未提交，本轮 commit。
+
+## 修改文件
+
+**`.github/workflows/intraday-monitor.yml`** (+25/-1):
+- `timeout-minutes: 15` → `30`
+- DB 摘要新增 postmarket count + 最近 10 条 postmarket 记录
+
+## Review 项状态
+
+| # | Priority | Item | Status |
+|---|----------|------|--------|
+| 1 | critical | 盘后→盘中 DB 共享（dsa-data-*\* cache + artifact） | ✅ Phase 3 |
+| 2 | critical | `--analysis-phase postmarket` + CLI plumbing | ✅ Phase 3 |
+| 3 | major | `timeout-minutes: 15` → `30` | ✅ 本轮 commit |
+| 4 | major | DB 摘要增加 postmarket 查询 | ✅ 本轮 commit |
+| 5 | major | Preferred snapshot 不可用时不 fallback | ✅ Phase 4 |
+| 6 | minor | UTC 分支清理 | ⏸️ 暂缓 |
+
+## 验证
+- 无新代码改动（变更已在磁盘，仅首次 commit）
+- `.bug-fix-pipeline/plan.md` + `.omc/` 保留为本地产物，不入库
