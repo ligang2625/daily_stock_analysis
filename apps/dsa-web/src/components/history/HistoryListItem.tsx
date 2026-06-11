@@ -2,11 +2,11 @@ import type React from 'react';
 import { Badge } from '../common';
 import type { HistoryItem } from '../../types/analysis';
 import { getSentimentColor } from '../../types/analysis';
+import { buildDecisionActionLabelMap, getDecisionActionLabel } from '../../utils/decisionAction';
 import { formatDateTime } from '../../utils/format';
 import { getMarketPhaseSummaryLabel } from '../../utils/marketPhase';
 import { truncateStockName } from '../../utils/stockName';
 import { useUiLanguage } from '../../contexts/UiLanguageContext';
-import type { UiTextKey } from '../../i18n/uiText';
 
 interface HistoryListItemProps {
   item: HistoryItem;
@@ -16,26 +16,6 @@ interface HistoryListItemProps {
   onToggleChecked: (recordId: number) => void;
   onClick: (recordId: number) => void;
 }
-
-const getOperationBadgeLabel = (advice: string | undefined, t: (key: UiTextKey) => string) => {
-  const normalized = advice?.trim();
-  if (!normalized) {
-    return t('history.sentiment');
-  }
-  if (normalized.includes('减仓')) {
-    return t('history.operationReduce');
-  }
-  if (normalized.includes('卖')) {
-    return t('history.operationSell');
-  }
-  if (normalized.includes('观望') || normalized.includes('等待')) {
-    return t('history.operationHold');
-  }
-  if (normalized.includes('买') || normalized.includes('布局')) {
-    return t('history.operationBuy');
-  }
-  return normalized.split(/[，。；、\s]/)[0] || t('history.operationAdvice');
-};
 
 export const HistoryListItem: React.FC<HistoryListItemProps> = ({
   item,
@@ -48,6 +28,14 @@ export const HistoryListItem: React.FC<HistoryListItemProps> = ({
   const { language, t } = useUiLanguage();
   const sentimentColor = item.sentimentScore !== undefined ? getSentimentColor(item.sentimentScore) : null;
   const stockName = item.stockName || item.stockCode;
+  const actionLabels = buildDecisionActionLabelMap(t);
+  const operationLabel = getDecisionActionLabel(
+    item.action,
+    item.actionLabel,
+    item.operationAdvice,
+    t('history.sentiment'),
+    actionLabels,
+  );
   const phaseLabel = getMarketPhaseSummaryLabel(item.marketPhaseSummary, language)
     ?.replace('市场阶段: ', '')
     .replace('市场阶段：', '')
@@ -101,7 +89,7 @@ export const HistoryListItem: React.FC<HistoryListItemProps> = ({
                       backgroundColor: `${sentimentColor}10`,
                     }}
                   >
-                    {getOperationBadgeLabel(item.operationAdvice, t)} {item.sentimentScore}
+                    {operationLabel} {item.sentimentScore}
                   </Badge>
                 )}
               </div>

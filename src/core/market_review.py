@@ -94,6 +94,7 @@ def run_market_review(
     override_region: Optional[str] = None,
     query_id: Optional[str] = None,
     return_structured: bool = False,
+    trigger_source: str = "cli",
 ) -> Optional[str] | Optional[MarketReviewRunResult]:
     """
     执行大盘复盘分析
@@ -107,11 +108,11 @@ def run_market_review(
         merge_notification: 是否合并推送（跳过本次推送，由 main 层合并个股+大盘后统一发送，Issue #190）
         override_region: 覆盖 config 的 market_review_region（Issue #373 交易日过滤后有效子集）
         query_id: 历史记录关联 ID；API 后台任务会传入 task_id，CLI/Bot 为空时自动生成
+        trigger_source: 触发来源，用于日志排障（cli/schedule/api/bot/service 等）
 
     Returns:
         复盘报告文本
     """
-    logger.info("开始执行大盘复盘分析...")
     runtime_config = config or get_config()
     review_text = _get_market_review_text(getattr(runtime_config, "report_language", "zh"))
     raw_region = (
@@ -121,6 +122,12 @@ def run_market_review(
     )
     run_markets = _resolve_market_review_regions(raw_region)
     persist_region = ','.join(run_markets) if len(run_markets) > 1 else run_markets[0]
+    logger.info(
+        "[MarketReview] component=market_review action=start trigger_source=%s query_id=%s region=%s",
+        trigger_source,
+        query_id or "-",
+        persist_region,
+    )
 
     try:
         if len(run_markets) > 1:
@@ -131,7 +138,14 @@ def run_market_review(
             for mkt, title_key, label in _MARKET_REVIEW_MARKETS:
                 if mkt not in run_markets:
                     continue
-                logger.info("生成 %s 大盘复盘报告...", label)
+                logger.info(
+                    "[MarketReview] component=market_review action=build_report "
+                    "trigger_source=%s query_id=%s region=%s label=%s",
+                    trigger_source,
+                    query_id or "-",
+                    mkt,
+                    label,
+                )
                 mkt_analyzer = MarketAnalyzer(
                     search_service=search_service,
                     analyzer=analyzer,
@@ -154,6 +168,18 @@ def run_market_review(
                 review_report = None
         else:
             run_region = run_markets[0]
+            label = next(
+                (market_label for mkt, _, market_label in _MARKET_REVIEW_MARKETS if mkt == run_region),
+                run_region,
+            )
+            logger.info(
+                "[MarketReview] component=market_review action=build_report "
+                "trigger_source=%s query_id=%s region=%s label=%s",
+                trigger_source,
+                query_id or "-",
+                run_region,
+                label,
+            )
             market_analyzer = MarketAnalyzer(
                 search_service=search_service,
                 analyzer=analyzer,
@@ -190,7 +216,14 @@ def run_market_review(
                 markdown_report,
                 report_filename
             )
-            logger.info(f"大盘复盘报告已保存: {filepath}")
+            logger.info(
+                "[MarketReview] component=market_review action=save_report "
+                "trigger_source=%s query_id=%s region=%s path=%s",
+                trigger_source,
+                query_id or "-",
+                persist_region,
+                filepath,
+            )
 
             _persist_market_review_history(
                 review_report=review_report,
@@ -204,7 +237,13 @@ def run_market_review(
             
             # 推送通知（合并模式下跳过，由 main 层统一发送）
             if merge_notification and send_notification:
-                logger.info("合并推送模式：跳过大盘复盘单独推送，将在个股+大盘复盘后统一发送")
+                logger.info(
+                    "[MarketReview] component=market_review action=skip_standalone_notification "
+                    "trigger_source=%s query_id=%s region=%s",
+                    trigger_source,
+                    query_id or "-",
+                    persist_region,
+                )
             elif send_notification and notifier.is_available():
                 # 添加标题
                 report_content = _render_market_review_payload_markdown(
@@ -214,11 +253,29 @@ def run_market_review(
 
                 success = notifier.send(report_content, email_send_to_all=True, route_type="report")
                 if success:
-                    logger.info("大盘复盘推送成功")
+                    logger.info(
+                        "[MarketReview] component=market_review action=send_notification "
+                        "status=success trigger_source=%s query_id=%s region=%s",
+                        trigger_source,
+                        query_id or "-",
+                        persist_region,
+                    )
                 else:
-                    logger.warning("大盘复盘推送失败")
+                    logger.warning(
+                        "[MarketReview] component=market_review action=send_notification "
+                        "status=failed trigger_source=%s query_id=%s region=%s",
+                        trigger_source,
+                        query_id or "-",
+                        persist_region,
+                    )
             elif not send_notification:
-                logger.info("已跳过推送通知 (--no-notify)")
+                logger.info(
+                    "[MarketReview] component=market_review action=skip_notification "
+                    "reason=no_notify trigger_source=%s query_id=%s region=%s",
+                    trigger_source,
+                    query_id or "-",
+                    persist_region,
+                )
             
             if return_structured:
                 return MarketReviewRunResult(
@@ -227,8 +284,14 @@ def run_market_review(
                 )
             return review_report
         
-    except Exception as e:
-        logger.error(f"大盘复盘分析失败: {e}")
+    except Exception:
+        logger.exception(
+            "[MarketReview] component=market_review action=failed "
+            "trigger_source=%s query_id=%s region=%s",
+            trigger_source,
+            query_id or "-",
+            persist_region,
+        )
     
     return None
 

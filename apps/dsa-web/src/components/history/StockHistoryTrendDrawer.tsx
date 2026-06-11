@@ -2,6 +2,12 @@ import type React from 'react';
 import { useEffect, useMemo, useState } from 'react';
 import type { AnalysisReport, HistoryItem, StockHistoryFilters, StockHistoryRange } from '../../types/analysis';
 import { getSentimentColor } from '../../types/analysis';
+import {
+  buildDecisionActionLabelMap,
+  getDecisionActionLabel,
+  getDecisionActionTone,
+  type DecisionActionLabelMap,
+} from '../../utils/decisionAction';
 import { formatDateTime } from '../../utils/format';
 import { Badge, Button, Card } from '../common';
 import { DashboardStateBlock } from '../dashboard';
@@ -65,32 +71,27 @@ const formatModelName = (value: string | undefined, t: (key: UiTextKey, params?:
   return parts[parts.length - 1] || model;
 };
 
-const formatAdviceParts = (item: Pick<HistoryItem, 'operationAdvice' | 'trendPrediction'>): string[] => {
-  const parts = [item.operationAdvice?.trim(), item.trendPrediction?.trim()]
+type AdviceSource = Pick<HistoryItem, 'operationAdvice' | 'trendPrediction' | 'action' | 'actionLabel'>;
+
+const formatAdviceParts = (item: AdviceSource, actionLabels: DecisionActionLabelMap): string[] => {
+  const actionLabel = getDecisionActionLabel(item.action, item.actionLabel, null, null, actionLabels);
+  const adviceText = actionLabel || item.operationAdvice?.trim();
+  const parts = [actionLabel?.trim(), item.trendPrediction?.trim()]
     .filter((part): part is string => Boolean(part));
+  if (!actionLabel && adviceText) {
+    return [adviceText, ...(item.trendPrediction?.trim() ? [item.trendPrediction.trim()] : [])];
+  }
   return parts.length ? parts : ['--'];
 };
 
-const formatAdvice = (item: Pick<HistoryItem, 'operationAdvice' | 'trendPrediction'>): string =>
-  formatAdviceParts(item)[0];
-
-const getAdviceVariant = (value: string): 'success' | 'warning' | 'danger' | 'default' => {
-  if (value.includes('买') || value.includes('多') || value.includes('持有')) {
-    return 'success';
-  }
-  if (value.includes('卖') || value.includes('减') || value.includes('空')) {
-    return 'danger';
-  }
-  if (value.includes('观望') || value.includes('震荡')) {
-    return 'warning';
-  }
-  return 'default';
-};
+const formatAdvice = (item: AdviceSource, actionLabels: DecisionActionLabelMap): string =>
+  formatAdviceParts(item, actionLabels)[0];
 
 const summarizeView = (
   items: HistoryItem[],
   report: AnalysisReport,
   t: (key: UiTextKey, params?: Record<string, string | number>) => string,
+  actionLabels: DecisionActionLabelMap,
   currentId?: number,
 ) => {
   const scores = items
@@ -112,11 +113,13 @@ const summarizeView = (
   return {
     currentScore: current?.sentimentScore ?? report.summary.sentimentScore,
     currentAdvice: current
-      ? formatAdvice(current)
+      ? formatAdvice(current, actionLabels)
       : formatAdvice({
           operationAdvice: report.summary.operationAdvice,
+          action: report.summary.action,
+          actionLabel: report.summary.actionLabel,
           trendPrediction: report.summary.trendPrediction,
-        }),
+        }, actionLabels),
     averageScore,
     latestTime: formatDateTime(items[0]?.createdAt || report.meta.createdAt),
     modelSummary: modelEntries
@@ -186,9 +189,10 @@ export const StockHistoryTrendDrawer: React.FC<StockHistoryTrendDrawerProps> = (
   const { t } = useUiLanguage();
   const currentRecordId = report.meta.id;
   const [selectedRecordId, setSelectedRecordId] = useState(currentRecordId);
+  const actionLabels = useMemo(() => buildDecisionActionLabelMap(t), [t]);
   const summary = useMemo(
-    () => summarizeView(items, report, t, currentRecordId),
-    [currentRecordId, items, report, t],
+    () => summarizeView(items, report, t, actionLabels, currentRecordId),
+    [actionLabels, currentRecordId, items, report, t],
   );
 
   useEffect(() => {
@@ -333,11 +337,11 @@ export const StockHistoryTrendDrawer: React.FC<StockHistoryTrendDrawerProps> = (
                         </td>
                         <td className="whitespace-nowrap px-3 py-3">
                           <Badge
-                            variant={getAdviceVariant(formatAdvice(item))}
+                            variant={getDecisionActionTone(item.action, item.actionLabel, item.operationAdvice)}
                             size="sm"
                             className="shadow-none"
                           >
-                            {formatAdvice(item)}
+                            {formatAdvice(item, actionLabels)}
                           </Badge>
                         </td>
                         <td

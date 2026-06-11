@@ -194,6 +194,7 @@ class AnalysisApiContractTestCase(unittest.TestCase):
         call_kwargs = run_market_review.call_args.kwargs
         self.assertEqual(call_kwargs["send_notification"], True)
         self.assertIsNone(call_kwargs["override_region"])
+        self.assertEqual(call_kwargs["trigger_source"], "api")
         runtime_config = call_kwargs.get("config")
         self.assertIsNotNone(runtime_config)
         self.assertEqual(getattr(runtime_config, "report_language", None), "en")
@@ -246,6 +247,7 @@ class AnalysisApiContractTestCase(unittest.TestCase):
         call_kwargs = run_market_review.call_args.kwargs
         runtime_config = call_kwargs.get("config")
         self.assertEqual(getattr(runtime_config, "report_language", None), "en")
+        self.assertEqual(call_kwargs["trigger_source"], "api")
 
     def test_trigger_market_review_rejects_duplicate_submission(self) -> None:
         if trigger_market_review is None or analysis_endpoint_module is None:
@@ -376,6 +378,7 @@ class AnalysisApiContractTestCase(unittest.TestCase):
             send_notification=False,
             override_region="cn,us",
             return_structured=True,
+            trigger_source="api",
         )
 
     def test_market_review_runtime_initializes_analyzer_for_litellm_provider(self) -> None:
@@ -430,6 +433,7 @@ class AnalysisApiContractTestCase(unittest.TestCase):
             send_notification=False,
             override_region="cn",
             return_structured=True,
+            trigger_source="api",
         )
 
     def test_run_market_review_uses_request_scoped_config_language(self) -> None:
@@ -515,7 +519,7 @@ class AnalysisApiContractTestCase(unittest.TestCase):
                 "stock_name": "贵州茅台",
                 "report": {
                     "meta": {"query_id": "task-queue-1", "stock_code": "600519"},
-                    "summary": {"analysis_summary": "summary"},
+                    "summary": {"analysis_summary": "summary", "operation_advice": "不建议买入"},
                 },
             },
             error=None,
@@ -539,6 +543,61 @@ class AnalysisApiContractTestCase(unittest.TestCase):
             status.result.report["summary"]["analysis_summary"],
             "summary",
         )
+        self.assertEqual(status.result.report["summary"]["operation_advice"], "不建议买入")
+        self.assertEqual(status.result.report["summary"]["action"], "avoid")
+        self.assertEqual(status.result.report["summary"]["action_label"], "回避")
+
+    def test_get_analysis_status_prefers_raw_result_action_over_summary_action(self) -> None:
+        if get_analysis_status is None or analysis_endpoint_module is None:
+            self.skipTest("analysis endpoint helpers unavailable in this environment")
+
+        created_at = datetime(2026, 5, 21, 17, 40, 0)
+        queue = MagicMock()
+        queue.get_task.return_value = SimpleNamespace(
+            task_id="task-queue-action-conflict",
+            stock_code="600519",
+            stock_name="贵州茅台",
+            status=analysis_endpoint_module.TaskStatusEnum.COMPLETED,
+            progress=100,
+            result={
+                "stock_code": "600519",
+                "stock_name": "贵州茅台",
+                "report": {
+                    "meta": {
+                        "query_id": "task-queue-action-conflict",
+                        "stock_code": "600519",
+                        "report_type": "detailed",
+                        "report_language": "zh",
+                    },
+                    "summary": {
+                        "analysis_summary": "summary",
+                        "operation_advice": "持有观察",
+                        "action": "buy",
+                    },
+                    "details": {
+                        "raw_result": {
+                            "operation_advice": "持有观察",
+                            "action": "watch",
+                            "report_language": "zh",
+                        },
+                    },
+                },
+            },
+            error=None,
+            original_query=None,
+            selection_source=None,
+            analysis_phase="auto",
+            created_at=created_at,
+            completed_at=datetime(2026, 5, 21, 17, 45, 0),
+        )
+
+        with patch("api.v1.endpoints.analysis.get_task_queue", return_value=queue):
+            status = get_analysis_status("task-queue-action-conflict")
+
+        self.assertEqual(status.status, "completed")
+        self.assertIsNotNone(status.result)
+        self.assertEqual(status.result.report["summary"]["action"], "watch")
+        self.assertEqual(status.result.report["summary"]["action_label"], "观望")
 
     def test_get_analysis_status_preserves_queue_report_created_at_when_enriching(self) -> None:
         if get_analysis_status is None or analysis_endpoint_module is None:
@@ -1140,6 +1199,67 @@ class AnalysisApiContractTestCase(unittest.TestCase):
 
         self.assertEqual(report.details.financial_report["report_date"], "2025-12-31")
         self.assertEqual(report.details.dividend_metrics["ttm_dividend_yield_pct"], 2.5)
+
+    def test_build_analysis_report_derives_decision_action_fields(self) -> None:
+        if _build_analysis_report is None:
+            self.skipTest("analysis endpoint helpers unavailable in this environment")
+
+        report = _build_analysis_report(
+            report_data={
+                "meta": {"report_type": "detailed", "report_language": "zh"},
+                "summary": {
+                    "analysis_summary": "等待确认",
+                    "operation_advice": "不建议买入",
+                    "trend_prediction": "震荡",
+                    "sentiment_score": 45,
+                },
+                "strategy": {},
+                "details": {"decision_type": "buy"},
+            },
+            query_id="q1",
+            stock_code="600519",
+            stock_name="贵州茅台",
+            context_snapshot=None,
+            fallback_fundamental_payload=None,
+        )
+
+        self.assertEqual(report.summary.operation_advice, "不建议买入")
+        self.assertEqual(report.summary.action, "avoid")
+        self.assertEqual(report.summary.action_label, "回避")
+
+    def test_build_analysis_report_reads_decision_action_from_raw_result(self) -> None:
+        if _build_analysis_report is None:
+            self.skipTest("analysis endpoint helpers unavailable in this environment")
+
+        report = _build_analysis_report(
+            report_data={
+                "meta": {"report_type": "detailed", "report_language": "zh"},
+                "summary": {
+                    "analysis_summary": "等待确认",
+                    "operation_advice": "持有观察",
+                    "action": "buy",
+                    "trend_prediction": "震荡",
+                    "sentiment_score": 45,
+                },
+                "strategy": {},
+                "details": {
+                    "action": "sell",
+                    "raw_result": {
+                        "operation_advice": "持有观察",
+                        "action": "watch",
+                        "report_language": "zh",
+                    },
+                },
+            },
+            query_id="q1",
+            stock_code="600519",
+            stock_name="贵州茅台",
+            context_snapshot=None,
+            fallback_fundamental_payload=None,
+        )
+
+        self.assertEqual(report.summary.action, "watch")
+        self.assertEqual(report.summary.action_label, "观望")
 
     def test_build_analysis_report_stringifies_strategy_price_fields(self) -> None:
         if _build_analysis_report is None:

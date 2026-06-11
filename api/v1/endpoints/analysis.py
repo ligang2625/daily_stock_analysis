@@ -53,6 +53,7 @@ from api.v1.schemas.history import (
     ReportStrategy,
     ReportDetails,
 )
+from api.v1.schemas.run_flow import RunFlowSnapshot
 from data_provider.base import canonical_stock_code, normalize_stock_code
 from src.config import Config
 from src.core.market_review_lock import (
@@ -70,6 +71,7 @@ from src.analysis_context_pack_overview import (
 )
 from src.market_phase_summary import extract_market_phase_summary, render_market_phase_summary
 from src.report_language import get_localized_stock_name, normalize_report_language
+from src.schemas.decision_action import build_action_fields
 from src.services.name_to_code_resolver import resolve_name_to_code
 from src.services.stock_code_utils import is_code_like
 from src.services.task_queue import (
@@ -78,6 +80,7 @@ from src.services.task_queue import (
     TaskStatus as TaskStatusEnum,
 )
 from src.services.run_diagnostics import build_run_diagnostic_summary
+from src.services.run_flow import build_task_run_flow_snapshot
 from src.utils.data_processing import (
     normalize_model_used,
     parse_json_field,
@@ -143,10 +146,16 @@ def _run_market_review_background(
             "send_notification": send_notification,
             "override_region": override_region,
             "return_structured": True,
-            "config": runtime_config,
+            "trigger_source": "api",
         }
         if query_id:
             review_kwargs["query_id"] = query_id
+        logger.info(
+            "[MarketReview] component=market_review action=background_start "
+            "trigger_source=api task_id=%s region=%s",
+            query_id or "-",
+            override_region or getattr(runtime_config, "market_review_region", "cn") or "cn",
+        )
         report = run_market_review(**review_kwargs)
         if not report:
             raise RuntimeError("大盘复盘未返回可持久化报告")
@@ -494,6 +503,13 @@ def trigger_market_review(
 
     try:
         task_id = uuid.uuid4().hex
+        logger.info(
+            "[MarketReview] component=market_review action=submit trigger_source=api "
+            "task_id=%s region=%s send_notification=%s",
+            task_id,
+            getattr(runtime_config, "market_review_region", "cn") or "cn",
+            request.send_notification,
+        )
         task = get_task_queue().submit_background_task(
             lambda: _run_market_review_background(
                 request.send_notification,
@@ -679,6 +695,70 @@ def _format_sse_event(event_type: str, data: Dict[str, Any]) -> str:
     return f"event: {event_type}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
 
 
+def _load_history_run_flow_by_query_id(
+    query_id: str,
+    *,
+    fail_open: bool = False,
+) -> Optional[RunFlowSnapshot]:
+    try:
+        from src.storage import DatabaseManager
+        from src.services.history_service import HistoryService
+
+        service = HistoryService(DatabaseManager.get_instance())
+        return service.resolve_and_get_run_flow(query_id)
+    except Exception as e:
+        if fail_open:
+            logger.debug(
+                "load history run-flow failed, falling back to task skeleton: query_id=%s err=%s",
+                query_id,
+                e,
+            )
+            return None
+        raise
+
+
+@router.get(
+    "/tasks/{task_id}/flow",
+    response_model=RunFlowSnapshot,
+    responses={
+        200: {"description": "任务运行流快照"},
+        404: {"description": "任务不存在", "model": ErrorResponse},
+        500: {"description": "服务器错误", "model": ErrorResponse},
+    },
+    summary="获取分析任务运行流",
+    description="根据 task_id 查询任务数据流/信息流快照；活跃任务缺少诊断时返回骨架流。",
+)
+def get_task_run_flow(task_id: str) -> RunFlowSnapshot:
+    """
+    查询分析任务运行流。
+
+    Active tasks are served from the in-memory task queue. Completed tasks try
+    to hydrate from persisted history diagnostics using the same task_id/query_id.
+    """
+    task_queue = get_task_queue()
+    task = task_queue.get_task(task_id)
+
+    if task:
+        if task.status == TaskStatusEnum.COMPLETED:
+            history_snapshot = _load_history_run_flow_by_query_id(
+                task_id,
+                fail_open=True,
+            )
+            if history_snapshot is not None:
+                return history_snapshot
+        return build_task_run_flow_snapshot(task)
+
+    try:
+        history_snapshot = _load_history_run_flow_by_query_id(task_id)
+        if history_snapshot is not None:
+            return history_snapshot
+    except Exception as e:
+        logger.error(f"查询任务运行流失败: {e}", exc_info=True)
+        raise api_error(500, "internal_error", f"查询任务运行流失败: {str(e)}")
+
+    raise api_error(404, "not_found", f"任务 {task_id} 不存在或已过期")
+
+
 def _datetime_to_iso(value: Any) -> Optional[str]:
     if isinstance(value, datetime):
         return value.isoformat()
@@ -708,6 +788,27 @@ def _prepare_report_for_task_enrichment(
     if created_at and not _datetime_to_iso(meta.get("created_at")):
         meta["created_at"] = created_at
     enriched_report["meta"] = meta
+    return enriched_report
+
+
+def _ensure_report_action_fields(report_data: Dict[str, Any]) -> Dict[str, Any]:
+    enriched_report = dict(report_data)
+    meta = dict(enriched_report.get("meta") or {})
+    summary = dict(enriched_report.get("summary") or {})
+    details = enriched_report.get("details") if isinstance(enriched_report.get("details"), dict) else {}
+    raw_result = details.get("raw_result") if isinstance(details.get("raw_result"), dict) else {}
+    report_language = normalize_report_language(
+        meta.get("report_language") or raw_result.get("report_language")
+    )
+    action_fields = build_action_fields(
+        operation_advice=raw_result.get("operation_advice") or summary.get("operation_advice"),
+        explicit_action=raw_result.get("action") or summary.get("action"),
+        report_type=meta.get("report_type"),
+        report_language=report_language,
+    )
+    summary["action"] = action_fields["action"]
+    summary["action_label"] = action_fields["action_label"]
+    enriched_report["summary"] = summary
     return enriched_report
 
 
@@ -741,6 +842,8 @@ def _build_task_analysis_result(task: Any) -> AnalysisResultResponse:
     report_data = payload.get("report")
     stock_code = payload.get("stock_code")
     query_id = payload.get("query_id")
+    report_enriched = False
+
     if isinstance(report_data, dict) and stock_code and query_id:
         context_snapshot, fundamental_snapshot = _load_sync_fundamental_sources(
             query_id=query_id,
@@ -760,12 +863,16 @@ def _build_task_analysis_result(task: Any) -> AnalysisResultResponse:
                     fallback_fundamental_payload=fundamental_snapshot,
                 )
                 payload["report"] = report.model_dump()
+                report_enriched = True
             except Exception as e:
                 logger.debug(
                     "enrich in-memory task report failed (fail-open): task_id=%s err=%s",
                     getattr(task, "task_id", None),
                     e,
                 )
+
+    if not report_enriched and isinstance(report_data, dict):
+        payload["report"] = _ensure_report_action_fields(report_data)
 
     return AnalysisResultResponse.model_validate(payload)
 
@@ -924,6 +1031,14 @@ def get_analysis_status(task_id: str) -> TaskStatus:
                     sector_rankings=extracted_boards.get("sector_rankings"),
                 )
 
+            raw_dict = raw_result if isinstance(raw_result, dict) else {}
+            action_fields = build_action_fields(
+                operation_advice=raw_dict.get("operation_advice") or record.operation_advice,
+                explicit_action=raw_dict.get("action"),
+                report_type=getattr(record, 'report_type', None),
+                report_language=report_language,
+            )
+
             # Build report from DB record so completed tasks return real data
             report_dict = AnalysisReport(
                 meta=ReportMeta(
@@ -942,6 +1057,8 @@ def get_analysis_status(task_id: str) -> TaskStatus:
                 summary=ReportSummary(
                     sentiment_score=record.sentiment_score,
                     operation_advice=record.operation_advice,
+                    action=action_fields["action"],
+                    action_label=action_fields["action_label"],
                     trend_prediction=record.trend_prediction,
                     analysis_summary=record.analysis_summary,
                 ),
@@ -1090,9 +1207,23 @@ def _build_analysis_report(
         market_phase_summary=market_phase_summary,
     )
 
+    raw_result_data = details_data.get("raw_result") if isinstance(details_data.get("raw_result"), dict) else {}
+    action_fields = build_action_fields(
+        operation_advice=(
+            raw_result_data.get("operation_advice")
+            or details_data.get("operation_advice")
+            or summary_data.get("operation_advice")
+        ),
+        explicit_action=raw_result_data.get("action") or details_data.get("action") or summary_data.get("action"),
+        report_type=meta.report_type,
+        report_language=report_language,
+    )
+
     summary = ReportSummary(
         analysis_summary=summary_data.get("analysis_summary"),
         operation_advice=summary_data.get("operation_advice"),
+        action=action_fields["action"],
+        action_label=action_fields["action_label"],
         trend_prediction=summary_data.get("trend_prediction"),
         sentiment_score=summary_data.get("sentiment_score"),
         sentiment_label=summary_data.get("sentiment_label")

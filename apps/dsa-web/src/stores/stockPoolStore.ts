@@ -216,6 +216,8 @@ function reportToHistoryItem(report: AnalysisReport): HistoryItem | null {
     analysisSummary: report.summary.analysisSummary,
     sentimentScore: report.summary.sentimentScore,
     operationAdvice: report.summary.operationAdvice,
+    action: report.summary.action,
+    actionLabel: report.summary.actionLabel,
     currentPrice: report.meta.currentPrice,
     changePct: report.meta.changePct,
     modelUsed: report.meta.modelUsed,

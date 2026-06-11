@@ -24,6 +24,7 @@ from src.report_language import (
     normalize_report_language,
 )
 from src.market_phase_summary import extract_market_phase_summary
+from src.schemas.decision_action import build_action_fields
 from src.services.run_diagnostics import (
     activate_run_diagnostic_context,
     build_run_diagnostic_summary,
@@ -174,6 +175,12 @@ class AnalysisService:
         report_language = normalize_report_language(getattr(result, "report_language", "zh"))
         sentiment_label = get_sentiment_label(result.sentiment_score, report_language)
         stock_name = get_localized_stock_name(getattr(result, "name", None), result.code, report_language)
+        action_fields = build_action_fields(
+            operation_advice=getattr(result, "operation_advice", None),
+            explicit_action=getattr(result, "action", None),
+            report_type=report_type,
+            report_language=report_language,
+        )
         diagnostic_context = get_current_diagnostic_context()
         trace_id = diagnostic_context.trace_id if diagnostic_context is not None else query_id
         diagnostic_snapshot = diagnostic_context.snapshot() if diagnostic_context is not None else None
@@ -212,6 +219,8 @@ class AnalysisService:
             "summary": {
                 "analysis_summary": result.analysis_summary,
                 "operation_advice": localize_operation_advice(result.operation_advice, report_language),
+                "action": action_fields["action"],
+                "action_label": action_fields["action_label"],
                 "trend_prediction": localize_trend_prediction(result.trend_prediction, report_language),
                 "sentiment_score": result.sentiment_score,
                 "sentiment_label": sentiment_label,

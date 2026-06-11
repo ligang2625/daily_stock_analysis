@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { UiLanguageProvider } from '../../contexts/UiLanguageContext';
 import { UI_LANGUAGE_STORAGE_KEY } from '../../utils/uiLanguage';
@@ -50,6 +50,26 @@ const basePerformance = {
   diagnostics: {},
 };
 
+const baseResultItem = {
+  analysisHistoryId: 101,
+  code: '600519',
+  stockName: '贵州茅台',
+  analysisDate: '2026-03-20',
+  evalWindowDays: 10,
+  engineVersion: 'test-engine',
+  evalStatus: 'completed',
+  operationAdvice: '继续持有',
+  action: 'watch',
+  actionLabel: '观望',
+  trendPrediction: '震荡偏多',
+  actualMovement: 'up',
+  actualReturnPct: 3.8,
+  directionExpected: 'long',
+  directionCorrect: true,
+  outcome: 'win',
+  simulatedReturnPct: 3.8,
+};
+
 beforeEach(() => {
   vi.clearAllMocks();
   window.localStorage.clear();
@@ -59,25 +79,7 @@ beforeEach(() => {
     total: 1,
     page: 1,
     limit: 20,
-    items: [
-      {
-        analysisHistoryId: 101,
-        code: '600519',
-        stockName: '贵州茅台',
-        analysisDate: '2026-03-20',
-        evalWindowDays: 10,
-        engineVersion: 'test-engine',
-        evalStatus: 'completed',
-        operationAdvice: '继续持有',
-        trendPrediction: '震荡偏多',
-        actualMovement: 'up',
-        actualReturnPct: 3.8,
-        directionExpected: 'long',
-        directionCorrect: true,
-        outcome: 'win',
-        simulatedReturnPct: 3.8,
-      },
-    ],
+    items: [baseResultItem],
   });
   mockRun.mockResolvedValue({
     processed: 1,
@@ -113,7 +115,12 @@ describe('BacktestPage', () => {
     expect(screen.getByText('已完成')).toBeInTheDocument();
     expect(screen.getByText('600519')).toBeInTheDocument();
     expect(screen.getByText('贵州茅台')).toBeInTheDocument();
-    expect(screen.getByText('震荡偏多')).toBeInTheDocument();
+    const resultRow = screen.getByText('600519').closest('tr');
+    expect(resultRow).not.toBeNull();
+    const rowScope = within(resultRow as HTMLElement);
+    expect(rowScope.getByText('观望')).toBeInTheDocument();
+    expect(rowScope.getByText('震荡偏多')).toBeInTheDocument();
+    expect(rowScope.getByText('继续持有')).toBeInTheDocument();
     expect(screen.getByText('上涨')).toBeInTheDocument();
     expect(screen.getByText('窗口收益')).toBeInTheDocument();
     expect(screen.getByText('方向匹配')).toBeInTheDocument();
@@ -121,6 +128,84 @@ describe('BacktestPage', () => {
     expect(screen.getAllByLabelText('是').length).toBeGreaterThan(0);
     expect(screen.getByText('方向准确率')).toBeInTheDocument();
     expect(screen.getByText('平均模拟收益')).toBeInTheDocument();
+  });
+
+  it('falls back to the taxonomy label when backtest actionLabel is missing', async () => {
+    mockGetResults.mockResolvedValueOnce({
+      total: 1,
+      page: 1,
+      limit: 20,
+      items: [
+        {
+          ...baseResultItem,
+          action: 'watch',
+          actionLabel: null,
+        },
+      ],
+    });
+
+    render(<BacktestPage />);
+
+    const codeCell = await screen.findByText('600519');
+    const resultRow = codeCell.closest('tr');
+    expect(resultRow).not.toBeNull();
+    const rowScope = within(resultRow as HTMLElement);
+    expect(rowScope.getByText('观望')).toBeInTheDocument();
+    expect(rowScope.getByText('继续持有')).toBeInTheDocument();
+  });
+
+  it('uses localized taxonomy labels before server labels in English UI mode', async () => {
+    mockGetResults.mockResolvedValueOnce({
+      total: 1,
+      page: 1,
+      limit: 20,
+      items: [
+        {
+          ...baseResultItem,
+          operationAdvice: 'continue holding',
+          action: 'watch',
+          actionLabel: '观望',
+          trendPrediction: 'range-bound',
+        },
+      ],
+    });
+
+    renderEnglishPage();
+
+    const codeCell = await screen.findByText('600519');
+    const resultRow = codeCell.closest('tr');
+    expect(resultRow).not.toBeNull();
+    const rowScope = within(resultRow as HTMLElement);
+    expect(rowScope.getByText('Watch')).toBeInTheDocument();
+    expect(rowScope.getByText('continue holding')).toBeInTheDocument();
+    expect(rowScope.queryByText('观望')).not.toBeInTheDocument();
+  });
+
+  it('keeps operation advice visible when backtest action fields are absent for multi-guard advice', async () => {
+    mockGetResults.mockResolvedValueOnce({
+      total: 1,
+      page: 1,
+      limit: 20,
+      items: [
+        {
+          ...baseResultItem,
+          operationAdvice: 'risk alert, avoid buying',
+          action: null,
+          actionLabel: null,
+        },
+      ],
+    });
+
+    render(<BacktestPage />);
+
+    const codeCell = await screen.findByText('600519');
+    const resultRow = codeCell.closest('tr');
+    expect(resultRow).not.toBeNull();
+    const rowScope = within(resultRow as HTMLElement);
+    expect(rowScope.getByText('震荡偏多')).toBeInTheDocument();
+    expect(rowScope.getByText('risk alert, avoid buying')).toBeInTheDocument();
+    expect(rowScope.queryByText('回避')).not.toBeInTheDocument();
+    expect(rowScope.queryByText('预警')).not.toBeInTheDocument();
   });
 
   it('renders backtest controls and result headings in English UI mode', async () => {

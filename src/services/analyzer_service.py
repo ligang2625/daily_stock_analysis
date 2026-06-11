@@ -131,4 +131,5 @@ def perform_market_review(
         analyzer=pipeline.analyzer,
         search_service=pipeline.search_service,
         config=config,
+        trigger_source="service",
     )
