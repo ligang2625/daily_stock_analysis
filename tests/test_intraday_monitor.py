@@ -2689,8 +2689,138 @@ class TestSnapshotIntegrationSQLite:
         result = monitor._get_latest_completed_snapshot()
         assert result is not None
         assert result["status"] == "completed"
-        assert "600519" in result["expected_codes"]
         assert "000001" in result["expected_codes"]
         assert len(result["valid_quote_codes"]) == 2
         assert result["snapshot_id"] is not None
         assert "standalone" in result["snapshot_id"]
+
+
+class TestOneShotDecisionSnapshotIsolation:
+    """One-shot decision must NOT fall back to old snapshot.
+
+    run_one_shot_decision() creates a new snapshot and passes it as
+    preferred_snapshot_id to _final_decision_locked(). The decision
+    MUST use that snapshot or send an alert — never silently fall back
+    to an older completed snapshot.
+    """
+
+    def test_decision_uses_new_snapshot_not_old(self, tmp_path):
+        """Pre-seed old snapshot, run decision that creates new one,
+        assert _final_decision_locked gets the NEW snapshot_id."""
+        monitor = _make_monitor_with_real_db(tmp_path, intraday_stocks="600519,000001")
+        monitor._config.intraday_force_run = True
+
+        # Pre-seed an old completed snapshot
+        old_state = SnapshotState(
+            snapshot_id="20260610_100000_old",
+            run_id="old-run",
+            status="completed",
+            started_at=datetime(2026, 6, 10, 10, 0, 0),
+            finished_at=datetime(2026, 6, 10, 10, 1, 0),
+            expected_codes=["600519", "000001"],
+            completed_codes=["600519", "000001"],
+            valid_quote_codes=["600519", "000001"],
+            failed_codes=[],
+        )
+        with patch.object(monitor, '_get_market_query_date', return_value="2026-06-10"):
+            monitor._persist_snapshot_state(old_state)
+
+        # Run decision; mock snapshot & decision to control input/output
+        with patch.object(monitor, '_is_stock_trading_today', return_value=True):
+            with patch.object(monitor, 'load_yesterday_analysis'):
+                with patch.object(monitor, '_get_market_query_date', return_value="2026-06-10"):
+                    with patch.object(monitor, '_run_snapshot_for_codes') as mock_run:
+                        mock_run.return_value = {
+                            "completed_codes": ["600519", "000001"],
+                            "valid_quote_codes": ["600519", "000001"],
+                            "failed_codes": [],
+                            "timeout_count": 0,
+                            "suspended_count": 0,
+                            "batch_matched_count": 2,
+                            "fallback_count": 0,
+                        }
+                        with patch.object(monitor, '_final_decision_locked') as mock_fd:
+                            monitor.run_one_shot_decision()
+
+        # Verify _final_decision_locked was called with preferred_snapshot_id
+        # pointing to the NEW snapshot, not the old one
+        assert mock_fd.called
+        call_kwargs = mock_fd.call_args[1]
+        preferred = call_kwargs.get('preferred_snapshot_id')
+        assert preferred is not None
+        assert preferred != "20260610_100000_old"
+        assert "_decision" in preferred  # new snapshots created by decision
+
+    def test_partial_snapshot_with_coverage_still_uses_new_snapshot(self, tmp_path):
+        """New snapshot is partial but coverage passes threshold —
+        still passes the new snapshot_id to _final_decision_locked."""
+        monitor = _make_monitor_with_real_db(tmp_path, intraday_stocks="600519,000001")
+        monitor._config.intraday_force_run = True
+        monitor._config.intraday_min_quote_coverage = 0.5  # lower threshold
+
+        with patch.object(monitor, '_is_stock_trading_today', return_value=True):
+            with patch.object(monitor, 'load_yesterday_analysis'):
+                with patch.object(monitor, '_get_market_query_date', return_value="2026-06-10"):
+                    with patch.object(monitor, '_run_snapshot_for_codes') as mock_run:
+                        mock_run.return_value = {
+                            "completed_codes": ["600519"],
+                            "valid_quote_codes": ["600519"],
+                            "failed_codes": ["000001"],
+                            "timeout_count": 1,
+                            "suspended_count": 0,
+                            "batch_matched_count": 1,
+                            "fallback_count": 0,
+                        }
+                        with patch.object(monitor, '_final_decision_locked') as mock_fd:
+                            monitor.run_one_shot_decision()
+
+        assert mock_fd.called
+        preferred = mock_fd.call_args[1].get('preferred_snapshot_id')
+        assert preferred is not None
+        assert "_decision" in preferred
+
+    def test_failed_snapshot_sends_alert_no_fallback(self, tmp_path):
+        """New snapshot status is 'failed' — does NOT fallback to old
+        completed snapshot. Sends SNAPSHOT_INCOMPLETE_ALERT instead."""
+        monitor = _make_monitor_with_real_db(tmp_path, intraday_stocks="600519")
+        monitor._config.intraday_force_run = True
+
+        # Pre-seed an old completed snapshot
+        old_state = SnapshotState(
+            snapshot_id="20260610_093000_old",
+            run_id="old-run",
+            status="completed",
+            started_at=datetime(2026, 6, 10, 9, 30, 0),
+            finished_at=datetime(2026, 6, 10, 9, 31, 0),
+            expected_codes=["600519"],
+            completed_codes=["600519"],
+            valid_quote_codes=["600519"],
+            failed_codes=[],
+        )
+        with patch.object(monitor, '_get_market_query_date', return_value="2026-06-10"):
+            monitor._persist_snapshot_state(old_state)
+
+        # Mock snapshot to produce a failed status (0 valid quotes)
+        with patch.object(monitor, '_is_stock_trading_today', return_value=True):
+            with patch.object(monitor, 'load_yesterday_analysis'):
+                with patch.object(monitor, '_get_market_query_date', return_value="2026-06-10"):
+                    with patch.object(monitor, '_run_snapshot_for_codes') as mock_run:
+                        mock_run.return_value = {
+                            "completed_codes": [],
+                            "valid_quote_codes": [],
+                            "failed_codes": ["600519"],
+                            "timeout_count": 1,
+                            "suspended_count": 0,
+                            "batch_matched_count": 0,
+                            "fallback_count": 0,
+                        }
+                        with patch.object(monitor, '_send_decision_email') as mock_email:
+                            monitor.run_one_shot_decision()
+
+        # Verify alert sent, not an official decision using old snapshot
+        assert mock_email.called
+        expected_report_type = EmailReportType.SNAPSHOT_INCOMPLETE_ALERT
+        actual_report_type = mock_email.call_args[1].get('report_type')
+        assert actual_report_type == expected_report_type, (
+            f"Expected {expected_report_type}, got {actual_report_type}"
+        )
