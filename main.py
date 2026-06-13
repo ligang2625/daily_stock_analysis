@@ -1022,11 +1022,19 @@ def main() -> int:
             if getattr(args, 'reset_intraday_events', False):
                 config.intraday_reset_on_start = True
 
+            # For snapshot-only mode, skip LLM init to save time.
+            # For decision mode, inject the unified analyzer.
+            llm_analyzer = None
+            if args.intraday_decision:
+                from src.analyzer import GeminiAnalyzer
+                llm_analyzer = GeminiAnalyzer(config=config)
+
             monitor = IntradayMonitor(
                 config=config,
                 fetcher_manager=fetcher_mgr,
                 db_manager=db_mgr,
                 email_sender=email_sender,
+                llm_analyzer=llm_analyzer,
             )
 
             if args.intraday_snapshot:
@@ -1079,11 +1087,15 @@ def main() -> int:
                 fetcher_mgr = DataFetcherManager()
                 email_sender = EmailSender(config)
 
+                from src.analyzer import GeminiAnalyzer
+                llm_analyzer = GeminiAnalyzer(config=config)
+
                 intraday_monitor = IntradayMonitor(
                     config=config,
                     fetcher_manager=fetcher_mgr,
                     db_manager=db_mgr,
                     email_sender=email_sender,
+                    llm_analyzer=llm_analyzer,
                 )
                 intraday_monitor._ensure_intraday_table()
 

@@ -64,6 +64,9 @@ class MainScheduleModeTestCase(unittest.TestCase):
             "host": "0.0.0.0",
             "port": 8000,
             "backtest": False,
+            "backtest_code": None,
+            "backtest_days": None,
+            "backtest_force": False,
             "market_review": False,
             "schedule": False,
             "no_run_immediately": False,
@@ -75,6 +78,10 @@ class MainScheduleModeTestCase(unittest.TestCase):
             "force_run": False,
             "single_notify": False,
             "no_context_snapshot": False,
+            "intraday_snapshot": False,
+            "intraday_decision": False,
+            "reset_intraday_events": False,
+            "analysis_phase": None,
         }
         defaults.update(overrides)
         return SimpleNamespace(**defaults)
@@ -478,7 +485,7 @@ class MainScheduleModeTestCase(unittest.TestCase):
             exit_code = main.main()
 
         self.assertEqual(exit_code, 0)
-        run_full_analysis.assert_called_once_with(config, args, ["600519", "000001"])
+        run_full_analysis.assert_called_once_with(config, args, ["600519", "000001"], analysis_phase="auto")
 
     def test_run_full_analysis_skips_market_review_when_shared_lock_is_held(self) -> None:
         from src.core.market_review_lock import (
@@ -704,6 +711,132 @@ class MainScheduleModeTestCase(unittest.TestCase):
         # Cleanup: reset state
         main._LazyPipelineDescriptor._resolved = None
         main._env_bootstrapped = False
+
+
+class IntradaySnapshotDecisionInjectionTestCase(unittest.TestCase):
+    """Verify analyzer injection for --intraday-snapshot / --intraday-decision."""
+
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.env_path = Path(self.temp_dir.name) / ".env"
+        self.env_path.write_text("STOCK_LIST=600519\n", encoding="utf-8")
+        self.original_cwd = os.getcwd()
+        os.chdir(self.temp_dir.name)
+        self.env_patch = patch.dict(os.environ, {"ENV_FILE": str(self.env_path)}, clear=False)
+        self.env_patch.start()
+        Config.reset_instance()
+
+    def tearDown(self) -> None:
+        os.chdir(self.original_cwd)
+        Config.reset_instance()
+        self.env_patch.stop()
+        self.temp_dir.cleanup()
+
+    def _make_intraday_args(self, snapshot=True):
+        return SimpleNamespace(
+            debug=False, stocks=None, webui=False, webui_only=False,
+            serve=False, serve_only=False, host="0.0.0.0", port=8000,
+            backtest=False, market_review=False, schedule=False,
+            no_run_immediately=False, no_notify=False, check_notify=False,
+            no_market_review=False, dry_run=False, workers=1,
+            force_run=False, single_notify=False, no_context_snapshot=False,
+            intraday_snapshot=snapshot,
+            intraday_decision=not snapshot,
+        )
+
+    def test_snapshot_mode_creates_monitor_without_analyzer(self):
+        args = self._make_intraday_args(snapshot=True)
+        config = _DummyConfig(log_dir=self.temp_dir.name, webui_enabled=False)
+        config.validate = lambda: []
+
+        monitor_mock = MagicMock()
+
+        with patch("main.parse_arguments", return_value=args), \
+             patch("main.get_config", return_value=config), \
+             patch("main.setup_logging"), \
+             patch("src.storage.DatabaseManager") as db_cls, \
+             patch("data_provider.base.DataFetcherManager") as fetcher_cls, \
+             patch("src.notification_sender.email_sender.EmailSender") as email_cls, \
+             patch("src.core.intraday_monitor.IntradayMonitor", return_value=monitor_mock) as monitor_cls:
+            exit_code = main.main()
+
+        self.assertEqual(exit_code, 0)
+        monitor_cls.assert_called_once()
+        call_kwargs = monitor_cls.call_args.kwargs
+        self.assertIsNone(call_kwargs["llm_analyzer"],
+                          "Snapshot mode should NOT inject an LLM analyzer")
+        monitor_mock.run_one_shot_snapshot.assert_called_once()
+
+    def test_decision_mode_creates_monitor_with_analyzer(self):
+        args = self._make_intraday_args(snapshot=False)
+        config = _DummyConfig(log_dir=self.temp_dir.name, webui_enabled=False)
+        config.validate = lambda: []
+
+        monitor_mock = MagicMock()
+        mock_analyzer = MagicMock()
+
+        with patch("main.parse_arguments", return_value=args), \
+             patch("main.get_config", return_value=config), \
+             patch("main.setup_logging"), \
+             patch("src.storage.DatabaseManager") as db_cls, \
+             patch("data_provider.base.DataFetcherManager") as fetcher_cls, \
+             patch("src.notification_sender.email_sender.EmailSender") as email_cls, \
+             patch("src.analyzer.GeminiAnalyzer", return_value=mock_analyzer) as analyzer_cls, \
+             patch("src.core.intraday_monitor.IntradayMonitor", return_value=monitor_mock) as monitor_cls:
+            exit_code = main.main()
+
+        self.assertEqual(exit_code, 0)
+        analyzer_cls.assert_called_once_with(config=config)
+        monitor_cls.assert_called_once()
+        call_kwargs = monitor_cls.call_args.kwargs
+        self.assertIs(call_kwargs["llm_analyzer"], mock_analyzer,
+                      "Decision mode should inject an LLM analyzer")
+        monitor_mock.run_one_shot_decision.assert_called_once()
+
+    def test_schedule_mode_creates_intraday_monitor_with_analyzer(self):
+        args = SimpleNamespace(
+            debug=False, stocks=None, webui=False, webui_only=False,
+            serve=False, serve_only=False, host="0.0.0.0", port=8000,
+            backtest=False, market_review=False, schedule=True,
+            no_run_immediately=True, no_notify=False, check_notify=False,
+            no_market_review=False, dry_run=False, workers=1,
+            force_run=False, single_notify=False, no_context_snapshot=False,
+            intraday_snapshot=False,
+            intraday_decision=False,
+            reset_intraday_events=False,
+        )
+        config = _DummyConfig(
+            log_dir=self.temp_dir.name,
+            webui_enabled=False,
+            schedule_enabled=False,
+            schedule_time="18:00",
+            schedule_run_immediately=False,
+            intraday_monitor_enabled=True,
+            agent_event_monitor_enabled=False,
+        )
+        config.validate = lambda: []
+
+        monitor_mock = MagicMock()
+        mock_analyzer = MagicMock()
+
+        with patch("main.parse_arguments", return_value=args), \
+             patch("main.get_config", return_value=config), \
+             patch("main._reload_runtime_config", return_value=config), \
+             patch("main._build_schedule_time_provider", return_value=lambda: "18:00"), \
+             patch("main.setup_logging"), \
+             patch("src.storage.DatabaseManager") as db_cls, \
+             patch("data_provider.base.DataFetcherManager") as fetcher_cls, \
+             patch("src.notification_sender.email_sender.EmailSender") as email_cls, \
+             patch("src.analyzer.GeminiAnalyzer", return_value=mock_analyzer) as analyzer_cls, \
+             patch("src.core.intraday_monitor.IntradayMonitor", return_value=monitor_mock) as monitor_cls:
+            exit_code = main.main()
+
+        self.assertEqual(exit_code, 0)
+        analyzer_cls.assert_called_once_with(config=config)
+        monitor_cls.assert_called_once()
+        call_kwargs = monitor_cls.call_args.kwargs
+        self.assertIs(call_kwargs["llm_analyzer"], mock_analyzer,
+                      "Schedule mode should inject an LLM analyzer for intraday monitor")
 
 
 if __name__ == "__main__":

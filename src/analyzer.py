@@ -2661,6 +2661,9 @@ class GeminiAnalyzer:
         prompt: str,
         max_tokens: int = 2048,
         temperature: float = 0.7,
+        system_prompt: Optional[str] = None,
+        call_type: str = "market_review",
+        raise_on_error: bool = False,
     ) -> Optional[str]:
         """Public entry point for free-form text generation.
 
@@ -2669,25 +2672,32 @@ class GeminiAnalyzer:
         _litellm_available, _router, _model, _use_openai, or _use_anthropic.
 
         Args:
-            prompt:      Text prompt to send to the LLM.
-            max_tokens:  Maximum tokens in the response (default 2048).
-            temperature: Sampling temperature (default 0.7).
+            prompt:        Text prompt to send to the LLM.
+            max_tokens:    Maximum tokens in the response (default 2048).
+            temperature:   Sampling temperature (default 0.7).
+            system_prompt: Optional system prompt override (default: TEXT_SYSTEM_PROMPT).
+            call_type:     Usage record tag (default "market_review", e.g. "intraday_decision").
+            raise_on_error: If True, re-raise exceptions instead of returning None.
 
         Returns:
-            Response text, or None if the LLM call fails (error is logged).
+            Response text, or None if the LLM call fails (error is logged
+            unless raise_on_error is True).
         """
         try:
             result = self._call_litellm(
                 prompt,
                 generation_config={"max_tokens": max_tokens, "temperature": temperature},
+                system_prompt=system_prompt,
             )
             if isinstance(result, tuple):
                 text, model_used, usage = result
-                persist_llm_usage(usage, model_used, call_type="market_review")
+                persist_llm_usage(usage, model_used, call_type=call_type)
                 return text
             return result
         except Exception as exc:
             logger.error("[generate_text] LLM call failed: %s", exc)
+            if raise_on_error:
+                raise
             return None
 
     def analyze(

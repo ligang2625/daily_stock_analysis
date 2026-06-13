@@ -1460,137 +1460,189 @@ class TestCoverageGate:
 
 
 # ============================================================
-# Issue 4: LLM model field fallback chain
+# Issue 4: LLM call via unified analyzer (_call_llm)
 # ============================================================
 
-class TestResolveLLMModel:
-    """Issue 4: _resolve_llm_model checks litellm_model first, then llm_model, etc."""
+class TestCallLLM:
+    """_call_llm delegates to GeminiAnalyzer.generate_text() and returns LLMResult."""
 
-    def test_litellm_model_first(self):
-        monitor = _make_monitor()
-        monitor._config.litellm_model = "gemini/test"
-        model = monitor._resolve_llm_model()
-        assert model == "gemini/test"
-
-    def test_llm_model_fallback(self):
-        monitor = _make_monitor()
-        monitor._config.litellm_model = ""
-        monitor._config.llm_model = "gpt-4"
-        model = monitor._resolve_llm_model()
-        assert model == "gpt-4"
-
-    def test_openai_model_fallback(self):
-        monitor = _make_monitor()
-        monitor._config.litellm_model = ""
-        monitor._config.llm_model = None
-        monitor._config.openai_model = "gpt-3.5-turbo"
-        model = monitor._resolve_llm_model()
-        assert model == "gpt-3.5-turbo"
-
-    def test_model_name_fallback(self):
-        monitor = _make_monitor()
-        monitor._config.litellm_model = ""
-        monitor._config.llm_model = None
-        monitor._config.openai_model = None
-        monitor._config.model_name = "claude-3"
-        model = monitor._resolve_llm_model()
-        assert model == "claude-3"
-
-    def test_ai_model_fallback(self):
-        monitor = _make_monitor()
-        monitor._config.litellm_model = ""
-        monitor._config.llm_model = None
-        monitor._config.openai_model = None
-        monitor._config.model_name = None
-        monitor._config.ai_model = "deepseek"
-        model = monitor._resolve_llm_model()
-        assert model == "deepseek"
-
-    def test_empty_all_fields(self):
-        monitor = _make_monitor()
-        monitor._config.litellm_model = ""
-        monitor._config.llm_model = None
-        monitor._config.openai_model = None
-        monitor._config.model_name = None
-        monitor._config.ai_model = None
-        model = monitor._resolve_llm_model()
-        assert model == ""
-
-    def test_whitespace_only_skipped(self):
-        monitor = _make_monitor()
-        monitor._config.litellm_model = "   "
-        monitor._config.llm_model = "valid-model"
-        model = monitor._resolve_llm_model()
-        assert model == "valid-model"
-
-
-# ============================================================
-# Issue 4: LLM config errors don't retry
-# ============================================================
-
-class TestLLMConfigErrorNoRetry:
-    """Issue 4: Config errors (auth, key) return immediately without retry."""
-
-    @pytest.fixture(autouse=True)
-    def _check_deps(self):
-        try:
-            import litellm  # noqa: F401
-        except ImportError:
-            pytest.skip("litellm not available")
-
-    def test_config_error_returns_immediately(self):
-        monitor = _make_monitor()
-        monitor._config.litellm_model = "test/model"
-        with patch('litellm.completion', side_effect=Exception("AuthenticationError: invalid key")):
-            result = monitor._call_llm_with_retries("test prompt")
-            assert result.status == "config_error"
-            assert "invalid key" in result.error_message
-
-    def test_auth_error_returns_immediately(self):
-        monitor = _make_monitor()
-        monitor._config.litellm_model = "test/model"
-        with patch('litellm.completion', side_effect=Exception("API key not found")):
-            result = monitor._call_llm_with_retries("test prompt")
-            assert result.status == "config_error"
-
-    def test_no_model_configured(self):
-        monitor = _make_monitor()
-        monitor._config.litellm_model = ""
-        monitor._config.llm_model = None
-        monitor._config.openai_model = None
-        monitor._config.model_name = None
-        monitor._config.ai_model = None
-        result = monitor._call_llm_with_retries("test")
-        assert result.status == "config_error"
-        assert "No LLM model configured" in result.error_message
+    @staticmethod
+    def _make_mock_analyzer(available=True, text="Buy recommendation"):
+        mock_analyzer = MagicMock()
+        type(mock_analyzer).is_available = MagicMock(return_value=available)
+        mock_analyzer.generate_text.return_value = text
+        return mock_analyzer
 
     def test_success_returns_llm_result(self):
+        analyzer = self._make_mock_analyzer()
         monitor = _make_monitor()
-        monitor._config.litellm_model = "test/model"
-        mock_response = MagicMock()
-        mock_choice = MagicMock()
-        mock_message = MagicMock()
-        mock_message.content = "Buy recommendation"
-        mock_choice.message = mock_message
-        mock_response.choices = [mock_choice]
-        with patch('litellm.completion', return_value=mock_response):
-            result = monitor._call_llm_with_retries("test prompt")
-            assert result.status == "success"
-            assert result.content == "Buy recommendation"
+        monitor._llm_analyzer = analyzer
+        result = monitor._call_llm("test prompt")
+        assert result.status == "success"
+        assert result.content == "Buy recommendation"
+        analyzer.generate_text.assert_called_once_with(
+            "test prompt",
+            call_type="intraday_decision",
+            raise_on_error=True,
+        )
 
-    def test_empty_response_after_retries(self):
+    def test_config_error_when_analyzer_not_available(self):
+        analyzer = self._make_mock_analyzer(available=False)
         monitor = _make_monitor()
-        monitor._config.litellm_model = "test/model"
-        mock_response = MagicMock()
-        mock_choice = MagicMock()
-        mock_message = MagicMock()
-        mock_message.content = ""
-        mock_choice.message = mock_message
-        mock_response.choices = [mock_choice]
-        with patch('litellm.completion', return_value=mock_response):
-            with patch('time.sleep'):  # skip sleep
-                result = monitor._call_llm_with_retries("test prompt")
-                assert result.status == "empty_response"
+        monitor._llm_analyzer = analyzer
+        result = monitor._call_llm("test")
+        assert result.status == "config_error"
+        assert "not available" in result.error_message
+
+    def test_empty_response(self):
+        analyzer = self._make_mock_analyzer(text="")
+        monitor = _make_monitor()
+        monitor._llm_analyzer = analyzer
+        result = monitor._call_llm("test")
+        assert result.status == "empty_response"
+
+    def test_whitespace_only_response(self):
+        analyzer = self._make_mock_analyzer(text="   ")
+        monitor = _make_monitor()
+        monitor._llm_analyzer = analyzer
+        result = monitor._call_llm("test")
+        assert result.status == "empty_response"
+
+    def test_config_error_on_auth_exception(self):
+        analyzer = self._make_mock_analyzer()
+        analyzer.generate_text.side_effect = Exception("AuthenticationError: invalid key")
+        monitor = _make_monitor()
+        monitor._llm_analyzer = analyzer
+        result = monitor._call_llm("test")
+        assert result.status == "config_error"
+        assert "invalid key" in result.error_message
+
+    def test_rate_limited_error(self):
+        analyzer = self._make_mock_analyzer()
+        analyzer.generate_text.side_effect = Exception("rate_limit exceeded: 429")
+        monitor = _make_monitor()
+        monitor._llm_analyzer = analyzer
+        result = monitor._call_llm("test")
+        assert result.status == "rate_limited"
+
+    def test_network_error_on_timeout(self):
+        analyzer = self._make_mock_analyzer()
+        analyzer.generate_text.side_effect = Exception("connection timeout")
+        monitor = _make_monitor()
+        monitor._llm_analyzer = analyzer
+        result = monitor._call_llm("test")
+        assert result.status == "network_error"
+
+    def test_network_error_on_generic_exception(self):
+        analyzer = self._make_mock_analyzer()
+        analyzer.generate_text.side_effect = Exception("something bad happened")
+        monitor = _make_monitor()
+        monitor._llm_analyzer = analyzer
+        result = monitor._call_llm("test")
+        assert result.status == "network_error"
+
+    def test_analyzer_init_failure(self):
+        monitor = _make_monitor()
+        monitor._llm_analyzer = None
+        with patch.object(monitor, '_get_llm_analyzer', side_effect=ImportError("no module")):
+            result = monitor._call_llm("test")
+        assert result.status == "config_error"
+        assert "no module" in result.error_message
+
+
+# ============================================================
+# Issue 4: LLM error classification (_classify_llm_error / _is_auth_error)
+# ============================================================
+
+class TestClassifyLLMError:
+    """_is_auth_error and _classify_llm_error classify exceptions correctly."""
+
+    @staticmethod
+    def _make_monitor_for_classify():
+        monitor = _make_monitor()
+        return monitor
+
+    def test_auth_pattern_authentication_error(self):
+        monitor = self._make_monitor_for_classify()
+        assert monitor._is_auth_error("AuthenticationError: bad key")
+
+    def test_auth_pattern_api_key(self):
+        monitor = self._make_monitor_for_classify()
+        assert monitor._is_auth_error("invalid api key provided")
+
+    def test_auth_pattern_unauthorized(self):
+        monitor = self._make_monitor_for_classify()
+        assert monitor._is_auth_error("401 Unauthorized")
+
+    def test_auth_pattern_permission_denied(self):
+        monitor = self._make_monitor_for_classify()
+        assert monitor._is_auth_error("Permission denied for model")
+
+    def test_auth_pattern_invalid_apikey(self):
+        monitor = self._make_monitor_for_classify()
+        assert monitor._is_auth_error("invalid apikey")
+
+    def test_auth_pattern_credential(self):
+        monitor = self._make_monitor_for_classify()
+        assert monitor._is_auth_error("credential error")
+
+    def test_auth_pattern_no_router(self):
+        monitor = self._make_monitor_for_classify()
+        assert monitor._is_auth_error("No litellm router configured")
+
+    def test_non_auth_error(self):
+        monitor = self._make_monitor_for_classify()
+        assert not monitor._is_auth_error("timeout")
+
+    def test_non_auth_rate_limit(self):
+        monitor = self._make_monitor_for_classify()
+        assert not monitor._is_auth_error("rate_limit")
+
+    def test_classify_returns_config_error_for_auth(self):
+        monitor = self._make_monitor_for_classify()
+        result = monitor._classify_llm_error(Exception("AuthenticationError: bad key"))
+        assert result.status == "config_error"
+
+    def test_classify_returns_rate_limited_for_429(self):
+        monitor = self._make_monitor_for_classify()
+        result = monitor._classify_llm_error(Exception("429 Too Many Requests"))
+        assert result.status == "rate_limited"
+
+    def test_classify_returns_network_error_for_timeout(self):
+        monitor = self._make_monitor_for_classify()
+        result = monitor._classify_llm_error(Exception("connection timeout"))
+        assert result.status == "network_error"
+
+
+# ============================================================
+# Issue 4: Lazy analyzer initialization (_get_llm_analyzer)
+# ============================================================
+
+class TestGetLLMAnalyzer:
+    """_get_llm_analyzer returns injected instance or creates lazily."""
+
+    def test_returns_injected_analyzer(self):
+        mock_analyzer = MagicMock()
+        monitor = _make_monitor()
+        monitor._llm_analyzer = mock_analyzer
+        assert monitor._get_llm_analyzer() is mock_analyzer
+
+    def test_creates_lazily_when_none(self):
+        monitor = _make_monitor()
+        monitor._llm_analyzer = None
+        with patch('src.analyzer.GeminiAnalyzer') as mock_cls:
+            analyzer = monitor._get_llm_analyzer()
+            mock_cls.assert_called_once_with(config=monitor._config)
+            assert analyzer is mock_cls.return_value
+
+    def test_caches_lazy_instance(self):
+        monitor = _make_monitor()
+        monitor._llm_analyzer = None
+        with patch('src.analyzer.GeminiAnalyzer') as mock_cls:
+            first = monitor._get_llm_analyzer()
+            second = monitor._get_llm_analyzer()
+            mock_cls.assert_called_once()
+            assert first is second
 
 
 # ============================================================

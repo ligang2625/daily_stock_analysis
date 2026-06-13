@@ -349,11 +349,13 @@ class IntradayMonitor:
         fetcher_manager: Any,
         db_manager: Any,
         email_sender: Any = None,
+        llm_analyzer: Any = None,
     ):
         self._config = config
         self._fetcher = fetcher_manager
         self._db = db_manager
         self._email_sender = email_sender
+        self._llm_analyzer = llm_analyzer  # Injected GeminiAnalyzer; lazy-init fallback if None
         self._yesterday_analysis: Dict[str, Dict[str, Optional[float]]] = {}
         self._initialized: bool = False
         self._lock = threading.Lock()
@@ -362,6 +364,14 @@ class IntradayMonitor:
         self._expired_requests: set = set()
         self._current_run_id = uuid.uuid4().hex[:12]
         self._current_snapshot_id: Optional[str] = None
+
+    def _get_llm_analyzer(self):
+        """Return the injected analyzer, or create one lazily from config (fallback)."""
+        if self._llm_analyzer is not None:
+            return self._llm_analyzer
+        from src.analyzer import GeminiAnalyzer
+        self._llm_analyzer = GeminiAnalyzer(config=self._config)
+        return self._llm_analyzer
 
     # ------------------------------------------------------------------
     # Market resolution (per-stock)
@@ -1444,8 +1454,8 @@ class IntradayMonitor:
             markets={self._get_market_for_stock(c) for c in stock_codes if self._get_market_for_stock(c)},
         )
 
-        # Call LLM
-        result = self._call_llm_with_retries(prompt)
+        # Call LLM via unified analyzer
+        result = self._call_llm(prompt)
 
         if result.status == "success":
             self._send_decision_email(
@@ -1495,55 +1505,68 @@ class IntradayMonitor:
                     market_dates=snapshot_market_dates,
                 )
 
-    def _call_llm_with_retries(self, prompt: str) -> LLMResult:
-        """Call litellm.completion() with 3 retries, 5s interval. Returns LLMResult."""
-        import litellm
+    def _call_llm(self, prompt: str) -> LLMResult:
+        """Call LLM via the unified GeminiAnalyzer.generate_text() pipeline.
 
-        # Resolve model
-        model = self._resolve_llm_model()
-        if not model:
-            return LLMResult(status="config_error", error_message="No LLM model configured (all known fields empty)")
+        Uses the injected or lazily-initialized analyzer so that model
+        resolution, Router, API keys, fallback, and retry logic are all
+        handled by the same code path as the post-market analysis.
+        """
+        try:
+            analyzer = self._get_llm_analyzer()
+        except Exception as exc:
+            logger.error("LLM analyzer init failed: %s", exc)
+            return LLMResult(status="config_error", error_message=str(exc))
 
-        for attempt in range(3):
-            try:
-                response = litellm.completion(
-                    model=model,
-                    messages=[{"role": "user", "content": prompt}],
-                    max_tokens=getattr(self._config, "llm_max_tokens", 2000),
-                    temperature=getattr(self._config, "llm_temperature", 0.3),
-                )
-                text = response.choices[0].message.content
-                if not text or not text.strip():
-                    logger.warning("LLM 返回空响应 (attempt %d/3)", attempt + 1)
-                    if attempt < 2:
-                        time.sleep(5)
-                        continue
-                    return LLMResult(status="empty_response", error_message="Empty response after 3 retries")
-                logger.info("LLM 决策成功 (attempt %d/3)", attempt + 1)
-                return LLMResult(status="success", content=str(text))
-            except Exception as exc:
-                error_str = str(exc)
-                if "AuthenticationError" in error_str or "auth" in error_str.lower() or "api key" in error_str.lower():
-                    logger.error("LLM 配置错误（不重试）: %s", exc)
-                    return LLMResult(status="config_error", error_message=str(exc))
-                if "rate_limit" in error_str.lower() or "429" in error_str:
-                    logger.warning("LLM 限流 (attempt %d/3): %s", attempt + 1, exc)
-                elif "timeout" in error_str.lower() or "connection" in error_str.lower():
-                    logger.warning("LLM 网络错误 (attempt %d/3): %s", attempt + 1, exc)
-                else:
-                    logger.warning("LLM 调用失败 (attempt %d/3): %s", attempt + 1, exc)
-                if attempt < 2:
-                    time.sleep(5)
+        if not analyzer.is_available():
+            return LLMResult(
+                status="config_error",
+                error_message="LLM analyzer not available (no Router and no legacy litellm fallback)",
+            )
 
-        return LLMResult(status="network_error", error_message="All 3 retries failed")
+        try:
+            text = analyzer.generate_text(
+                prompt,
+                call_type="intraday_decision",
+                raise_on_error=True,
+            )
+        except Exception as exc:
+            return self._classify_llm_error(exc)
 
-    def _resolve_llm_model(self) -> str:
-        """Resolve LLM model name from config, supporting multiple field names."""
-        for attr in ('litellm_model', 'llm_model', 'openai_model', 'model_name', 'ai_model'):
-            val = getattr(self._config, attr, None)
-            if val and isinstance(val, str) and val.strip():
-                return val.strip()
-        return ""
+        if not text or not text.strip():
+            return LLMResult(status="empty_response", error_message="Empty response from LLM")
+
+        return LLMResult(status="success", content=str(text))
+
+    def _classify_llm_error(self, exc: Exception) -> LLMResult:
+        """Classify an LLM exception into an LLMResult with appropriate status."""
+        error_str = str(exc)
+        if self._is_auth_error(error_str):
+            logger.error("LLM config/auth error: %s", exc)
+            return LLMResult(status="config_error", error_message=error_str)
+        if "rate_limit" in error_str.lower() or "429" in error_str:
+            logger.warning("LLM rate limited: %s", exc)
+            return LLMResult(status="rate_limited", error_message=error_str)
+        if "timeout" in error_str.lower() or "connection" in error_str.lower():
+            logger.warning("LLM network error: %s", exc)
+            return LLMResult(status="network_error", error_message=error_str)
+        logger.error("LLM call failed: %s", exc)
+        return LLMResult(status="network_error", error_message=error_str)
+
+    @staticmethod
+    def _is_auth_error(error_str: str) -> bool:
+        """Check if an error string indicates an authentication or configuration error."""
+        lowered = error_str.lower()
+        for keyword in ("authenticationerror", "auth", "api key", "not found error",
+                         "invalid x-goog", "permission denied", "unauthorized",
+                         "access denied", "forbidden", "invalid api key", "apikey",
+                         "credential", "no litellm router"):
+            if keyword in lowered:
+                return True
+        for keyword in ("missing", "not configured", "no api key", "no models configured"):
+            if keyword in lowered:
+                return True
+        return False
 
     def _build_raw_summary(self, events: List[IntradayEvent], markets: Optional[set] = None) -> str:
         """Build raw data summary when LLM fails."""
