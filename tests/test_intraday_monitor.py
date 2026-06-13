@@ -10,6 +10,7 @@ from unittest.mock import MagicMock, patch, PropertyMock
 
 from src.core.intraday_monitor import (
     EmailReportType,
+    INTRADAY_SYSTEM_PROMPT,
     IntradayEvent,
     IntradayMonitor,
     LLMConfigError,
@@ -1477,11 +1478,17 @@ class TestCallLLM:
         analyzer = self._make_mock_analyzer()
         monitor = _make_monitor()
         monitor._llm_analyzer = analyzer
+        # Ensure config has the intraday_llm_max_tokens field
+        monitor._config.intraday_llm_max_tokens = 4096
+        monitor._config.llm_temperature = 0.7
         result = monitor._call_llm("test prompt")
         assert result.status == "success"
         assert result.content == "Buy recommendation"
         analyzer.generate_text.assert_called_once_with(
             "test prompt",
+            max_tokens=4096,
+            temperature=0.7,
+            system_prompt=INTRADAY_SYSTEM_PROMPT,
             call_type="intraday_decision",
             raise_on_error=True,
         )
@@ -1551,61 +1558,103 @@ class TestCallLLM:
 
 
 # ============================================================
-# Issue 4: LLM error classification (_classify_llm_error / _is_auth_error)
+# Issue 4: LLM error classification (_classify_llm_error / _is_config_error)
 # ============================================================
 
 class TestClassifyLLMError:
-    """_is_auth_error and _classify_llm_error classify exceptions correctly."""
+    """_is_config_error and _classify_llm_error classify exceptions correctly."""
 
     @staticmethod
     def _make_monitor_for_classify():
         monitor = _make_monitor()
         return monitor
 
-    def test_auth_pattern_authentication_error(self):
-        monitor = self._make_monitor_for_classify()
-        assert monitor._is_auth_error("AuthenticationError: bad key")
+    # -- config/auth error patterns (positive) --
 
-    def test_auth_pattern_api_key(self):
+    def test_config_pattern_authentication_error(self):
         monitor = self._make_monitor_for_classify()
-        assert monitor._is_auth_error("invalid api key provided")
+        assert monitor._is_config_error("AuthenticationError: bad key")
 
-    def test_auth_pattern_unauthorized(self):
+    def test_config_pattern_api_key(self):
         monitor = self._make_monitor_for_classify()
-        assert monitor._is_auth_error("401 Unauthorized")
+        assert monitor._is_config_error("invalid api key provided")
 
-    def test_auth_pattern_permission_denied(self):
+    def test_config_pattern_unauthorized(self):
         monitor = self._make_monitor_for_classify()
-        assert monitor._is_auth_error("Permission denied for model")
+        assert monitor._is_config_error("401 Unauthorized")
 
-    def test_auth_pattern_invalid_apikey(self):
+    def test_config_pattern_permission_denied(self):
         monitor = self._make_monitor_for_classify()
-        assert monitor._is_auth_error("invalid apikey")
+        assert monitor._is_config_error("Permission denied for model")
 
-    def test_auth_pattern_credential(self):
+    def test_config_pattern_invalid_apikey(self):
         monitor = self._make_monitor_for_classify()
-        assert monitor._is_auth_error("credential error")
+        assert monitor._is_config_error("invalid apikey")
 
-    def test_auth_pattern_no_router(self):
+    def test_config_pattern_credential(self):
         monitor = self._make_monitor_for_classify()
-        assert monitor._is_auth_error("No litellm router configured")
+        assert monitor._is_config_error("credential error")
 
-    def test_non_auth_error(self):
+    def test_config_pattern_no_router(self):
         monitor = self._make_monitor_for_classify()
-        assert not monitor._is_auth_error("timeout")
+        assert monitor._is_config_error("No litellm router configured")
 
-    def test_non_auth_rate_limit(self):
+    # -- model-not-found patterns (positive) --
+
+    def test_config_pattern_notfounderror(self):
         monitor = self._make_monitor_for_classify()
-        assert not monitor._is_auth_error("rate_limit")
+        assert monitor._is_config_error("NotFoundError: model 'gpt-5' does not exist")
+
+    def test_config_pattern_model_is_not_found(self):
+        monitor = self._make_monitor_for_classify()
+        assert monitor._is_config_error("model is not found in provider registry")
+
+    def test_config_pattern_model_not_found(self):
+        monitor = self._make_monitor_for_classify()
+        assert monitor._is_config_error("model not found: gemini-4")
+
+    def test_config_pattern_invalid_model(self):
+        monitor = self._make_monitor_for_classify()
+        assert monitor._is_config_error("invalid model specified")
+
+    def test_config_pattern_unknown_model(self):
+        monitor = self._make_monitor_for_classify()
+        assert monitor._is_config_error("unknown model: foo/bar")
+
+    # -- negative tests (NOT config errors) --
+
+    def test_non_config_error_timeout(self):
+        monitor = self._make_monitor_for_classify()
+        assert not monitor._is_config_error("timeout")
+
+    def test_non_config_error_rate_limit(self):
+        monitor = self._make_monitor_for_classify()
+        assert not monitor._is_config_error("rate_limit")
+
+    def test_non_config_error_ratelimit(self):
+        monitor = self._make_monitor_for_classify()
+        assert not monitor._is_config_error("ratelimit exceeded")
+
+    # -- _classify_llm_error integration tests --
 
     def test_classify_returns_config_error_for_auth(self):
         monitor = self._make_monitor_for_classify()
         result = monitor._classify_llm_error(Exception("AuthenticationError: bad key"))
         assert result.status == "config_error"
 
+    def test_classify_returns_config_error_for_model_not_found(self):
+        monitor = self._make_monitor_for_classify()
+        result = monitor._classify_llm_error(Exception("NotFoundError: model not found"))
+        assert result.status == "config_error"
+
     def test_classify_returns_rate_limited_for_429(self):
         monitor = self._make_monitor_for_classify()
         result = monitor._classify_llm_error(Exception("429 Too Many Requests"))
+        assert result.status == "rate_limited"
+
+    def test_classify_returns_rate_limited_for_ratelimit(self):
+        monitor = self._make_monitor_for_classify()
+        result = monitor._classify_llm_error(Exception("Ratelimit exceeded try again later"))
         assert result.status == "rate_limited"
 
     def test_classify_returns_network_error_for_timeout(self):

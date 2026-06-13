@@ -1097,6 +1097,7 @@ def main() -> int:
                     email_sender=email_sender,
                     llm_analyzer=llm_analyzer,
                 )
+                logger.info("盘中 LLM Analyzer 在 schedule 启动时创建，运行期间配置变更需重启进程后才生效")
                 intraday_monitor._ensure_intraday_table()
 
                 # Snapshot jobs every 30 min from 10:00 to 14:00

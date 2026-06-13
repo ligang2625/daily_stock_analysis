@@ -933,6 +933,8 @@ class Config:
     intraday_snapshot_lock_ttl_seconds: int = 600
     # 盘中决策进程锁 TTL（秒），默认 5 分钟
     intraday_decision_lock_ttl_seconds: int = 300
+    # 盘中 LLM 调用 max_tokens（防止报告截断）
+    intraday_llm_max_tokens: int = 4096
 
     # === 实时行情增强数据配置 ==="
     # 实时行情开关（关闭后使用历史收盘价进行分析）
@@ -1751,6 +1753,7 @@ class Config:
             intraday_cn_batch_threshold=parse_env_int(os.getenv('INTRADAY_CN_BATCH_THRESHOLD'), 3, field_name='INTRADAY_CN_BATCH_THRESHOLD', minimum=1),
             intraday_hk_batch_primary_timeout=parse_env_float(os.getenv('INTRADAY_HK_BATCH_PRIMARY_TIMEOUT'), 20.0, field_name='INTRADAY_HK_BATCH_PRIMARY_TIMEOUT', minimum=5.0),
             intraday_hk_batch_fallback_timeout=parse_env_float(os.getenv('INTRADAY_HK_BATCH_FALLBACK_TIMEOUT'), 60.0, field_name='INTRADAY_HK_BATCH_FALLBACK_TIMEOUT', minimum=10.0),
+            intraday_llm_max_tokens=parse_env_int(os.getenv('INTRADAY_LLM_MAX_TOKENS'), 4096, field_name='INTRADAY_LLM_MAX_TOKENS', minimum=256, maximum=16384),
             webui_enabled=os.getenv('WEBUI_ENABLED', 'false').lower() == 'true',
             webui_host=os.getenv('WEBUI_HOST', '127.0.0.1'),
             webui_port=parse_env_int(os.getenv('WEBUI_PORT'), 8000, field_name='WEBUI_PORT', minimum=1, maximum=65535),

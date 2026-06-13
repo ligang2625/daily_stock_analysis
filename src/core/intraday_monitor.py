@@ -330,6 +330,15 @@ def _safe_float(val: Any) -> Optional[float]:
 # IntradayMonitor
 # ---------------------------------------------------------------------------
 
+INTRADAY_SYSTEM_PROMPT = """你是一个专业的盘中股票分析助手。你的任务是基于盘中实时数据、昨日技术分析结果和盘中事件，生成客观、审慎的盘中决策参考。
+
+规则：
+1. 所有判断必须基于输入数据，不得虚构价格、成交量、技术指标数值或新闻事件。
+2. 必须明确区分：事实陈述（基于数据）、风险提示（基于阈值偏离）、操作建议（基于多因素推理，需有条件说明）。
+3. 不得输出确定性收益承诺或保证性预测。
+4. 对数据不足或信号矛盾的标的，应明确表示无法判断，而不是强行给出结论。"""
+
+
 class IntradayMonitor:
     """
     盘中监控器
@@ -372,6 +381,10 @@ class IntradayMonitor:
         from src.analyzer import GeminiAnalyzer
         self._llm_analyzer = GeminiAnalyzer(config=self._config)
         return self._llm_analyzer
+
+    def set_llm_analyzer(self, analyzer: Any) -> None:
+        """Set or replace the LLM analyzer (e.g., after config reload in schedule mode)."""
+        self._llm_analyzer = analyzer
 
     # ------------------------------------------------------------------
     # Market resolution (per-stock)
@@ -1511,6 +1524,9 @@ class IntradayMonitor:
         Uses the injected or lazily-initialized analyzer so that model
         resolution, Router, API keys, fallback, and retry logic are all
         handled by the same code path as the post-market analysis.
+
+        Passes explicit max_tokens, temperature, and system_prompt to prevent
+        report truncation and ensure consistent generation parameters.
         """
         try:
             analyzer = self._get_llm_analyzer()
@@ -1527,6 +1543,9 @@ class IntradayMonitor:
         try:
             text = analyzer.generate_text(
                 prompt,
+                max_tokens=self._config.intraday_llm_max_tokens,
+                temperature=self._config.llm_temperature,
+                system_prompt=INTRADAY_SYSTEM_PROMPT,
                 call_type="intraday_decision",
                 raise_on_error=True,
             )
@@ -1541,10 +1560,10 @@ class IntradayMonitor:
     def _classify_llm_error(self, exc: Exception) -> LLMResult:
         """Classify an LLM exception into an LLMResult with appropriate status."""
         error_str = str(exc)
-        if self._is_auth_error(error_str):
+        if self._is_config_error(error_str):
             logger.error("LLM config/auth error: %s", exc)
             return LLMResult(status="config_error", error_message=error_str)
-        if "rate_limit" in error_str.lower() or "429" in error_str:
+        if "ratelimit" in error_str.lower() or "rate_limit" in error_str.lower() or "429" in error_str:
             logger.warning("LLM rate limited: %s", exc)
             return LLMResult(status="rate_limited", error_message=error_str)
         if "timeout" in error_str.lower() or "connection" in error_str.lower():
@@ -1554,18 +1573,33 @@ class IntradayMonitor:
         return LLMResult(status="network_error", error_message=error_str)
 
     @staticmethod
-    def _is_auth_error(error_str: str) -> bool:
-        """Check if an error string indicates an authentication or configuration error."""
+    def _is_config_error(error_str: str) -> bool:
+        """Check if an error string indicates a configuration or authentication error.
+
+        Uses precise keyword matching. Does NOT use bare "auth" which is too broad
+        and would also match generic auth errors unrelated to configuration.
+        """
         lowered = error_str.lower()
-        for keyword in ("authenticationerror", "auth", "api key", "not found error",
-                         "invalid x-goog", "permission denied", "unauthorized",
-                         "access denied", "forbidden", "invalid api key", "apikey",
-                         "credential", "no litellm router"):
-            if keyword in lowered:
+        # Exact config/credential errors
+        config_keywords = (
+            "authenticationerror", "unauthorized", "forbidden",
+            "invalid api key", "incorrect api key", "credential",
+            "invalid x-goog", "permission denied", "access denied",
+            "apikey", "no litellm router", "no models configured",
+            "missing", "not configured", "no api key",
+        )
+        # Model-not-found errors (often indicate config drift, not network issues)
+        model_keywords = (
+            "notfounderror", "model is not found", "model not found",
+            "model_not_found", "invalid model", "unknown model",
+        )
+        for kw in config_keywords:
+            if kw in lowered:
                 return True
-        for keyword in ("missing", "not configured", "no api key", "no models configured"):
-            if keyword in lowered:
+        for kw in model_keywords:
+            if kw in lowered:
                 return True
+        # Do NOT use bare "auth" — too broad
         return False
 
     def _build_raw_summary(self, events: List[IntradayEvent], markets: Optional[set] = None) -> str:

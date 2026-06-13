@@ -122,22 +122,9 @@ class MainScheduleModeTestCase(unittest.TestCase):
     def test_schedule_mode_ignores_cli_stock_snapshot(self) -> None:
         args = self._make_args(schedule=True, stocks="600519,000001")
         config = self._make_config(schedule_enabled=False)
-        scheduled_call = {}
-
-        def fake_run_with_schedule(
-            task,
-            schedule_time,
-            run_immediately,
-            background_tasks=None,
-            schedule_time_provider=None,
-        ):
-            scheduled_call["schedule_time"] = schedule_time
-            scheduled_call["run_immediately"] = run_immediately
-            scheduled_call["background_tasks"] = background_tasks or []
-            scheduled_call["resolved_schedule_time"] = (
-                schedule_time_provider() if schedule_time_provider is not None else None
-            )
-            task()
+        scheduler_mock = MagicMock()
+        scheduler_mock.run.return_value = None
+        scheduler_mock.set_daily_task.side_effect = lambda task, run_immediately=True: task()
 
         with patch("main.parse_arguments", return_value=args), \
              patch("main.get_config", return_value=config), \
@@ -146,20 +133,17 @@ class MainScheduleModeTestCase(unittest.TestCase):
              patch("main.setup_logging"), \
              patch("main.run_full_analysis") as run_full_analysis, \
              patch("main.logger.warning") as warning_log, \
-             patch("src.scheduler.run_with_schedule", side_effect=fake_run_with_schedule):
+             patch("src.scheduler.Scheduler", return_value=scheduler_mock) as scheduler_cls:
             exit_code = main.main()
 
         self.assertEqual(exit_code, 0)
-        self.assertEqual(
-            scheduled_call,
-            {
-                "schedule_time": "18:00",
-                "run_immediately": True,
-                "background_tasks": [],
-                "resolved_schedule_time": "18:00",
-            },
+        scheduler_cls.assert_called_once()
+        self.assertEqual(scheduler_cls.call_args.kwargs["schedule_time"], "18:00")
+        scheduler_mock.set_daily_task.assert_called_once()
+        self.assertTrue(
+            scheduler_mock.set_daily_task.call_args.kwargs["run_immediately"]
         )
-        run_full_analysis.assert_called_once_with(config, args, None)
+        run_full_analysis.assert_called_once_with(config, args, None, analysis_phase="postmarket")
         warning_log.assert_any_call(
             "定时模式下检测到 --stocks 参数；计划执行将忽略启动时股票快照，并在每次运行前重新读取最新的 STOCK_LIST。"
         )
@@ -168,20 +152,9 @@ class MainScheduleModeTestCase(unittest.TestCase):
         args = self._make_args(schedule=True)
         startup_config = self._make_config(schedule_enabled=True, schedule_time="18:00")
         runtime_config = self._make_config(schedule_enabled=True, schedule_time="09:30")
-        scheduled_call = {}
-
-        def fake_run_with_schedule(
-            task,
-            schedule_time,
-            run_immediately,
-            background_tasks=None,
-            schedule_time_provider=None,
-        ):
-            scheduled_call["schedule_time"] = schedule_time
-            scheduled_call["resolved_schedule_time"] = (
-                schedule_time_provider() if schedule_time_provider is not None else None
-            )
-            task()
+        scheduler_mock = MagicMock()
+        scheduler_mock.run.return_value = None
+        scheduler_mock.set_daily_task.side_effect = lambda task, run_immediately=True: task()
 
         with patch("main.parse_arguments", return_value=args), \
              patch("main.get_config", return_value=startup_config), \
@@ -189,15 +162,13 @@ class MainScheduleModeTestCase(unittest.TestCase):
              patch("main._build_schedule_time_provider", return_value=lambda: "09:30"), \
              patch("main.setup_logging"), \
              patch("main.run_full_analysis") as run_full_analysis, \
-             patch("src.scheduler.run_with_schedule", side_effect=fake_run_with_schedule):
+             patch("src.scheduler.Scheduler", return_value=scheduler_mock) as scheduler_cls:
             exit_code = main.main()
 
         self.assertEqual(exit_code, 0)
-        self.assertEqual(
-            scheduled_call,
-            {"schedule_time": "18:00", "resolved_schedule_time": "09:30"},
-        )
-        run_full_analysis.assert_called_once_with(runtime_config, args, None)
+        scheduler_cls.assert_called_once()
+        self.assertEqual(scheduler_cls.call_args.kwargs["schedule_time"], "18:00")
+        run_full_analysis.assert_called_once_with(runtime_config, args, None, analysis_phase="postmarket")
 
     def test_schedule_mode_registers_event_monitor_background_task(self) -> None:
         args = self._make_args(schedule=True)
@@ -208,21 +179,8 @@ class MainScheduleModeTestCase(unittest.TestCase):
         )
         worker = MagicMock()
         worker.run_once.return_value = {"triggered": 2}
-        scheduled_call = {}
-
-        def fake_run_with_schedule(
-            task,
-            schedule_time,
-            run_immediately,
-            background_tasks=None,
-            schedule_time_provider=None,
-        ):
-            scheduled_call["schedule_time"] = schedule_time
-            scheduled_call["run_immediately"] = run_immediately
-            scheduled_call["background_tasks"] = background_tasks or []
-            scheduled_call["resolved_schedule_time"] = (
-                schedule_time_provider() if schedule_time_provider is not None else None
-            )
+        scheduler_mock = MagicMock()
+        scheduler_mock.run.return_value = None
 
         with patch("main.parse_arguments", return_value=args), \
              patch("main.get_config", return_value=config), \
@@ -231,24 +189,20 @@ class MainScheduleModeTestCase(unittest.TestCase):
              patch("main.setup_logging"), \
              patch("main.run_full_analysis") as run_full_analysis, \
              patch("src.services.alert_worker.AlertWorker", return_value=worker) as worker_cls, \
-             patch("src.scheduler.run_with_schedule", side_effect=fake_run_with_schedule):
+             patch("src.scheduler.Scheduler", return_value=scheduler_mock) as scheduler_cls:
             exit_code = main.main()
 
         self.assertEqual(exit_code, 0)
         worker_cls.assert_called_once()
         self.assertIs(worker_cls.call_args.kwargs["config_provider"], reload_config)
         run_full_analysis.assert_not_called()
-        self.assertEqual(scheduled_call["schedule_time"], "18:00")
-        self.assertEqual(scheduled_call["run_immediately"], True)
-        self.assertEqual(scheduled_call["resolved_schedule_time"], "18:00")
-        self.assertEqual(len(scheduled_call["background_tasks"]), 1)
-        background_task = scheduled_call["background_tasks"][0]
-        self.assertEqual(background_task["name"], "agent_event_monitor")
-        self.assertEqual(background_task["interval_seconds"], 7 * 60)
-        self.assertEqual(background_task["run_immediately"], True)
+        scheduler_mock.add_background_task.assert_called_once()
+        bt_call = scheduler_mock.add_background_task.call_args
+        self.assertEqual(bt_call.kwargs["interval_seconds"], 7 * 60)
+        self.assertEqual(bt_call.kwargs["name"], "agent_event_monitor")
 
         with patch("main.logger.info") as info_log:
-            background_task["task"]()
+            bt_call.kwargs["task"]()
 
         worker.run_once.assert_called_once_with()
         info_log.assert_any_call("[EventMonitor] 本轮触发 %d 条提醒", 2)
@@ -262,16 +216,8 @@ class MainScheduleModeTestCase(unittest.TestCase):
         )
         worker = MagicMock()
         worker.run_once.return_value = {"triggered": 0}
-        scheduled_call = {}
-
-        def fake_run_with_schedule(
-            task,
-            schedule_time,
-            run_immediately,
-            background_tasks=None,
-            schedule_time_provider=None,
-        ):
-            scheduled_call["background_tasks"] = background_tasks or []
+        scheduler_mock = MagicMock()
+        scheduler_mock.run.return_value = None
 
         with patch("main.parse_arguments", return_value=args), \
              patch("main.get_config", return_value=config), \
@@ -280,14 +226,17 @@ class MainScheduleModeTestCase(unittest.TestCase):
              patch("main.setup_logging"), \
              patch("main.run_full_analysis") as run_full_analysis, \
              patch("src.services.alert_worker.AlertWorker", return_value=worker) as worker_cls, \
-             patch("src.scheduler.run_with_schedule", side_effect=fake_run_with_schedule):
+             patch("src.scheduler.Scheduler", return_value=scheduler_mock) as scheduler_cls:
             exit_code = main.main()
 
         self.assertEqual(exit_code, 0)
         worker_cls.assert_called_once()
         run_full_analysis.assert_not_called()
-        self.assertEqual(len(scheduled_call["background_tasks"]), 1)
-        self.assertEqual(scheduled_call["background_tasks"][0]["name"], "agent_event_monitor")
+        scheduler_mock.add_background_task.assert_called_once()
+        self.assertEqual(
+            scheduler_mock.add_background_task.call_args.kwargs["name"],
+            "agent_event_monitor",
+        )
 
     def test_check_notify_returns_before_other_modes(self) -> None:
         args = self._make_args(check_notify=True, serve=True, schedule=True, market_review=True)
@@ -818,6 +767,9 @@ class IntradaySnapshotDecisionInjectionTestCase(unittest.TestCase):
 
         monitor_mock = MagicMock()
         mock_analyzer = MagicMock()
+        scheduler_mock = MagicMock()
+        scheduler_mock.run.return_value = None
+        scheduler_mock.add_daily_job = MagicMock()
 
         with patch("main.parse_arguments", return_value=args), \
              patch("main.get_config", return_value=config), \
@@ -828,7 +780,8 @@ class IntradaySnapshotDecisionInjectionTestCase(unittest.TestCase):
              patch("data_provider.base.DataFetcherManager") as fetcher_cls, \
              patch("src.notification_sender.email_sender.EmailSender") as email_cls, \
              patch("src.analyzer.GeminiAnalyzer", return_value=mock_analyzer) as analyzer_cls, \
-             patch("src.core.intraday_monitor.IntradayMonitor", return_value=monitor_mock) as monitor_cls:
+             patch("src.core.intraday_monitor.IntradayMonitor", return_value=monitor_mock) as monitor_cls, \
+             patch("src.scheduler.Scheduler", return_value=scheduler_mock) as scheduler_cls:
             exit_code = main.main()
 
         self.assertEqual(exit_code, 0)
@@ -837,6 +790,8 @@ class IntradaySnapshotDecisionInjectionTestCase(unittest.TestCase):
         call_kwargs = monitor_cls.call_args.kwargs
         self.assertIs(call_kwargs["llm_analyzer"], mock_analyzer,
                       "Schedule mode should inject an LLM analyzer for intraday monitor")
+        scheduler_cls.assert_called_once()
+        scheduler_mock.run.assert_called_once_with()
 
 
 if __name__ == "__main__":
