@@ -935,6 +935,14 @@ class Config:
     intraday_decision_lock_ttl_seconds: int = 300
     # 盘中 LLM 调用 max_tokens（防止报告截断）
     intraday_llm_max_tokens: int = 4096
+    # 是否在盘中快照中同步抓取大盘指数行情
+    intraday_market_snapshot_enabled: bool = True
+    # A股大盘指数代码（逗号分隔），默认：上证指数、深证成指、创业板指
+    intraday_market_indices_cn: str = "000001,399001,399006"
+    # 港股大盘指数代码（逗号分隔），默认：恒生指数、恒生科技指数
+    intraday_market_indices_hk: str = "HSI,HSTECH"
+    # 美股大盘指数代码（逗号分隔），默认：标普500、纳斯达克综合
+    intraday_market_indices_us: str = "^GSPC,^IXIC"
 
     # === 实时行情增强数据配置 ==="
     # 实时行情开关（关闭后使用历史收盘价进行分析）
@@ -1754,6 +1762,10 @@ class Config:
             intraday_hk_batch_primary_timeout=parse_env_float(os.getenv('INTRADAY_HK_BATCH_PRIMARY_TIMEOUT'), 20.0, field_name='INTRADAY_HK_BATCH_PRIMARY_TIMEOUT', minimum=5.0),
             intraday_hk_batch_fallback_timeout=parse_env_float(os.getenv('INTRADAY_HK_BATCH_FALLBACK_TIMEOUT'), 60.0, field_name='INTRADAY_HK_BATCH_FALLBACK_TIMEOUT', minimum=10.0),
             intraday_llm_max_tokens=parse_env_int(os.getenv('INTRADAY_LLM_MAX_TOKENS'), 4096, field_name='INTRADAY_LLM_MAX_TOKENS', minimum=256, maximum=16384),
+            intraday_market_snapshot_enabled=os.getenv('INTRADAY_MARKET_SNAPSHOT_ENABLED', 'true').lower() == 'true',
+            intraday_market_indices_cn=os.getenv('INTRADAY_MARKET_INDICES_CN', '000001,399001,399006'),
+            intraday_market_indices_hk=os.getenv('INTRADAY_MARKET_INDICES_HK', 'HSI,HSTECH'),
+            intraday_market_indices_us=os.getenv('INTRADAY_MARKET_INDICES_US', '^GSPC,^IXIC'),
             webui_enabled=os.getenv('WEBUI_ENABLED', 'false').lower() == 'true',
             webui_host=os.getenv('WEBUI_HOST', '127.0.0.1'),
             webui_port=parse_env_int(os.getenv('WEBUI_PORT'), 8000, field_name='WEBUI_PORT', minimum=1, maximum=65535),

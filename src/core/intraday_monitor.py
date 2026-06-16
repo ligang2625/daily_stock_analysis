@@ -420,6 +420,27 @@ class IntradayMonitor:
         return event
 
     @staticmethod
+    def _extract_quote_data(quote) -> Dict[str, Any]:
+        """Extract supplemental quote fields from a UnifiedRealtimeQuote into a dict for raw_quote storage.
+
+        Returns dict with keys: source, open, prev_close, high, low, volume, amount, turnover_rate.
+        Fields that are None or missing are excluded.
+        """
+        data: Dict[str, Any] = {}
+        try:
+            data['source'] = getattr(quote, 'source', None)
+        except Exception:
+            pass
+        for field in ('open', 'prev_close', 'high', 'low', 'volume', 'amount', 'turnover_rate'):
+            try:
+                val = getattr(quote, field, None)
+                if val is not None:
+                    data[field] = float(val) if isinstance(val, (int, float)) else val
+            except Exception:
+                pass
+        return data
+
+    @staticmethod
     def _get_market_query_date(market: str) -> str:
         """Return market-local date string (YYYY-MM-DD) for the given market."""
         try:
@@ -1106,6 +1127,12 @@ class IntradayMonitor:
             snapshot_id, snapshot_state.status, len(codes), len(valid_quote_codes), len(failed_codes), coverage * 100, source,
         )
 
+        # Fetch and persist market index snapshots (fail-open, after stock snapshot is done)
+        try:
+            self._run_market_index_snapshot(snapshot_id, self._current_run_id, snapshot_state.markets)
+        except Exception as exc:
+            logger.warning("[市场指数] 指数快照阶段异常（不影响个股决策）: %s", exc)
+
         return results, snapshot_state
 
     def _snapshot_one_stock_with_quote(self, code: str, now: datetime, quote) -> SnapshotQuoteProcessResult:
@@ -1135,7 +1162,7 @@ class IntradayMonitor:
                 change_pct=None,
                 event_type="suspended",
                 description="停牌或无有效价格",
-            ), snapshot_status="suspended"))
+            ), snapshot_status="suspended"), raw_quote_data=self._extract_quote_data(quote))
             return SnapshotQuoteProcessResult(
                 code=code, status=SnapshotQuoteStatus.SUSPENDED,
                 source=getattr(quote, 'source', None),
@@ -1167,7 +1194,7 @@ class IntradayMonitor:
                 event_type="price_only",
                 description=f"当前价 {price}（无昨日分析数据）",
             )
-            self._save_event(self._stamp_event(event, snapshot_status="valid"))
+            self._save_event(self._stamp_event(event, snapshot_status="valid"), raw_quote_data=self._extract_quote_data(quote))
             event_count = 1
             return SnapshotQuoteProcessResult(
                 code=code, status=SnapshotQuoteStatus.VALID, event_count=event_count,
@@ -1176,7 +1203,7 @@ class IntradayMonitor:
 
         events = _compare_with_thresholds(code, name, price, vol_ratio, change, yesterday, now=now)
         for event in events:
-            self._save_event(self._stamp_event(event, snapshot_status="valid"))
+            self._save_event(self._stamp_event(event, snapshot_status="valid"), raw_quote_data=self._extract_quote_data(quote))
             event_count += 1
 
         return SnapshotQuoteProcessResult(
@@ -1218,7 +1245,7 @@ class IntradayMonitor:
                 change_pct=None,
                 event_type="suspended",
                 description="停牌或无有效价格(单股逐笔)",
-            ), snapshot_status="suspended"))
+            ), snapshot_status="suspended"), raw_quote_data=self._extract_quote_data(quote))
             return SnapshotQuoteProcessResult(
                 code=code, status=SnapshotQuoteStatus.SUSPENDED,
                 source=getattr(quote, 'source', None),
@@ -1248,7 +1275,7 @@ class IntradayMonitor:
                 event_type="price_only",
                 description=f"当前价 {price}（无昨日分析数据, 单股逐笔）",
             )
-            self._save_event(self._stamp_event(event, snapshot_status="valid"))
+            self._save_event(self._stamp_event(event, snapshot_status="valid"), raw_quote_data=self._extract_quote_data(quote))
             event_count = 1
             return SnapshotQuoteProcessResult(
                 code=code, status=SnapshotQuoteStatus.VALID, event_count=event_count,
@@ -1257,7 +1284,7 @@ class IntradayMonitor:
 
         events = _compare_with_thresholds(code, name, price, vol_ratio, change, yesterday, now=now)
         for event in events:
-            self._save_event(self._stamp_event(event, snapshot_status="valid"))
+            self._save_event(self._stamp_event(event, snapshot_status="valid"), raw_quote_data=self._extract_quote_data(quote))
             event_count += 1
 
         return SnapshotQuoteProcessResult(
@@ -1487,11 +1514,28 @@ class IntradayMonitor:
 
         # Build prompt (filter out data_unavailable)
         from src.core.intraday_prompt import build_intraday_prompt
+
+        # Rebuild snapshot_times from DB instead of relying on in-memory state
+        db_snapshot_times = self._rebuild_snapshot_times_from_db()
+        merged_times = db_snapshot_times if db_snapshot_times else self._snapshot_times
+
+        # Determine markets and market_dates for timeline queries
+        decision_markets = list(snapshot["markets"]) if snapshot.get("markets") else []
+        decision_market_dates = snapshot.get("market_dates") if snapshot.get("market_dates") else {}
+
+        # Load stock timelines (all snapshots across the day)
+        stock_timelines = self._load_stock_timelines_for_decision(decision_markets, decision_market_dates)
+
+        # Load market index timelines
+        market_timelines = self._load_market_timelines_for_decision(decision_markets, decision_market_dates)
+
         prompt = build_intraday_prompt(
             events=all_events,
             yesterday_analysis=self._yesterday_analysis,
-            snapshot_times=self._snapshot_times,
+            snapshot_times=merged_times,
             markets={self._get_market_for_stock(c) for c in stock_codes if self._get_market_for_stock(c)},
+            stock_timelines=stock_timelines,
+            market_timelines=market_timelines,
         )
 
         # Call LLM via unified analyzer
@@ -1717,8 +1761,14 @@ class IntradayMonitor:
     # SQLite helpers
     # ------------------------------------------------------------------
 
-    def _save_event(self, event: IntradayEvent) -> None:
-        """Persist one intraday event to SQLite. Uses market-local date."""
+    def _save_event(self, event: IntradayEvent, raw_quote_data: Optional[Dict[str, Any]] = None) -> None:
+        """Persist one intraday event to SQLite. Uses market-local date.
+
+        Args:
+            event: The intraday event to persist.
+            raw_quote_data: Optional dict with extra quote fields (open, prev_close, high, low,
+                           volume, amount, turnover_rate, source) to save as raw_quote JSON.
+        """
         market = self._get_market_for_stock(event.stock_code)
         if market is None:
             policy = self._resolve_unknown_market_policy()
@@ -1738,6 +1788,14 @@ class IntradayMonitor:
             event.market_local_timestamp = market_now.isoformat()
         except Exception:
             event.market_local_timestamp = event.timestamp.isoformat()
+
+        # Build raw_quote JSON from provided extra fields
+        raw_quote_str = None
+        if raw_quote_data:
+            # Filter None values and serialize
+            clean_data = {k: v for k, v in raw_quote_data.items() if v is not None}
+            if clean_data:
+                raw_quote_str = json.dumps(clean_data, default=str)
 
         try:
             with self._db.session_scope() as session:
@@ -1764,7 +1822,7 @@ class IntradayMonitor:
                         "cpct": event.change_pct,
                         "et": event.event_type,
                         "desc": event.description,
-                        "rq": None,
+                        "rq": raw_quote_str,
                         "sid": event.snapshot_id,
                         "rid": event.run_id,
                         "ss": event.snapshot_status,
@@ -2202,6 +2260,306 @@ class IntradayMonitor:
                 session.commit()
         except Exception as exc:
             logger.warning("持久化快照状态失败: %s", exc)
+
+    def _ensure_intraday_market_snapshots_table(self) -> None:
+        """Create intraday_market_snapshots table if not exists."""
+        try:
+            with self._db.session_scope() as session:
+                conn = session.connection()
+                from sqlalchemy import text as sa_text
+                conn.execute(sa_text(
+                    "CREATE TABLE IF NOT EXISTS intraday_market_snapshots ("
+                    "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+                    "snapshot_id TEXT NOT NULL, "
+                    "run_id TEXT, "
+                    "query_date TEXT NOT NULL, "
+                    "market TEXT NOT NULL, "
+                    "market_local_timestamp TEXT, "
+                    "index_code TEXT NOT NULL, "
+                    "index_name TEXT, "
+                    "current_price REAL, "
+                    "open_price REAL, "
+                    "prev_close REAL, "
+                    "high_price REAL, "
+                    "low_price REAL, "
+                    "change_pct REAL, "
+                    "volume REAL, "
+                    "amount REAL, "
+                    "source TEXT, "
+                    "status TEXT NOT NULL DEFAULT 'valid', "
+                    "raw_quote TEXT, "
+                    "created_at TEXT NOT NULL, "
+                    "UNIQUE(snapshot_id, market, index_code))"
+                ))
+                conn.execute(sa_text(
+                    "CREATE INDEX IF NOT EXISTS idx_intraday_market_snapshots_day "
+                    "ON intraday_market_snapshots(query_date, market, index_code)"
+                ))
+                conn.execute(sa_text(
+                    "CREATE INDEX IF NOT EXISTS idx_intraday_market_snapshots_snapshot "
+                    "ON intraday_market_snapshots(snapshot_id, market)"
+                ))
+                session.commit()
+                logger.info("intraday_market_snapshots 表已就绪")
+        except Exception as exc:
+            logger.error("创建 intraday_market_snapshots 表失败: %s", exc)
+
+    def _get_market_indices(self, market: str) -> List[str]:
+        """Get configured index codes for a market."""
+        if market == 'cn':
+            codes_str = getattr(self._config, 'intraday_market_indices_cn', '') or ''
+        elif market == 'hk':
+            codes_str = getattr(self._config, 'intraday_market_indices_hk', '') or ''
+        elif market == 'us':
+            codes_str = getattr(self._config, 'intraday_market_indices_us', '') or ''
+        else:
+            return []
+        return [c.strip() for c in codes_str.split(',') if c.strip()]
+
+    def _fetch_index_quotes(self, market: str) -> List[Dict[str, Any]]:
+        """Fetch realtime index quotes for a single market. Fail-open: returns [] on error."""
+        enabled = getattr(self._config, 'intraday_market_snapshot_enabled', True)
+        if not enabled:
+            return []
+        index_codes = self._get_market_indices(market)
+        if not index_codes:
+            return []
+        results: List[Dict[str, Any]] = []
+        for code in index_codes:
+            try:
+                quote = self._fetcher.get_realtime_quote(code, log_final_failure=False)
+                if quote is None:
+                    logger.info("[市场指数] %s index_code=%s: 无行情数据", market.upper(), code)
+                    results.append({
+                        'index_code': code, 'status': 'data_unavailable',
+                        'market': market,
+                    })
+                    continue
+                results.append({
+                    'index_code': code,
+                    'index_name': getattr(quote, 'name', '') or '',
+                    'current_price': float(quote.price) if quote.price is not None else None,
+                    'open_price': float(quote.open) if getattr(quote, 'open', None) is not None else None,
+                    'prev_close': float(quote.prev_close) if getattr(quote, 'prev_close', None) is not None else None,
+                    'high_price': float(quote.high) if getattr(quote, 'high', None) is not None else None,
+                    'low_price': float(quote.low) if getattr(quote, 'low', None) is not None else None,
+                    'change_pct': float(quote.change_pct) if getattr(quote, 'change_pct', None) is not None else None,
+                    'volume': float(quote.volume) if getattr(quote, 'volume', None) is not None else None,
+                    'amount': float(quote.amount) if getattr(quote, 'amount', None) is not None else None,
+                    'source': getattr(quote, 'source', '') or '',
+                    'status': 'valid',
+                    'market': market,
+                })
+            except Exception as exc:
+                logger.warning("[市场指数] %s index_code=%s 获取失败: %s", market.upper(), code, exc)
+                results.append({
+                    'index_code': code, 'status': 'fetch_failed',
+                    'market': market,
+                })
+        return results
+
+    def _persist_market_snapshots(
+        self, snapshot_id: str, run_id: str, market: str,
+        index_quotes: List[Dict[str, Any]],
+    ) -> None:
+        """Persist market index snapshots to intraday_market_snapshots table."""
+        self._ensure_intraday_market_snapshots_table()
+        query_date = self._get_market_query_date(market)
+        try:
+            from src.core.trading_calendar import get_market_now
+            market_local_ts = get_market_now(market).isoformat()
+        except Exception:
+            market_local_ts = datetime.now().isoformat()
+        created_at = datetime.now().isoformat()
+        try:
+            with self._db.session_scope() as session:
+                conn = session.connection()
+                from sqlalchemy import text as sa_text
+                for idx in index_quotes:
+                    raw = None
+                    if idx.get('status') == 'valid':
+                        raw_data = {k: v for k, v in idx.items()
+                                    if k not in ('status', 'market') and v is not None}
+                        raw = json.dumps(raw_data, default=str) if raw_data else None
+                    conn.execute(sa_text(
+                        "INSERT OR REPLACE INTO intraday_market_snapshots "
+                        "(snapshot_id, run_id, query_date, market, market_local_timestamp, "
+                        "index_code, index_name, current_price, open_price, prev_close, "
+                        "high_price, low_price, change_pct, volume, amount, source, "
+                        "status, raw_quote, created_at) "
+                        "VALUES (:sid, :rid, :qd, :mkt, :mlt, :ic, :iname, :cp, :op, :pc, "
+                        ":hp, :lp, :chpct, :vol, :amt, :src, :st, :rq, :ca)"
+                    ), {
+                        "sid": snapshot_id, "rid": run_id, "qd": query_date,
+                        "mkt": market, "mlt": market_local_ts,
+                        "ic": idx.get('index_code', ''),
+                        "iname": idx.get('index_name') or None,
+                        "cp": idx.get('current_price'),
+                        "op": idx.get('open_price'),
+                        "pc": idx.get('prev_close'),
+                        "hp": idx.get('high_price'),
+                        "lp": idx.get('low_price'),
+                        "chpct": idx.get('change_pct'),
+                        "vol": idx.get('volume'),
+                        "amt": idx.get('amount'),
+                        "src": idx.get('source') or None,
+                        "st": idx.get('status', 'data_unavailable'),
+                        "rq": raw,
+                        "ca": created_at,
+                    })
+                session.commit()
+            if any(idx.get('status') == 'valid' for idx in index_quotes):
+                valid_count = sum(1 for idx in index_quotes if idx.get('status') == 'valid')
+                logger.info(
+                    "[市场指数] 持久化成功: snapshot_id=%s market=%s valid=%d/%d",
+                    snapshot_id, market.upper(), valid_count, len(index_quotes),
+                )
+        except Exception as exc:
+            logger.warning("[市场指数] 持久化失败 snapshot_id=%s market=%s: %s", snapshot_id, market.upper(), exc)
+
+    def _run_market_index_snapshot(self, snapshot_id: str, run_id: str, markets: List[str]) -> Dict[str, List[Dict[str, Any]]]:
+        """Fetch and persist market index snapshots for all given markets.
+        Fail-open: individual market failure does not block others.
+        Returns dict mapping market -> list of index quote dicts.
+        """
+        all_results: Dict[str, List[Dict[str, Any]]] = {}
+        enabled = getattr(self._config, 'intraday_market_snapshot_enabled', True)
+        if not enabled:
+            logger.info("[市场指数] 市场指数快照已禁用 (intraday_market_snapshot_enabled=false)")
+            return all_results
+        for market in markets:
+            try:
+                quotes = self._fetch_index_quotes(market)
+                all_results[market] = quotes
+                self._persist_market_snapshots(snapshot_id, run_id, market, quotes)
+            except Exception as exc:
+                logger.warning("[市场指数] 市场 %s 指数快照失败: %s", market.upper(), exc)
+                all_results[market] = [{'index_code': 'ALL', 'status': 'fetch_failed', 'market': market}]
+        return all_results
+
+    def _load_market_timelines_for_decision(self, markets: List[str], market_dates: Dict[str, str]) -> Dict[str, List[Dict[str, Any]]]:
+        """Load all market index snapshots for the decision day, grouped by market+index_code.
+        Returns {market: [{index_code, index_name, timestamps: [{ts, price, change_pct}], ...}]}
+        """
+        timelines: Dict[str, List[Dict[str, Any]]] = {}
+        self._ensure_intraday_market_snapshots_table()
+        try:
+            with self._db.session_scope() as session:
+                conn = session.connection()
+                from sqlalchemy import text as sa_text
+                for market in markets:
+                    query_date = market_dates.get(market) or self._get_market_query_date(market)
+                    rows = conn.execute(sa_text(
+                        "SELECT index_code, index_name, current_price, change_pct, "
+                        "market_local_timestamp, status, open_price, prev_close, "
+                        "high_price, low_price, snapshot_id "
+                        "FROM intraday_market_snapshots "
+                        "WHERE query_date = :qd AND market = :mkt "
+                        "ORDER BY index_code, market_local_timestamp"
+                    ), {"qd": query_date, "mkt": market}).fetchall()
+                    if not rows:
+                        continue
+                    # Group by index_code
+                    index_map: Dict[str, Dict[str, Any]] = {}
+                    for row in rows:
+                        ic = str(row[0] or "")
+                        if not ic:
+                            continue
+                        if ic not in index_map:
+                            index_map[ic] = {
+                                'index_code': ic,
+                                'index_name': str(row[1] or "") if row[1] else ic,
+                                'points': [],
+                                'open_price': float(row[6]) if row[6] is not None else None,
+                                'prev_close': float(row[7]) if row[7] is not None else None,
+                                'high_price': float(row[8]) if row[8] is not None else None,
+                                'low_price': float(row[9]) if row[9] is not None else None,
+                            }
+                        entry = index_map[ic]
+                        if row[5] == 'valid' and row[2] is not None:
+                            entry['points'].append({
+                                'price': float(row[2]),
+                                'change_pct': float(row[3]) if row[3] is not None else 0,
+                                'timestamp': str(row[4]) if row[4] else '',
+                            })
+                            # Track high/low across snapshots
+                            price_val = float(row[2])
+                            if entry['high_price'] is None or price_val > entry['high_price']:
+                                entry['high_price'] = price_val
+                            if entry['low_price'] is None or price_val < entry['low_price']:
+                                entry['low_price'] = price_val
+                    timelines[market] = list(index_map.values())
+        except Exception as exc:
+            logger.warning("[市场指数] 加载市场指数时间线失败: %s", exc)
+        return timelines
+
+    def _load_stock_timelines_for_decision(self, markets: List[str], market_dates: Dict[str, str]) -> Dict[str, Dict[str, List[Dict[str, Any]]]]:
+        """Load all intraday events across all snapshots for the decision day.
+
+        Groups by stock_code, sorted by market_local_timestamp.
+        Returns: {stock_code: {'market': str, 'points': [{price, change_pct, volume_ratio, ts, event_type, description}, ...]}}
+        """
+        self._ensure_intraday_table()
+        timelines: Dict[str, Dict[str, Any]] = {}
+        try:
+            with self._db.session_scope() as session:
+                conn = session.connection()
+                from sqlalchemy import text as sa_text
+                for market in markets:
+                    query_date = market_dates.get(market) or self._get_market_query_date(market)
+                    rows = conn.execute(sa_text(
+                        "SELECT stock_code, stock_name, current_price, change_pct, volume_ratio, "
+                        "market_local_timestamp, event_type, description, snapshot_id, market "
+                        "FROM intraday_events "
+                        "WHERE query_date = :qd AND market = :mkt "
+                        "ORDER BY stock_code, market_local_timestamp"
+                    ), {"qd": query_date, "mkt": market}).fetchall()
+                    for row in rows:
+                        code = str(row[0] or "")
+                        if not code:
+                            continue
+                        if code not in timelines:
+                            timelines[code] = {
+                                'stock_name': str(row[1] or ""),
+                                'market': str(row[9] or market),
+                                'points': [],
+                            }
+                        timelines[code]['points'].append({
+                            'price': float(row[2]) if row[2] is not None else None,
+                            'change_pct': float(row[3]) if row[3] is not None else None,
+                            'volume_ratio': float(row[4]) if row[4] is not None else None,
+                            'timestamp': str(row[5]) if row[5] else '',
+                            'event_type': str(row[6] or ""),
+                            'description': str(row[7] or ""),
+                            'snapshot_id': str(row[8]) if row[8] else '',
+                        })
+        except Exception as exc:
+            logger.warning("[个股时间线] 加载失败: %s", exc)
+        return timelines
+
+    def _rebuild_snapshot_times_from_db(self) -> List[str]:
+        """Query intraday_snapshots to rebuild snapshot times for the day."""
+        snapshot_times: List[str] = []
+        self._ensure_intraday_snapshots_table()
+        try:
+            with self._db.session_scope() as session:
+                conn = session.connection()
+                from sqlalchemy import text as sa_text
+                rows = conn.execute(sa_text(
+                    "SELECT DISTINCT started_at FROM intraday_snapshots "
+                    "WHERE status IN ('completed', 'partial') ORDER BY started_at"
+                )).fetchall()
+                for row in rows:
+                    ts_str = str(row[0]) if row[0] else ""
+                    if ts_str:
+                        try:
+                            dt = datetime.fromisoformat(ts_str)
+                            snapshot_times.append(dt.strftime("%H:%M"))
+                        except (ValueError, TypeError):
+                            pass
+        except Exception as exc:
+            logger.warning("[快照时间] 从DB重建失败: %s", exc)
+        return snapshot_times
 
     def _update_snapshot_status(self, snapshot_id: str, status: str, finished_at: Optional[datetime] = None) -> None:
         """Update snapshot status."""

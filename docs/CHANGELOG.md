@@ -18,6 +18,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - [新功能] 新增分析任务与历史报告运行流快照 API，提供 lanes、nodes、edges、events、summary 等统一契约，并从任务队列、运行诊断和 AnalysisContextPack overview 构建脱敏数据流/信息流。
 - [修复] 修复历史报告运行流快照在混合时区事件时间戳下返回 500 的问题。
 - [改进] #1459 持仓管理页新增持仓账户删除入口，复用现有账户软删除接口，误建账户会从默认列表、快照、风险、录入入口和事件列表隐藏且不物理清理历史流水。
+- [新功能] 盘中决策新增大盘指数快照 (intraday_market_snapshots 表: CN/HK/US 主要指数)，每轮快照自动抓取
+- [新功能] 盘中决策新增个股全天走势摘要 (per-stock timeline: 首末价、日内高低、回撤、涨跌幅趋势)
+- [改进] 盘中决策 prompt 新增 3 段落: 大盘指数走势、个股走势摘要、个股相对大盘强弱
+- [改进] intraday_events.raw_quote 填充结构化行情 (open/prev_close/high/low/volume/amount/turnover_rate/source)
+- [改进] 快照时间从 DB 重建(不再依赖进程内存)，多 market_dates 分别加载
+- [修复] 指数数据缺失时 prompt 明确标注不臆测大盘方向
 <!-- 新条目格式：- [类型] 描述（类型取值：新功能/改进/修复/文档/测试/chore）-->
 <!-- 每条独立一行追加到本段末尾，无需分类标题，合并时冲突最小 -->
 - [修复] 桌面发布打包改用冻结可执行文件运行时探针校验 `alphasift.dsa_adapter`，避免 macOS PyInstaller 将模块内嵌进可执行文件时被文件系统/zip 扫描误判为缺失。

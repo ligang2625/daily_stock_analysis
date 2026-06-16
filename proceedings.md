@@ -62,3 +62,55 @@
 ### 测试
 
 **203 passed, 3 failed** (3 failed 为预存已知问题，无回归)
+
+## Session 3: 大盘指数快照与决策走势增强 (2026-06-16)
+
+### 新增特性
+
+| # | Priority | Feature | Key Change |
+|---|----------|---------|------------|
+| 1 | Critical | Decision 阶段增加个股全天走势 | `_load_stock_timelines_for_decision()` 加载全量快照事件构建 per-stock timeline；`_summarize_stock_timeline()` 汇总首末价格、日内高低、最大回撤、涨跌幅趋势 |
+| 2 | Critical | 大盘指数盘中快照 | `intraday_market_snapshots` 表 + `_snapshot_market_indices()` 每轮快照抓取 CN/HK/US 主要指数 |
+| 3 | Major | 决策 Prompt 增加走势段落 | `build_intraday_prompt(stock_timelines=, market_timelines=)` + 3 新段落：大盘指数走势、个股走势、相对强弱 |
+| 4 | Major | 快照时间从 DB 重建 | `_rebuild_snapshot_times_from_db()` 查询 intraday_snapshots，不再依赖进程内存 |
+| 5 | Major | raw_quote 填充结构化行情 | `_extract_quote_data()` 提取 open/prev_close/high/low/volume/amount/turnover_rate/source |
+| 6 | Major | 多市场按 market_dates 查询 | timeline 加载使用 per-market query_date |
+| 7 | Minor | 指数数据降级策略 | status 字段 + fail-open + prompt 标注"数据缺失，勿臆测" |
+
+### 新增配置
+
+| 配置 | 默认值 | 说明 |
+|------|--------|------|
+| `intraday_market_snapshot_enabled` | `true` | 启用大盘指数快照 |
+| `intraday_market_indices_cn` | `000001,399001,399006` | A 股指数代码 |
+| `intraday_market_indices_hk` | `HSI,HSTECH` | 港股指数代码 |
+| `intraday_market_indices_us` | `^GSPC,^IXIC` | 美股指数代码 |
+
+### 新增数据库表
+
+```sql
+CREATE TABLE intraday_market_snapshots (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    snapshot_id TEXT NOT NULL, run_id TEXT,
+    query_date TEXT NOT NULL, market TEXT NOT NULL,
+    market_local_timestamp TEXT, index_code TEXT NOT NULL,
+    index_name TEXT, current_price REAL, open_price REAL,
+    prev_close REAL, high_price REAL, low_price REAL,
+    change_pct REAL, volume REAL, amount REAL,
+    source TEXT, status TEXT NOT NULL DEFAULT 'valid',
+    raw_quote TEXT, created_at TEXT NOT NULL,
+    UNIQUE(snapshot_id, market, index_code)
+);
+```
+
+### 修改文件
+
+| 文件 | 改动 |
+|------|------|
+| `src/core/intraday_monitor.py` | 指数快照、timeline 构建、raw_quote 填充、DB 快照时间重建 |
+| `src/core/intraday_prompt.py` | 新参数 + 3 走势段落 |
+| `src/config.py` | 4 新配置项 |
+
+### 测试
+
+**3277 passed, 16 failed** (16 failed 为预存已知问题，无回归)
