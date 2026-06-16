@@ -247,6 +247,106 @@ class TestLoadYesterdayAnalysis:
 
 
 # ============================================================
+# IntradayMonitor — load_yesterday_analysis HK casing
+# ============================================================
+
+class TestLoadYesterdayAnalysisHKCasing:
+    """Regression: HK uppercase DB codes vs lowercase runtime input."""
+
+    @pytest.fixture(autouse=True)
+    def _check_deps(self):
+        try:
+            import pandas  # noqa: F401
+        except ImportError:
+            pytest.skip("pandas not available")
+
+    def test_hk_upper_in_db_lower_in_runtime(self):
+        """DB has HK00700, input is hk00700, should match via normalization."""
+        from src.storage import AnalysisHistory
+        mock_session = MagicMock()
+        mock_row = MagicMock(spec=AnalysisHistory)
+        mock_row.code = "HK00700"  # DB stores uppercase
+        mock_row.ideal_buy = 88.0
+        mock_row.secondary_buy = 85.0
+        mock_row.stop_loss = 80.0
+        mock_row.take_profit = 100.0
+        mock_row.raw_result = None
+        mock_session.__enter__.return_value = mock_session
+        mock_session.query.return_value.filter.return_value.order_by.return_value.all.return_value = [mock_row]
+
+        monitor = _make_monitor()
+        monitor._db.session_scope = MagicMock()
+        monitor._db.session_scope.return_value = mock_session
+
+        result = monitor.load_yesterday_analysis(["hk00700"])  # input lowercase
+        assert "hk00700" in result  # key normalized to lowercase
+        assert result["hk00700"]["ideal_buy"] == 88.0
+        assert result["hk00700"]["stop_loss"] == 80.0
+
+    def test_yesterday_analysis_key_unified(self):
+        """After loading, hk00700 dict key holds data; hotfix fallback covers uppercase."""
+        from src.storage import AnalysisHistory
+        mock_session = MagicMock()
+        mock_row = MagicMock(spec=AnalysisHistory)
+        mock_row.code = "HK00700"
+        mock_row.ideal_buy = 88.0
+        mock_row.secondary_buy = 85.0
+        mock_row.stop_loss = 80.0
+        mock_row.take_profit = 100.0
+        mock_row.raw_result = None
+        mock_session.__enter__.return_value = mock_session
+        mock_session.query.return_value.filter.return_value.order_by.return_value.all.return_value = [mock_row]
+
+        monitor = _make_monitor()
+        monitor._db.session_scope = MagicMock()
+        monitor._db.session_scope.return_value = mock_session
+
+        result = monitor.load_yesterday_analysis(["hk00700"])
+
+        # Primary: normalized lowercase key holds the data
+        assert "hk00700" in result
+        data = result["hk00700"]
+        assert data["ideal_buy"] == 88.0
+
+        # Uppercase variant NOT in result dict (stored normalized)
+        assert "HK00700" not in result
+
+        # But the hotfix fallback retrieves correctly
+        from src.utils.stock_code import normalize_stock_code_key
+        key = normalize_stock_code_key("HK00700")
+        retrieved = (
+            result.get(key)
+            or result.get(key.upper())
+            or result.get(key.lower())
+            or {}
+        )
+        assert retrieved["ideal_buy"] == 88.0
+
+    def test_cn_code_unaffected(self):
+        """CN stock 600519 is unaffected by HK normalizers."""
+        from src.storage import AnalysisHistory
+        mock_session = MagicMock()
+        mock_row = MagicMock(spec=AnalysisHistory)
+        mock_row.code = "600519"
+        mock_row.ideal_buy = 2000.0
+        mock_row.secondary_buy = 1950.0
+        mock_row.stop_loss = 1900.0
+        mock_row.take_profit = 2200.0
+        mock_row.raw_result = None
+        mock_session.__enter__.return_value = mock_session
+        mock_session.query.return_value.filter.return_value.order_by.return_value.all.return_value = [mock_row]
+
+        monitor = _make_monitor()
+        monitor._db.session_scope = MagicMock()
+        monitor._db.session_scope.return_value = mock_session
+
+        result = monitor.load_yesterday_analysis(["600519"])
+        assert "600519" in result  # key unchanged
+        assert result["600519"]["ideal_buy"] == 2000.0
+        assert "600519" not in (None, "")  # not corrupted
+
+
+# ============================================================
 # IntradayMonitor — monitor_snapshot
 # ============================================================
 

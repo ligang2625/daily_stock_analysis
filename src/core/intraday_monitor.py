@@ -36,6 +36,7 @@ from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 from src.core.intraday_prompt import format_intraday_event_time
 from data_provider.realtime_types import SnapshotQuoteProcessResult, SnapshotQuoteStatus
+from src.utils.stock_code import normalize_stock_code_key, normalize_stock_code_for_history_query
 
 logger = logging.getLogger(__name__)
 
@@ -531,12 +532,15 @@ class IntradayMonitor:
 
                     target_date_str = target_trading_date.strftime("%Y-%m-%d")
 
+                    # Normalize codes for DB query (HK uppercase for analysis_history)
+                    query_codes = [normalize_stock_code_for_history_query(c) for c in codes_in_market]
+
                     # --- Primary query: new columns, per-market date ---
                     primary_rows = (
                         session.query(AnalysisHistory)
                         .filter(
                             and_(
-                                AnalysisHistory.code.in_(codes_in_market),
+                                AnalysisHistory.code.in_(query_codes),
                                 AnalysisHistory.effective_trading_date == target_trading_date,
                                 AnalysisHistory.analysis_phase == 'postmarket',
                             )
@@ -544,17 +548,24 @@ class IntradayMonitor:
                         .order_by(AnalysisHistory.created_at.desc())
                         .all()
                     )
+                    if len(primary_rows) == 0 and codes_in_market:
+                        sample = codes_in_market[:3]
+                        logger.warning(
+                            "load_yesterday_analysis market=%s date=%s input_codes=%d matched=0 sample_input=%s hint='try uppercase HK prefix'",
+                            market, target_date_str, len(codes_in_market), sample,
+                        )
                     all_primary.extend(primary_rows)
-                    primary_codes = {str(row.code or "").strip() for row in primary_rows}
+                    primary_codes = {normalize_stock_code_key(str(row.code or "").strip()) for row in primary_rows}
 
                     # --- Fallback: old records only (no new columns) ---
-                    remaining_codes = [c for c in codes_in_market if c not in primary_codes]
+                    remaining_codes = [c for c in codes_in_market if normalize_stock_code_key(c) not in primary_codes]
                     if remaining_codes and allow_fallback:
+                        remaining_query_codes = [normalize_stock_code_for_history_query(c) for c in remaining_codes]
                         fallback_rows = (
                             session.query(AnalysisHistory)
                             .filter(
                                 and_(
-                                    AnalysisHistory.code.in_(remaining_codes),
+                                    AnalysisHistory.code.in_(remaining_query_codes),
                                     AnalysisHistory.analysis_phase.is_(None),
                                     AnalysisHistory.effective_trading_date.is_(None),
                                     func.date(AnalysisHistory.created_at) >= target_date_str,
@@ -580,10 +591,10 @@ class IntradayMonitor:
                 all_rows = list(all_primary) + list(all_fallback)
 
                 # --- Diagnostic logging when primary query misses ---
-                primary_codes_all = {str(row.code or "").strip() for row in all_primary}
+                primary_codes_all = {normalize_stock_code_key(str(row.code or "").strip()) for row in all_primary}
                 missed_codes: Dict[str, List[str]] = {}
                 for market, codes_in_market in by_market.items():
-                    missed = [c for c in codes_in_market if c not in primary_codes_all]
+                    missed = [c for c in codes_in_market if normalize_stock_code_key(c) not in primary_codes_all]
                     if missed:
                         missed_codes[market] = missed
 
@@ -594,6 +605,7 @@ class IntradayMonitor:
                     )
                     # Diagnostic 1: same code + effective_trading_date but different phase
                     for market, missed_list in missed_codes.items():
+                        missed_query_codes = [normalize_stock_code_for_history_query(c) for c in missed_list]
                         if get_effective_trading_date:
                             try:
                                 ttd = get_effective_trading_date(market)
@@ -610,7 +622,7 @@ class IntradayMonitor:
                             )
                             .filter(
                                 and_(
-                                    AnalysisHistory.code.in_(missed_list),
+                                    AnalysisHistory.code.in_(missed_query_codes),
                                     AnalysisHistory.effective_trading_date == ttd,
                                     AnalysisHistory.analysis_phase != 'postmarket',
                                     AnalysisHistory.analysis_phase.isnot(None),
@@ -635,7 +647,7 @@ class IntradayMonitor:
                             )
                             .filter(
                                 and_(
-                                    AnalysisHistory.code.in_(missed_list),
+                                    AnalysisHistory.code.in_(missed_query_codes),
                                     AnalysisHistory.analysis_phase == 'auto',
                                 )
                             )
@@ -658,7 +670,7 @@ class IntradayMonitor:
                             )
                             .filter(
                                 and_(
-                                    AnalysisHistory.code.in_(missed_list),
+                                    AnalysisHistory.code.in_(missed_query_codes),
                                     AnalysisHistory.effective_trading_date.is_(None),
                                     AnalysisHistory.analysis_phase.isnot(None),
                                 )
@@ -678,9 +690,12 @@ class IntradayMonitor:
                 seen: set = set()
                 for row in all_rows:
                     code = str(row.code or "").strip()
-                    if not code or code in seen:
+                    if not code:
                         continue
-                    seen.add(code)
+                    key = normalize_stock_code_key(code)
+                    if key in seen:
+                        continue
+                    seen.add(key)
 
                     ideal = float(row.ideal_buy) if row.ideal_buy is not None else None
                     secondary = float(row.secondary_buy) if row.secondary_buy is not None else None
@@ -700,7 +715,7 @@ class IntradayMonitor:
                         except Exception:
                             pass
 
-                    result[code] = {
+                    result[key] = {
                         "ideal_buy": ideal,
                         "secondary_buy": secondary,
                         "stop_loss": stop,
@@ -1133,7 +1148,13 @@ class IntradayMonitor:
         name = str(quote.name or "")
 
         # Compare with thresholds
-        yesterday = self._yesterday_analysis.get(code, {})
+        key = normalize_stock_code_key(code)
+        yesterday = (
+            self._yesterday_analysis.get(key)
+            or self._yesterday_analysis.get(key.upper())
+            or self._yesterday_analysis.get(key.lower())
+            or {}
+        )
         event_count = 0
         if not any(yesterday.values()):
             event = IntradayEvent(
@@ -1208,7 +1229,13 @@ class IntradayMonitor:
         change = float(quote.change_pct) if quote.change_pct is not None else None
         name = str(quote.name or "")
 
-        yesterday = self._yesterday_analysis.get(code, {})
+        key = normalize_stock_code_key(code)
+        yesterday = (
+            self._yesterday_analysis.get(key)
+            or self._yesterday_analysis.get(key.upper())
+            or self._yesterday_analysis.get(key.lower())
+            or {}
+        )
         event_count = 0
         if not any(yesterday.values()):
             event = IntradayEvent(

@@ -128,7 +128,7 @@ class AlertWorker:
         runtime_rules = self._load_runtime_rules(config)
         stats["loaded"] = len(runtime_rules)
         if not runtime_rules:
-            logger.info("[AlertWorker] No active alert rules loaded")
+            logger.warning("[AlertWorker] No enabled alert rules loaded. Market Light alerts will not run. Configure alert_rules or Alert API rules.")
             return stats
 
         monitor = EventMonitor()
