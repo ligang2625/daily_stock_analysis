@@ -57,7 +57,7 @@ from src.config import get_config
 
 logger = logging.getLogger(__name__)
 T = TypeVar("T")
-CURRENT_SCHEMA_VERSION = "2026-06-05-create-all-baseline"
+CURRENT_SCHEMA_VERSION = "2026-06-17-phase1-payload-split"
 
 # SQLAlchemy ORM 基类
 Base = declarative_base()
@@ -93,18 +93,21 @@ class DatabaseSchemaMigration(Base):
 class StockDaily(Base):
     """
     股票日线数据模型
-    
+
     存储每日行情数据和计算的技术指标
     支持多股票、多日期的唯一约束
     """
     __tablename__ = 'stock_daily'
-    
+
     # 主键
     id = Column(Integer, primary_key=True, autoincrement=True)
-    
+
     # 股票代码（如 600519, 000001）
     code = Column(String(10), nullable=False, index=True)
-    
+
+    # 规范化股票代码（CN: 600519, HK: HK00700, US: AAPL）
+    code_norm = Column(String(10), nullable=True, index=True)
+
     # 交易日期
     date = Column(Date, nullable=False, index=True)
     
@@ -249,6 +252,8 @@ class AnalysisHistory(Base):
 
     # 股票信息
     code = Column(String(10), nullable=False, index=True)
+    code_norm = Column(String(10), nullable=True, index=True)  # CN: 600519, HK: HK00700, US: AAPL
+    market = Column(String(8), nullable=True)  # cn / hk / us
     name = Column(String(50))
     report_type = Column(String(16), index=True)
 
@@ -258,7 +263,7 @@ class AnalysisHistory(Base):
     trend_prediction = Column(String(50))
     analysis_summary = Column(Text)
 
-    # 详细数据
+    # 详细数据 (legacy payload columns kept for backward compat, Phase 2 may archive)
     raw_result = Column(Text)
     news_content = Column(Text)
     context_snapshot = Column(Text)
@@ -269,6 +274,14 @@ class AnalysisHistory(Base):
     stop_loss = Column(Float)
     take_profit = Column(Float)
 
+    # Phase 1 hot fields extracted from payload
+    model_used = Column(String(128), nullable=True)
+    current_price = Column(Float, nullable=True)
+    change_pct = Column(Float, nullable=True)
+    volume_ratio = Column(Float, nullable=True)
+    turnover_rate = Column(Float, nullable=True)
+    market_phase_summary = Column(Text, nullable=True)
+
     # 分析阶段归属 (premarket / intraday / postmarket / auto / market_review)
     analysis_phase = Column(String(16), nullable=True, index=True)
 
@@ -276,6 +289,7 @@ class AnalysisHistory(Base):
     effective_trading_date = Column(Date, nullable=True, index=True)
 
     created_at = Column(DateTime, default=datetime.now, index=True)
+    updated_at = Column(DateTime, nullable=True)
 
     __table_args__ = (
         Index('ix_analysis_code_time', 'code', 'created_at'),
@@ -287,6 +301,8 @@ class AnalysisHistory(Base):
             'id': self.id,
             'query_id': self.query_id,
             'code': self.code,
+            'code_norm': self.code_norm,
+            'market': self.market,
             'name': self.name,
             'report_type': self.report_type,
             'analysis_phase': self.analysis_phase,
@@ -301,9 +317,38 @@ class AnalysisHistory(Base):
             'secondary_buy': self.secondary_buy,
             'stop_loss': self.stop_loss,
             'take_profit': self.take_profit,
+            'model_used': self.model_used,
+            'current_price': self.current_price,
+            'change_pct': self.change_pct,
+            'volume_ratio': self.volume_ratio,
+            'turnover_rate': self.turnover_rate,
+            'market_phase_summary': self.market_phase_summary,
             'effective_trading_date': self.effective_trading_date.isoformat() if self.effective_trading_date else None,
             'created_at': self.created_at.isoformat() if self.created_at else None,
         }
+
+
+class AnalysisHistoryPayload(Base):
+    """
+    Large payload columns split from AnalysisHistory to keep hot queries fast.
+
+    Each row has a 1:1 relationship with analysis_history via history_id.
+    """
+
+    __tablename__ = 'analysis_history_payload'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    history_id = Column(Integer, ForeignKey('analysis_history.id'), nullable=False, unique=True, index=True)
+    raw_result = Column(Text)
+    news_content = Column(Text)
+    context_snapshot = Column(Text)
+    payload_size = Column(Integer, nullable=True)
+    compressed = Column(Boolean, nullable=False, default=False)
+    created_at = Column(DateTime, default=datetime.now)
+
+    __table_args__ = (
+        Index('ix_analysis_payload_history_id', 'history_id'),
+    )
 
 
 class BacktestResult(Base):
@@ -993,18 +1038,53 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
                 conn = session.connection()
                 from sqlalchemy import text as sa_text
 
+                # --- Phase 1 additive columns on analysis_history ---
                 info = conn.execute(sa_text("PRAGMA table_info('analysis_history')")).fetchall()
                 existing_cols = {row[1] for row in info}
-                if 'analysis_phase' not in existing_cols:
+
+                phase1_columns = {
+                    'analysis_phase': 'VARCHAR(16)',
+                    'effective_trading_date': 'DATE',
+                    'code_norm': 'VARCHAR(10)',
+                    'market': 'VARCHAR(8)',
+                    'model_used': 'VARCHAR(128)',
+                    'current_price': 'FLOAT',
+                    'change_pct': 'FLOAT',
+                    'volume_ratio': 'FLOAT',
+                    'turnover_rate': 'FLOAT',
+                    'market_phase_summary': 'TEXT',
+                    'updated_at': 'DATETIME',
+                }
+                for col_name, col_type in phase1_columns.items():
+                    if col_name not in existing_cols:
+                        conn.execute(sa_text(
+                            f"ALTER TABLE analysis_history ADD COLUMN {col_name} {col_type}"
+                        ))
+                        logger.info("Schema migration: added analysis_history.%s", col_name)
+
+                # --- code_norm on stock_daily ---
+                sd_info = conn.execute(sa_text("PRAGMA table_info('stock_daily')")).fetchall()
+                sd_cols = {row[1] for row in sd_info}
+                if 'code_norm' not in sd_cols:
                     conn.execute(sa_text(
-                        "ALTER TABLE analysis_history ADD COLUMN analysis_phase VARCHAR(16)"
+                        "ALTER TABLE stock_daily ADD COLUMN code_norm VARCHAR(10)"
                     ))
-                    logger.info("Schema migration: added analysis_history.analysis_phase")
-                if 'effective_trading_date' not in existing_cols:
-                    conn.execute(sa_text(
-                        "ALTER TABLE analysis_history ADD COLUMN effective_trading_date DATE"
-                    ))
-                    logger.info("Schema migration: added analysis_history.effective_trading_date")
+                    logger.info("Schema migration: added stock_daily.code_norm")
+
+                # --- analysis_history_payload table ---
+                conn.execute(sa_text(
+                    "CREATE TABLE IF NOT EXISTS analysis_history_payload ("
+                    "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                    "  history_id INTEGER NOT NULL UNIQUE,"
+                    "  raw_result TEXT,"
+                    "  news_content TEXT,"
+                    "  context_snapshot TEXT,"
+                    "  payload_size INTEGER,"
+                    "  compressed BOOLEAN NOT NULL DEFAULT 0,"
+                    "  created_at DATETIME,"
+                    "  FOREIGN KEY (history_id) REFERENCES analysis_history(id)"
+                    ")"
+                ))
 
                 # intraday_monitor_state table for persistent restart-safe markers
                 conn.execute(sa_text(
@@ -1014,6 +1094,21 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
                     "  updated_at TEXT NOT NULL"
                     ")"
                 ))
+
+                # --- Phase 1 compound indexes ---
+                _INDEXES = [
+                    "CREATE INDEX IF NOT EXISTS ix_analysis_yesterday_lookup_norm ON analysis_history (code_norm, analysis_phase, effective_trading_date, report_type, created_at DESC)",
+                    "CREATE INDEX IF NOT EXISTS ix_analysis_market_review_date ON analysis_history (report_type, analysis_phase, effective_trading_date, created_at DESC)",
+                    "CREATE INDEX IF NOT EXISTS ix_analysis_created_id ON analysis_history (created_at DESC, id DESC)",
+                    "CREATE INDEX IF NOT EXISTS ix_analysis_payload_history_id ON analysis_history_payload (history_id)",
+                    "CREATE INDEX IF NOT EXISTS ix_stock_daily_norm_date ON stock_daily (code_norm, date)",
+                ]
+                for idx_sql in _INDEXES:
+                    try:
+                        conn.execute(sa_text(idx_sql))
+                    except Exception as exc:
+                        logger.warning("Index creation skipped (non-fatal): %s — %s", idx_sql[:80], exc)
+
                 session.commit()
         except Exception as exc:
             logger.warning("Schema migration error (non-fatal): %s", exc)
@@ -1540,6 +1635,9 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
     ) -> int:
         """
         保存分析结果历史记录
+
+        Phase 1: splits hot fields into analysis_history and large payload
+        fields into analysis_history_payload.
         """
         if result is None:
             return 0
@@ -1550,33 +1648,130 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
         if save_snapshot and context_snapshot is not None:
             context_text = self._safe_json_dumps(context_snapshot)
 
+        # Compute canonical storage fields
+        raw_code = getattr(result, 'code', '') or ''
+        try:
+            from src.services.stock_code_utils import (
+                normalize_stock_code_for_storage,
+                normalize_market_region,
+            )
+            code_norm = normalize_stock_code_for_storage(raw_code)
+            market = normalize_market_region(None, code=raw_code)
+        except Exception:
+            code_norm = raw_code
+            market = None
+
+        # Extract hot fields from result
+        now = datetime.now()
+        raw_result_json = self._safe_json_dumps(raw_result)
+        news_content_text = news_content or ''
+        context_text_val = context_text
+
+        def _ensure_str(v: Optional[str]) -> str:
+            return v if v is not None else ''
+
+        model_used_val = getattr(result, 'model_used', None)
+        current_price_val = getattr(result, 'current_price', None)
+        change_pct_val = getattr(result, 'change_pct', None)
+
+        # Try to extract real-time fields from context_snapshot if available
+        volume_ratio_val = None
+        turnover_rate_val = None
+        market_phase_summary_val = None
+        if isinstance(context_snapshot, dict):
+            enhanced = context_snapshot.get("enhanced_context")
+            realtime = enhanced.get("realtime") if isinstance(enhanced, dict) else None
+            quote_raw = context_snapshot.get("realtime_quote_raw")
+            quote = context_snapshot.get("realtime_quote")
+            for source in (realtime, quote_raw, quote):
+                if not isinstance(source, dict):
+                    continue
+                if current_price_val is None:
+                    current_price_val = source.get("price")
+                if change_pct_val is None:
+                    raw_pct = source.get("change_pct")
+                    if isinstance(raw_pct, str):
+                        raw_pct = raw_pct.replace('%', '').strip()
+                    change_pct_val = raw_pct
+                if volume_ratio_val is None:
+                    volume_ratio_val = source.get("volume_ratio") or source.get("volumeRatio")
+                if turnover_rate_val is None:
+                    turnover_rate_val = source.get("turnover_rate") or source.get("turnoverRate") or source.get("turnover")
+            try:
+                if context_text_val:
+                    from src.market_phase_summary import (
+                        extract_market_phase_summary as _extract_mps,
+                    )
+                    _mps_dict = _extract_mps(context_text_val)
+                    if isinstance(_mps_dict, dict):
+                        market_phase_summary_val = self._safe_json_dumps(_mps_dict)
+            except Exception:
+                pass
+
+        def _safe_float_or_none(v: Any) -> Optional[float]:
+            if v is None:
+                return None
+            try:
+                f = float(v)
+                return f if f == f else None
+            except (TypeError, ValueError):
+                return None
+
         try:
             def _write(session: Session) -> int:
-                session.add(
-                    AnalysisHistory(
-                        query_id=query_id,
-                        code=result.code,
-                        name=result.name,
-                        report_type=report_type,
-                        sentiment_score=result.sentiment_score,
-                        operation_advice=result.operation_advice,
-                        trend_prediction=result.trend_prediction,
-                        analysis_summary=result.analysis_summary,
-                        raw_result=self._safe_json_dumps(raw_result),
-                        news_content=news_content,
-                        context_snapshot=context_text,
-                        ideal_buy=sniper_points.get("ideal_buy"),
-                        secondary_buy=sniper_points.get("secondary_buy"),
-                        stop_loss=sniper_points.get("stop_loss"),
-                        take_profit=sniper_points.get("take_profit"),
-                        analysis_phase=analysis_phase,
-                        effective_trading_date=effective_trading_date,
-                        created_at=datetime.now(),
-                    )
+                history = AnalysisHistory(
+                    query_id=query_id,
+                    code=raw_code,
+                    code_norm=code_norm,
+                    market=market,
+                    name=result.name,
+                    report_type=report_type,
+                    sentiment_score=result.sentiment_score,
+                    operation_advice=result.operation_advice,
+                    trend_prediction=result.trend_prediction,
+                    analysis_summary=result.analysis_summary,
+                    raw_result=raw_result_json,
+                    news_content=news_content_text,
+                    context_snapshot=context_text_val,
+                    ideal_buy=sniper_points.get("ideal_buy"),
+                    secondary_buy=sniper_points.get("secondary_buy"),
+                    stop_loss=sniper_points.get("stop_loss"),
+                    take_profit=sniper_points.get("take_profit"),
+                    analysis_phase=analysis_phase,
+                    effective_trading_date=effective_trading_date,
+                    model_used=model_used_val,
+                    current_price=_safe_float_or_none(current_price_val),
+                    change_pct=_safe_float_or_none(change_pct_val),
+                    volume_ratio=_safe_float_or_none(volume_ratio_val),
+                    turnover_rate=_safe_float_or_none(turnover_rate_val),
+                    market_phase_summary=market_phase_summary_val,
+                    created_at=now,
+                    updated_at=now,
                 )
+                session.add(history)
+                session.flush()  # get history.id
+
+                # Persist payload in separate table
+                ctx_for_payload = _ensure_str(context_text_val)
+                payload_size = (
+                    len(raw_result_json.encode('utf-8'))
+                    + len(news_content_text.encode('utf-8'))
+                    + len(ctx_for_payload.encode('utf-8'))
+                )
+                payload_row = AnalysisHistoryPayload(
+                    history_id=history.id,
+                    raw_result=raw_result_json,
+                    news_content=news_content_text,
+                    context_snapshot=ctx_for_payload,
+                    payload_size=payload_size,
+                    compressed=False,
+                    created_at=now,
+                )
+                session.add(payload_row)
                 return 1
+
             return self._run_write_transaction(
-                f"save_analysis_history[{result.code}]",
+                f"save_analysis_history[{raw_code}]",
                 _write,
             )
         except Exception as e:
@@ -1786,6 +1981,61 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
             ).scalars().first()
             return result
 
+    def get_analysis_history_payload(self, history_id: int) -> Optional[AnalysisHistoryPayload]:
+        """
+        Get the payload row for an analysis history record.
+
+        Args:
+            history_id: The analysis_history.id
+
+        Returns:
+            AnalysisHistoryPayload or None
+        """
+        with self.get_session() as session:
+            return session.execute(
+                select(AnalysisHistoryPayload).where(
+                    AnalysisHistoryPayload.history_id == history_id
+                )
+            ).scalars().first()
+
+    def get_analysis_history_with_payload(self, record_id: int) -> Optional[Dict[str, Any]]:
+        """
+        Get analysis history record with its payload merged in.
+
+        Returns None if the history record does not exist.
+
+        Args:
+            record_id: The analysis_history.id
+
+        Returns:
+            Dict with history fields and payload fields, or None
+        """
+        with self.get_session() as session:
+            history = session.execute(
+                select(AnalysisHistory).where(AnalysisHistory.id == record_id)
+            ).scalars().first()
+            if history is None:
+                return None
+
+            payload = session.execute(
+                select(AnalysisHistoryPayload).where(
+                    AnalysisHistoryPayload.history_id == record_id
+                )
+            ).scalars().first()
+
+            result = history.to_dict()
+            if payload is not None:
+                result['payload_raw_result'] = payload.raw_result
+                result['payload_news_content'] = payload.news_content
+                result['payload_context_snapshot'] = payload.context_snapshot
+                result['payload_size'] = payload.payload_size
+            else:
+                # Fallback to legacy columns
+                result['payload_raw_result'] = history.raw_result
+                result['payload_news_content'] = history.news_content
+                result['payload_context_snapshot'] = history.context_snapshot
+            return result
+
     def delete_analysis_history_records(self, record_ids: List[int]) -> int:
         """
         删除指定的分析历史记录。
@@ -1813,6 +2063,12 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
             if not existing_ids:
                 return 0
 
+            # Delete payload rows first (FK constraint in payload table)
+            session.execute(
+                delete(AnalysisHistoryPayload).where(
+                    AnalysisHistoryPayload.history_id.in_(existing_ids)
+                )
+            )
             session.execute(
                 delete(DecisionSignalRecord).where(
                     and_(
@@ -1972,11 +2228,20 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
             return 0
 
         now = datetime.now()
+        # Compute canonical stock code for the normalized column
+        code_norm_val = None
+        try:
+            from src.services.stock_code_utils import normalize_stock_code_for_storage
+            code_norm_val = normalize_stock_code_for_storage(code)
+        except Exception:
+            pass
+
         records_by_date: Dict[date, Dict[str, Any]] = {}
         for row in df.to_dict(orient='records'):
             row_date = self._normalize_daily_date(row.get('date'))
             records_by_date[row_date] = {
                 'code': code,
+                'code_norm': code_norm_val,
                 'date': row_date,
                 'open': self._normalize_sql_value(row.get('open')),
                 'high': self._normalize_sql_value(row.get('high')),
@@ -2035,6 +2300,7 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
                         stmt.on_conflict_do_update(
                             index_elements=['code', 'date'],
                             set_={
+                                'code_norm': excluded.code_norm,
                                 'open': excluded.open,
                                 'high': excluded.high,
                                 'low': excluded.low,
@@ -2083,6 +2349,8 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
                     existing.ma20 = record['ma20']
                     existing.volume_ratio = record['volume_ratio']
                     existing.data_source = record['data_source']
+                    if record.get('code_norm'):
+                        existing.code_norm = record['code_norm']
                     existing.updated_at = record['updated_at']
                 return new_count
 

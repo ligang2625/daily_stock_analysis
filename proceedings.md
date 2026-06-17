@@ -151,3 +151,57 @@ CREATE TABLE intraday_market_snapshots (
 ### 测试
 
 **949 passed, 1 failed, 2 skipped** (1 failed 为预存已知 cache 问题，无回归)
+
+## Session 5: Phase 1 — 主库持久化层优化 (2026-06-17)
+
+### 新增特性 / 重构
+
+| # | Priority | Change | Key Detail |
+|---|----------|--------|------------|
+| 1 | Major | 股票代码规范化存储 | `normalize_stock_code_for_storage()` / `normalize_market_region()` in `stock_code_utils.py`；CN→600519, HK→HK00700, US→AAPL |
+| 2 | Major | AnalysisHistory 热字段与大 payload 拆分 | `analysis_history_payload` 表 (FK→history_id)；`raw_result`/`news_content`/`context_snapshot` 移入 payload；新增 11 个热列 (`code_norm`, `market`, `model_used`, `current_price`, `change_pct`, `volume_ratio`, `turnover_rate`, `market_phase_summary`, `updated_at`) |
+| 3 | Major | Schema migration 框架 | `_apply_schema_migrations()` 幂等升级：加列、建表、建索引、回填。JSON 解析失败非致命 (log+skip) |
+| 4 | Major | 写路径拆分 | `save_analysis_history()` 同时写热列 + payload 表；`save_daily_data()` 写 `code_norm` |
+| 5 | Major | 读路径懒加载 | HistoryService list 只读热列，detail 按 history_id 懒加载 payload |
+| 6 | Major | 5 条复合索引 | `ix_analysis_yesterday_lookup_norm`, `ix_analysis_market_review_date`, `ix_analysis_created_id`, `ix_analysis_payload_history_id`, `ix_stock_daily_norm_date` |
+| 7 | Major | 历史库基础骨架 | `HistoricalDatabaseManager`（独立单例）+ `archive_runs` 表；配置 `historical_database_path` / `archive_retention_days` |
+| 8 | Major | 安全归档 CLI | `python -m src.maintenance.archive --days 5 --dry-run`；`--cutoff-date`/`--skip-vacuum`；归档记录 ledger，异常→failed，VACUUM 仅成功后 |
+| 9 | Major | 盘中 code_norm 查询 | `load_yesterday_analysis()` 用 `code_norm.in_()` 优先命中复合索引，`code.in_()` 兜底 |
+| 10 | Fixed | 3 个预存测试修复 | `test_history_detail_accepts_dict_raw_result` (hot column precedence), `test_history_detail_handles_missing_overview_when_snapshot_disabled` (None→''), `test_history_list_includes_timeline_summary_fields` (change_pct % strip) |
+| 11 | Fixed | 5 个 config registry 项补全 | `INTRADAY_UNKNOWN_MARKET_POLICY`, `INTRADAY_CALENDAR_FAIL_OPEN`, `INTRADAY_LEGACY_FALLBACK_ENABLED`, `INTRADAY_RESET_ON_START`, `INTRADAY_FORCE_RUN` 补 docs；`INTRADAY_MONITOR_ENABLED` 加入 `WEB_SETTINGS_HIDDEN_FROM_UI` |
+
+### 新增配置
+
+| 配置 | 默认值 | 说明 |
+|------|--------|------|
+| `historical_database_path` | `./data/historical_market.db` | 历史库路径 |
+| `archive_retention_days` | `5` | 归档保留天数 |
+
+### 新增文件
+
+| 文件 | 说明 |
+|------|------|
+| `src/services/stock_code_utils.py` | 股票代码规范化工具 |
+| `src/storage_historical.py` | 历史库管理器 + archive_runs 表 |
+| `src/maintenance/__init__.py` | 维护工具包 |
+| `src/maintenance/archive.py` | 安全归档 CLI |
+| `tests/test_code_norm_migration.py` | 34 测试：规范化 |
+| `tests/test_storage_payload_split.py` | 7 测试：拆分 + 迁移 |
+| `tests/test_archive_dry_run.py` | 4 测试：归档 |
+| `tests/test_history_service_payload_compat.py` | 7 测试：兼容性 |
+
+### 修改文件
+
+| 文件 | 改动 |
+|------|------|
+| `src/storage.py` | `AnalysisHistoryPayload`, 11 hot columns, `code_norm` on StockDaily, 5 indexes, save split, payload helpers, schema migration |
+| `src/services/stock_code_utils.py` | NEW: `normalize_stock_code_for_storage()`, `normalize_market_region()` |
+| `src/services/history_service.py` | Lazy payload loading, hot column precedence |
+| `src/core/intraday_monitor.py` | `load_yesterday_analysis()` code_norm query |
+| `src/core/config_registry.py` | 5 docs entries, `INTRADAY_MONITOR_ENABLED` hidden |
+| `src/config.py` | `historical_database_path`, `archive_retention_days` |
+| `tests/test_analysis_history.py` | 3 预存测试修复 |
+
+### 测试
+
+**3331 passed, 14 failed, 2 skipped** (14 failed 均为预存已知问题，零回归)

@@ -80,6 +80,7 @@ WEB_SETTINGS_HIDDEN_FROM_UI = {
     "USE_PROXY",
     "PROXY_HOST",
     "PROXY_PORT",
+    "INTRADAY_MONITOR_ENABLED",
 }
 
 _FIELD_DEFINITIONS: Dict[str, Dict[str, Any]] = {
@@ -3889,7 +3890,12 @@ _FIELD_DEFINITIONS: Dict[str, Dict[str, Any]] = {
             "INTRADAY_UNKNOWN_MARKET_POLICY=skip",
             "INTRADAY_UNKNOWN_MARKET_POLICY=cn_compat",
         ],
-        "docs": [],
+        "docs": [
+            {
+                "label": "盘中监控配置说明",
+                "href": "https://github.com/ZhuLinsen/daily_stock_analysis/blob/main/.claude/proceedings.md#%E4%B8%89%E7%8E%AF%E5%A2%83%E5%8F%98%E9%87%8F",
+            },
+        ],
         "warning_codes": [],
     },
     "INTRADAY_CALENDAR_FAIL_OPEN": {
@@ -3909,7 +3915,12 @@ _FIELD_DEFINITIONS: Dict[str, Dict[str, Any]] = {
         "examples": [
             "INTRADAY_CALENDAR_FAIL_OPEN=false",
         ],
-        "docs": [],
+        "docs": [
+            {
+                "label": "盘中监控配置说明",
+                "href": "https://github.com/ZhuLinsen/daily_stock_analysis/blob/main/.claude/proceedings.md#%E4%B8%89%E7%8E%AF%E5%A2%83%E5%8F%98%E9%87%8F",
+            },
+        ],
         "warning_codes": [],
     },
     "INTRADAY_LEGACY_FALLBACK_ENABLED": {
@@ -3929,7 +3940,12 @@ _FIELD_DEFINITIONS: Dict[str, Dict[str, Any]] = {
         "examples": [
             "INTRADAY_LEGACY_FALLBACK_ENABLED=false",
         ],
-        "docs": [],
+        "docs": [
+            {
+                "label": "盘中监控配置说明",
+                "href": "https://github.com/ZhuLinsen/daily_stock_analysis/blob/main/.claude/proceedings.md#%E4%B8%89%E7%8E%AF%E5%A2%83%E5%8F%98%E9%87%8F",
+            },
+        ],
         "warning_codes": [],
     },
     "INTRADAY_RESET_ON_START": {
@@ -3949,7 +3965,12 @@ _FIELD_DEFINITIONS: Dict[str, Dict[str, Any]] = {
         "examples": [
             "INTRADAY_RESET_ON_START=false",
         ],
-        "docs": [],
+        "docs": [
+            {
+                "label": "盘中监控配置说明",
+                "href": "https://github.com/ZhuLinsen/daily_stock_analysis/blob/main/.claude/proceedings.md#%E4%B8%89%E7%8E%AF%E5%A2%83%E5%8F%98%E9%87%8F",
+            },
+        ],
         "warning_codes": [],
     },
     "INTRADAY_FORCE_RUN": {
@@ -3969,7 +3990,12 @@ _FIELD_DEFINITIONS: Dict[str, Dict[str, Any]] = {
         "examples": [
             "INTRADAY_FORCE_RUN=false",
         ],
-        "docs": [],
+        "docs": [
+            {
+                "label": "盘中监控配置说明",
+                "href": "https://github.com/ZhuLinsen/daily_stock_analysis/blob/main/.claude/proceedings.md#%E4%B8%89%E7%8E%AF%E5%A2%83%E5%8F%98%E9%87%8F",
+            },
+        ],
         "warning_codes": [],
     },
 }

@@ -867,6 +867,8 @@ class Config:
 
     # === 数据库配置 ===
     database_path: str = "./data/stock_analysis.db"
+    historical_database_path: str = "./data/historical_market.db"
+    archive_retention_days: int = 5
     sqlite_wal_enabled: bool = True
     sqlite_busy_timeout_ms: int = 5000
     sqlite_write_retry_max: int = 3

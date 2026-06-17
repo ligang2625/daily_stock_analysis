@@ -258,13 +258,19 @@ class HistoryService:
         }
 
     def _record_to_list_item_dict(self, record) -> Dict[str, Any]:
-        raw_result = parse_json_field(getattr(record, "raw_result", None))
-        model_used = raw_result.get("model_used") if isinstance(raw_result, dict) else None
-        market_fields = self._extract_history_market_fields(
-            getattr(record, "context_snapshot", None)
-        )
-        market_phase_summary = extract_market_phase_summary(getattr(record, "context_snapshot", None))
-        action_fields = self._decision_action_fields_for_record(record, raw_result)
+        # Prefer hot columns when available (Phase 1); fallback to payload for old rows
+        model_used_val = getattr(record, "model_used", None)
+        if not model_used_val:
+            raw_result = parse_json_field(getattr(record, "raw_result", None))
+            model_used_val = raw_result.get("model_used") if isinstance(raw_result, dict) else None
+
+        market_fields = self._extract_history_market_fields_for_record(record)
+        market_phase_summary = parse_json_field(getattr(record, "market_phase_summary", None))
+        if not market_phase_summary:
+            market_phase_summary = extract_market_phase_summary(getattr(record, "context_snapshot", None))
+
+        raw_result_for_action = parse_json_field(getattr(record, "raw_result", None))
+        action_fields = self._decision_action_fields_for_record(record, raw_result_for_action)
 
         return {
             "id": record.id,
@@ -278,11 +284,30 @@ class HistoryService:
             "operation_advice": record.operation_advice,
             "action": action_fields["action"],
             "action_label": action_fields["action_label"],
-            "model_used": normalize_model_used(model_used),
+            "model_used": normalize_model_used(model_used_val),
             "created_at": record.created_at.isoformat() if record.created_at else None,
             "market_phase_summary": market_phase_summary,
             **market_fields,
         }
+
+    def _extract_history_market_fields_for_record(self, record) -> Dict[str, Optional[float]]:
+        """Extract market snapshot fields, preferring hot columns; fallback to payload."""
+        hot_price = getattr(record, "current_price", None)
+        hot_change = getattr(record, "change_pct", None)
+        hot_vol = getattr(record, "volume_ratio", None)
+        hot_turnover = getattr(record, "turnover_rate", None)
+
+        # If all hot columns are populated, use them directly
+        if any(v is not None for v in (hot_price, hot_change, hot_vol, hot_turnover)):
+            return {
+                "current_price": self._safe_float(hot_price),
+                "change_pct": self._safe_float(hot_change),
+                "volume_ratio": self._safe_float(hot_vol),
+                "turnover_rate": self._safe_float(hot_turnover),
+            }
+
+        # Fallback: parse from payload for legacy rows
+        return self._extract_history_market_fields(getattr(record, "context_snapshot", None))
 
     def _resolve_record(self, record_id: str):
         """
@@ -485,7 +510,9 @@ class HistoryService:
         """
         raw_result = parse_json_field(record.raw_result)
 
-        model_used = (raw_result or {}).get("model_used") if isinstance(raw_result, dict) else None
+        model_used = getattr(record, "model_used", None)
+        if not model_used:
+            model_used = (raw_result or {}).get("model_used") if isinstance(raw_result, dict) else None
         model_used = normalize_model_used(model_used)
         sniper_points = self._get_display_sniper_points(record, raw_result)
 

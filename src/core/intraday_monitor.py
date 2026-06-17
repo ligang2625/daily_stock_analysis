@@ -528,10 +528,21 @@ class IntradayMonitor:
                 ", ".join(sorted(unknown_codes)),
             )
 
+        # Compute canonical code_norm for each stock
+        code_norm_map: Dict[str, str] = {}
+        try:
+            from src.services.stock_code_utils import normalize_stock_code_for_storage
+            for code in stock_codes:
+                norm = normalize_stock_code_for_storage(code)
+                if norm:
+                    code_norm_map[code] = norm
+        except Exception:
+            pass
+
         try:
             with self._db.session_scope() as session:
                 from src.storage import AnalysisHistory
-                from sqlalchemy import and_, func
+                from sqlalchemy import and_, func, or_
 
                 all_primary: list = []
                 all_fallback: list = []
@@ -556,16 +567,29 @@ class IntradayMonitor:
                     # Normalize codes for DB query (HK uppercase for analysis_history)
                     query_codes = [normalize_stock_code_for_history_query(c) for c in codes_in_market]
 
-                    # --- Primary query: new columns, per-market date ---
+                    # Build canonical code_norm list for indexed lookup
+                    norm_codes = []
+                    for c in codes_in_market:
+                        norm = code_norm_map.get(c)
+                        if norm:
+                            norm_codes.append(norm)
+
+                    # --- Primary query: code_norm first (hits compound index), then code fallback ---
+                    primary_conditions = [
+                        AnalysisHistory.effective_trading_date == target_trading_date,
+                        AnalysisHistory.analysis_phase == 'postmarket',
+                    ]
+                    code_conditions = []
+                    if norm_codes:
+                        code_conditions.append(AnalysisHistory.code_norm.in_(norm_codes))
+                    if query_codes:
+                        code_conditions.append(AnalysisHistory.code.in_(query_codes))
+                    if code_conditions:
+                        primary_conditions.append(or_(*code_conditions))
+
                     primary_rows = (
                         session.query(AnalysisHistory)
-                        .filter(
-                            and_(
-                                AnalysisHistory.code.in_(query_codes),
-                                AnalysisHistory.effective_trading_date == target_trading_date,
-                                AnalysisHistory.analysis_phase == 'postmarket',
-                            )
-                        )
+                        .filter(and_(*primary_conditions))
                         .order_by(AnalysisHistory.created_at.desc())
                         .all()
                     )

@@ -5,10 +5,13 @@ Shared stock code utilities.
 
 from __future__ import annotations
 
+import logging
 import re
 from typing import Optional
 
 from data_provider.base import is_bse_code
+
+logger = logging.getLogger(__name__)
 
 
 # Known exchange prefixes (case-insensitive) and the digit lengths they accept.
@@ -100,3 +103,114 @@ def normalize_code(raw: str) -> Optional[str]:
     if stripped is not None:
         return stripped
     return None
+
+
+# ---------------------------------------------------------------------------
+# Persistence-facing helpers (Phase 1)
+# ---------------------------------------------------------------------------
+
+_US_TICKER_RE = re.compile(r"^[A-Z]{1,5}$")
+
+
+def normalize_market_region(value: Optional[str], code: Optional[str] = None) -> Optional[str]:
+    """Return one of: 'cn', 'hk', 'us', or None.
+
+    Infers market region from an explicit market value or from the stock code.
+    """
+    if value is not None:
+        v = str(value).strip().lower()
+        if v in ("cn", "hk", "us"):
+            return v
+        # Accept common alias forms
+        if v in ("sh", "sz", "bj", "china", "a股"):
+            return "cn"
+        if v == "hong kong":
+            return "hk"
+        if v in ("united states", "usa"):
+            return "us"
+
+    if code is not None:
+        c = str(code).strip().upper()
+        if not c:
+            return None
+        if c.startswith("HK") and c[2:].isdigit():
+            return "hk"
+        if c.isdigit():
+            if len(c) == 5:
+                # Short HK code like 00700
+                return "hk"
+            if len(c) == 6:
+                try:
+                    if is_bse_code(c):
+                        return "cn"
+                except Exception:
+                    pass
+                return "cn"
+        if _US_TICKER_RE.match(c):
+            return "us"
+
+    return None
+
+
+def normalize_stock_code_for_storage(code: Optional[str], market: Optional[str] = None) -> Optional[str]:
+    """Return canonical DB key for persistence.
+
+    Canonical format:
+      CN: 600519 (6 digits as-is)
+      HK: HK00700 (uppercase HK prefix + 5 digits zero-padded)
+      US: AAPL (uppercase ticker)
+
+    This is a persistence-facing helper and does not change the public
+    behavior of existing input-munging functions.
+    """
+    if code is None:
+        return None
+
+    raw = str(code).strip()
+    if not raw:
+        return None
+
+    upper = raw.upper()
+
+    # Already canonical: HK + digits
+    if upper.startswith("HK") and len(upper) > 2 and upper[2:].isdigit():
+        digits = upper[2:].zfill(5)
+        return f"HK{digits}"
+
+    # Suffix .HK: 00700.HK, 1810.HK -> HK00700, HK01810
+    if "." in upper:
+        base, suffix = upper.rsplit(".", 1)
+        if suffix == "HK" and base.isdigit():
+            digits = base.zfill(5)
+            return f"HK{digits}"
+
+    # 1-5 digit numeric: HK code (e.g. 00700, 0700, 1810)
+    if upper.isdigit() and 1 <= len(upper) <= 5:
+        return f"HK{upper.zfill(5)}"
+
+    # 6-digit numeric: CN code
+    if upper.isdigit() and len(upper) == 6:
+        return upper
+
+    # Strip SH/SZ/BJ prefix for CN codes (e.g. SH600519 -> 600519)
+    if upper.startswith(("SH", "SZ", "BJ")) and len(upper) > 2:
+        candidate = upper[2:]
+        if candidate.isdigit() and len(candidate) == 6:
+            return candidate
+
+    # US ticker
+    if _US_TICKER_RE.match(upper):
+        return upper
+
+    # Try to infer market and format
+    if market is not None:
+        mkt = normalize_market_region(market, code=raw)
+        if mkt == "hk" and raw.isdigit():
+            digits = raw.zfill(5)
+            return f"HK{digits}"
+        if mkt == "us":
+            return upper
+        if mkt == "cn" and raw.isdigit():
+            return raw.zfill(6)
+
+    return upper

@@ -769,6 +769,7 @@ class AnalysisHistoryTestCase(unittest.TestCase):
             if row is None:
                 self.fail("未找到保存的历史记录")
             row.raw_result = {"model_used": "unknown", "extra": "v"}
+            row.model_used = None  # hot column should not shadow dict raw_result intent
 
             service = HistoryService(self.db)
             detail = service._record_to_detail_dict(row)
