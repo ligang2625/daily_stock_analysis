@@ -24,6 +24,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - [改进] intraday_events.raw_quote 填充结构化行情 (open/prev_close/high/low/volume/amount/turnover_rate/source)
 - [改进] 快照时间从 DB 重建(不再依赖进程内存)，多 market_dates 分别加载
 - [修复] 指数数据缺失时 prompt 明确标注不臆测大盘方向
+- [新功能] 大盘指数专用行情路由: CN→AkShare, HK/US→yfinance, 配置 intraday_index_data_source
+- [改进] 盘中决策邮件头部展示大盘指数覆盖率与数据质量告警
+- [改进] 盘中决策 prompt 输出表扩展为8列: 日内走势/大盘环境/相对强弱/数据质量
+- [修复] 大盘指数数据质量不足时邮件标注告警标记
 <!-- 新条目格式：- [类型] 描述（类型取值：新功能/改进/修复/文档/测试/chore）-->
 <!-- 每条独立一行追加到本段末尾，无需分类标题，合并时冲突最小 -->
 - [修复] 桌面发布打包改用冻结可执行文件运行时探针校验 `alphasift.dsa_adapter`，避免 macOS PyInstaller 将模块内嵌进可执行文件时被文件系统/zip 扫描误判为缺失。

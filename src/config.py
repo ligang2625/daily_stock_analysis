@@ -943,6 +943,12 @@ class Config:
     intraday_market_indices_hk: str = "HSI,HSTECH"
     # 美股大盘指数代码（逗号分隔），默认：标普500、纳斯达克综合
     intraday_market_indices_us: str = "^GSPC,^IXIC"
+    # 大盘指数数据质量门禁：有效指数快照点 / 预期总数 的最低比例（0.0=禁用，0.0-1.0）
+    intraday_min_market_index_coverage: float = 0.0
+    # 是否启用大盘指数数据质量告警邮件
+    intraday_data_quality_alert_enabled: bool = True
+    # 大盘指数数据源策略: dedicated（专用API路由）, realtime（旧行情接口）, auto（先专用后fallback）
+    intraday_index_data_source: str = "dedicated"
 
     # === 实时行情增强数据配置 ==="
     # 实时行情开关（关闭后使用历史收盘价进行分析）
@@ -1766,6 +1772,9 @@ class Config:
             intraday_market_indices_cn=os.getenv('INTRADAY_MARKET_INDICES_CN', '000001,399001,399006'),
             intraday_market_indices_hk=os.getenv('INTRADAY_MARKET_INDICES_HK', 'HSI,HSTECH'),
             intraday_market_indices_us=os.getenv('INTRADAY_MARKET_INDICES_US', '^GSPC,^IXIC'),
+            intraday_min_market_index_coverage=parse_env_float(os.getenv('INTRADAY_MIN_MARKET_INDEX_COVERAGE'), 0.0, field_name='INTRADAY_MIN_MARKET_INDEX_COVERAGE', minimum=0.0, maximum=1.0),
+            intraday_data_quality_alert_enabled=os.getenv('INTRADAY_DATA_QUALITY_ALERT_ENABLED', 'true').lower() == 'true',
+            intraday_index_data_source=os.getenv('INTRADAY_INDEX_DATA_SOURCE', 'dedicated'),
             webui_enabled=os.getenv('WEBUI_ENABLED', 'false').lower() == 'true',
             webui_host=os.getenv('WEBUI_HOST', '127.0.0.1'),
             webui_port=parse_env_int(os.getenv('WEBUI_PORT'), 8000, field_name='WEBUI_PORT', minimum=1, maximum=65535),

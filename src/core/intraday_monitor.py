@@ -1529,6 +1529,88 @@ class IntradayMonitor:
         # Load market index timelines
         market_timelines = self._load_market_timelines_for_decision(decision_markets, decision_market_dates)
 
+        # --- Market index coverage diagnostics ---
+        market_coverage_parts: List[str] = []
+        market_index_coverage_ratio: Optional[float] = None
+        mkt_coverage_info: Dict[str, Any] = {
+            'ratio': None, 'summary': None, 'quality_alert': False,
+        }
+        if decision_market_dates and decision_markets:
+            expected_indices_per_market = {}
+            for mkt in decision_markets:
+                indices = self._get_market_indices(mkt)
+                if indices:
+                    expected_indices_per_market[mkt] = len(indices)
+            expected_snapshots = len(merged_times) if merged_times else 1
+            total_valid = 0
+            total_expected = 0
+            for market in decision_markets:
+                timelines = market_timelines.get(market, [])
+                total_points = sum(len(t.get('points', [])) for t in timelines)
+                valid_points = sum(
+                    1 for t in timelines
+                    for p in t.get('points', [])
+                    if p.get('status', 'valid') != 'fetch_failed'
+                )
+                logger.info(
+                    "market_timeline_summary market=%s query_date=%s index_count=%d total_points=%d valid_points=%d",
+                    market, decision_market_dates.get(market, '?'), len(timelines),
+                    total_points, valid_points,
+                )
+                exp = expected_indices_per_market.get(market, 1) or 1
+                total_expected += exp * expected_snapshots
+                total_valid += valid_points
+                market_coverage_parts.append(
+                    f"  {market.upper()}: {valid_points}/{exp * expected_snapshots} 有效快照"
+                )
+            if total_expected > 0:
+                market_index_coverage_ratio = total_valid / total_expected
+                logger.info(
+                    "market_index_coverage total_valid=%d total_expected=%d ratio=%.1f%%",
+                    total_valid, total_expected, market_index_coverage_ratio * 100,
+                )
+        min_mkt_cov = getattr(self._config, 'intraday_min_market_index_coverage', 0.0)
+        market_quality_alert = False
+        if market_index_coverage_ratio is not None and min_mkt_cov > 0 and market_index_coverage_ratio < min_mkt_cov:
+            if getattr(self._config, 'intraday_data_quality_alert_enabled', True):
+                logger.warning(
+                    "DATA_QUALITY_ALERT: market_index_coverage=%.1f%% < threshold=%.0f%%. "
+                    "Decision email will include quality warning.",
+                    market_index_coverage_ratio * 100, min_mkt_cov * 100,
+                )
+                market_quality_alert = True
+        mkt_coverage_info = {
+            'ratio': market_index_coverage_ratio,
+            'summary': "\n".join(market_coverage_parts) if market_coverage_parts else None,
+            'quality_alert': market_quality_alert,
+        }
+
+        # --- Historical snapshot count (standalone decision) ---
+        historical_snapshot_count = 0
+        try:
+            with self._db.session_scope() as session:
+                from sqlalchemy import text as sa_text
+                primary_date = decision_market_dates.get('cn') or datetime.now().strftime('%Y-%m-%d')
+                row = session.execute(
+                    sa_text(
+                        "SELECT COUNT(*) FROM intraday_snapshots "
+                        "WHERE query_date = :qd AND snapshot_type != 'decision'"
+                    ),
+                    {"qd": primary_date},
+                ).scalar()
+                historical_snapshot_count = row or 0
+                logger.info(
+                    "historical_snapshots count=%d for query_date=%s",
+                    historical_snapshot_count, primary_date,
+                )
+        except Exception as exc:
+            logger.warning("查询历史快照数失败: %s", exc)
+
+        # --- Load market timeline stats for prompt ---
+        market_timeline_stats = self._load_market_timeline_stats_for_decision(
+            market_timelines, decision_markets, decision_market_dates,
+        )
+
         prompt = build_intraday_prompt(
             events=all_events,
             yesterday_analysis=self._yesterday_analysis,
@@ -1536,6 +1618,8 @@ class IntradayMonitor:
             markets={self._get_market_for_stock(c) for c in stock_codes if self._get_market_for_stock(c)},
             stock_timelines=stock_timelines,
             market_timelines=market_timelines,
+            market_timeline_stats=market_timeline_stats,
+            historical_snapshot_count=historical_snapshot_count,
         )
 
         # Call LLM via unified analyzer
@@ -1553,6 +1637,7 @@ class IntradayMonitor:
                 llm_status="success",
                 baseline_status=baseline_status,
                 market_dates=snapshot_market_dates,
+                market_index_coverage=mkt_coverage_info,
             )
         elif result.status == "config_error":
             logger.error("LLM config error, no email sent: %s", result.error_message)
@@ -1706,6 +1791,7 @@ class IntradayMonitor:
         llm_status: Optional[str] = None,
         baseline_status: Optional[str] = None,
         market_dates: Optional[Dict[str, str]] = None,
+        market_index_coverage: Optional[Dict[str, Any]] = None,
     ) -> None:
         """Send decision email via EmailSender with structured params."""
         if self._email_sender is None:
@@ -1734,13 +1820,24 @@ class IntradayMonitor:
 
         # Prepend coverage summary for official
         if report_type == EmailReportType.OFFICIAL_DECISION:
-            summary = (
-                f"> 快照覆盖率: {valid_count}/{expected_count} ({coverage_ratio:.0%})\n"
-                f"> 快照ID: {snapshot_id}\n"
-                f"> LLM状态: {llm_status or 'unknown'}\n"
-                f"> 基线状态: {baseline_status or 'unknown'}\n\n"
-            )
-            content = summary + content
+            summary_lines = [
+                f"> 快照覆盖率: {valid_count}/{expected_count} ({coverage_ratio:.0%})",
+                f"> 快照ID: {snapshot_id}",
+                f"> LLM状态: {llm_status or 'unknown'}",
+                f"> 基线状态: {baseline_status or 'unknown'}",
+            ]
+            if market_index_coverage:
+                if market_index_coverage.get('quality_alert'):
+                    summary_lines.append("> ⚠️ 大盘指数数据不足，本决策仅供参考")
+                if market_index_coverage.get('summary'):
+                    for line in market_index_coverage['summary'].split('\n'):
+                        summary_lines.append(f"> {line}")
+                if market_index_coverage.get('ratio') is not None:
+                    summary_lines.append(
+                        f"> 大盘指数有效占比: {market_index_coverage['ratio']:.1%}"
+                    )
+            summary_lines.append("")
+            content = "\n".join(summary_lines) + "\n" + content
 
         try:
             success = self._email_sender.send_to_email(
@@ -2327,7 +2424,7 @@ class IntradayMonitor:
         results: List[Dict[str, Any]] = []
         for code in index_codes:
             try:
-                quote = self._fetcher.get_realtime_quote(code, log_final_failure=False)
+                quote = self._fetch_index_quote(market, code)
                 if quote is None:
                     logger.info("[市场指数] %s index_code=%s: 无行情数据", market.upper(), code)
                     results.append({
@@ -2335,8 +2432,32 @@ class IntradayMonitor:
                         'market': market,
                     })
                     continue
+                results.append(quote)
+            except Exception as exc:
+                logger.warning("[市场指数] %s index_code=%s 获取失败: %s", market.upper(), code, exc)
                 results.append({
-                    'index_code': code,
+                    'index_code': code, 'status': 'fetch_failed',
+                    'market': market,
+                })
+        return results
+
+    def _fetch_index_quote(self, market: str, index_code: str) -> Optional[Dict[str, Any]]:
+        """Fetch single index quote using configured data-source strategy.
+
+        intraday_index_data_source strategies:
+        - 'dedicated': market-specific dedicated fetcher (AkShare/yfinance)
+        - 'realtime': old get_realtime_quote path
+        - 'auto': try dedicated first, fall back to realtime
+        """
+        data_source = getattr(self._config, 'intraday_index_data_source', 'dedicated')
+
+        def _try_realtime():
+            try:
+                quote = self._fetcher.get_realtime_quote(index_code, log_final_failure=False)
+                if quote is None:
+                    return None
+                return {
+                    'index_code': index_code,
                     'index_name': getattr(quote, 'name', '') or '',
                     'current_price': float(quote.price) if quote.price is not None else None,
                     'open_price': float(quote.open) if getattr(quote, 'open', None) is not None else None,
@@ -2349,14 +2470,138 @@ class IntradayMonitor:
                     'source': getattr(quote, 'source', '') or '',
                     'status': 'valid',
                     'market': market,
-                })
-            except Exception as exc:
-                logger.warning("[市场指数] %s index_code=%s 获取失败: %s", market.upper(), code, exc)
-                results.append({
-                    'index_code': code, 'status': 'fetch_failed',
-                    'market': market,
-                })
-        return results
+                }
+            except Exception:
+                return None
+
+        if data_source == 'realtime':
+            return _try_realtime()
+
+        result = None
+        try:
+            if market == 'cn':
+                result = self._fetch_cn_index_quote(index_code)
+            elif market == 'hk':
+                result = self._fetch_hk_index_quote(index_code)
+            elif market == 'us':
+                result = self._fetch_us_index_quote(index_code)
+        except Exception as exc:
+            logger.warning("[专用指数] %s index_code=%s 获取失败: %s", market.upper(), index_code, exc)
+            result = None
+
+        if result is None and data_source == 'auto':
+            logger.info("[专用指数] %s index_code=%s 专用路由失败，fallback到realtime", market.upper(), index_code)
+            return _try_realtime()
+        return result
+
+    def _fetch_cn_index_quote(self, index_code: str) -> Optional[Dict[str, Any]]:
+        """Fetch CN market index using AkShare index-specific API."""
+        try:
+            import akshare as ak
+            try:
+                df = ak.stock_zh_index_spot_em()
+                if df is not None and not df.empty:
+                    code_map = {
+                        '000001': '上证指数', '399001': '深证成指', '399006': '创业板指',
+                        '000016': '上证50', '000300': '沪深300', '000688': '科创50',
+                        '000905': '中证500', '000852': '中证1000',
+                    }
+                    name = code_map.get(index_code, '')
+                    if name and '名称' in df.columns:
+                        row = df[df['名称'] == name]
+                    elif '代码' in df.columns:
+                        row = df[df['代码'] == index_code]
+                    else:
+                        row = None
+                    if row is not None and not row.empty:
+                        r = row.iloc[0]
+                        return {
+                            'index_code': index_code, 'index_name': name,
+                            'current_price': float(r.get('最新价', 0)) if '最新价' in r else None,
+                            'open_price': float(r.get('今开', 0)) if '今开' in r else None,
+                            'prev_close': float(r.get('昨收', 0)) if '昨收' in r else None,
+                            'high_price': float(r.get('最高', 0)) if '最高' in r else None,
+                            'low_price': float(r.get('最低', 0)) if '最低' in r else None,
+                            'change_pct': float(r.get('涨跌幅', 0)) if '涨跌幅' in r else None,
+                            'volume': float(r.get('成交量', 0)) if '成交量' in r else None,
+                            'amount': float(r.get('成交额', 0)) if '成交额' in r else None,
+                            'source': 'akshare_spot_em',
+                            'status': 'valid',
+                        }
+            except Exception:
+                pass
+            df = ak.stock_zh_index_daily_em(symbol=index_code)
+            if df is not None and not df.empty:
+                latest = df.iloc[0]
+                return {
+                    'index_code': index_code, 'index_name': '',
+                    'current_price': float(latest.get('close', 0)) if 'close' in latest else None,
+                    'open_price': float(latest.get('open', 0)) if 'open' in latest else None,
+                    'high_price': float(latest.get('high', 0)) if 'high' in latest else None,
+                    'low_price': float(latest.get('low', 0)) if 'low' in latest else None,
+                    'change_pct': float(latest.get('pct_chg', 0)) if 'pct_chg' in latest else None,
+                    'volume': float(latest.get('volume', 0)) if 'volume' in latest else None,
+                    'amount': float(latest.get('amount', 0)) if 'amount' in latest else None,
+                    'source': 'akshare_daily_em',
+                    'status': 'valid',
+                }
+        except Exception as exc:
+            logger.warning("[CN指数专用] index_code=%s 失败: %s", index_code, exc)
+        return None
+
+    def _fetch_hk_index_quote(self, index_code: str) -> Optional[Dict[str, Any]]:
+        """Fetch HK market index using yfinance with proper symbol mapping."""
+        try:
+            import yfinance as yf
+            symbol_map = {'HSI': '^HSI', 'HSTECH': '^HSTECH', 'HSCEI': '^HSCEI'}
+            yf_symbol = symbol_map.get(index_code, index_code)
+            ticker = yf.Ticker(yf_symbol)
+            info = ticker.info
+            fast = ticker.fast_info
+            current = fast.get('lastPrice') or info.get('regularMarketPrice') or info.get('currentPrice')
+            if current is None:
+                return None
+            return {
+                'index_code': index_code,
+                'index_name': info.get('shortName', '') or info.get('longName', ''),
+                'current_price': float(current),
+                'open_price': float(fast.get('open')) if fast.get('open') is not None else None,
+                'prev_close': float(fast.get('previousClose')) if fast.get('previousClose') is not None else None,
+                'high_price': float(fast.get('dayHigh')) if fast.get('dayHigh') is not None else None,
+                'low_price': float(fast.get('dayLow')) if fast.get('dayLow') is not None else None,
+                'volume': float(fast.get('volume')) if fast.get('volume') is not None else None,
+                'source': 'yfinance_hk',
+                'status': 'valid',
+            }
+        except Exception as exc:
+            logger.warning("[HK指数专用] index_code=%s 失败: %s", index_code, exc)
+        return None
+
+    def _fetch_us_index_quote(self, index_code: str) -> Optional[Dict[str, Any]]:
+        """Fetch US market index using yfinance."""
+        try:
+            import yfinance as yf
+            ticker = yf.Ticker(index_code)
+            info = ticker.info
+            fast = ticker.fast_info
+            current = fast.get('lastPrice') or info.get('regularMarketPrice')
+            if current is None:
+                return None
+            return {
+                'index_code': index_code,
+                'index_name': info.get('shortName', '') or info.get('longName', ''),
+                'current_price': float(current),
+                'open_price': float(fast.get('open')) if fast.get('open') is not None else None,
+                'prev_close': float(fast.get('previousClose')) if fast.get('previousClose') is not None else None,
+                'high_price': float(fast.get('dayHigh')) if fast.get('dayHigh') is not None else None,
+                'low_price': float(fast.get('dayLow')) if fast.get('dayLow') is not None else None,
+                'volume': float(fast.get('volume')) if fast.get('volume') is not None else None,
+                'source': 'yfinance_us',
+                'status': 'valid',
+            }
+        except Exception as exc:
+            logger.warning("[US指数专用] index_code=%s 失败: %s", index_code, exc)
+        return None
 
     def _persist_market_snapshots(
         self, snapshot_id: str, run_id: str, market: str,
@@ -2492,6 +2737,51 @@ class IntradayMonitor:
         except Exception as exc:
             logger.warning("[市场指数] 加载市场指数时间线失败: %s", exc)
         return timelines
+
+    def _load_market_timeline_stats_for_decision(
+        self,
+        market_timelines: Dict[str, List[Dict[str, Any]]],
+        markets: List[str],
+        market_dates: Dict[str, str],
+    ) -> Dict[str, Any]:
+        """Build structured market timeline stats for prompt differentiation.
+
+        Returns {market: {market, expected_indices, rows, valid_points,
+                          failed_indices, unavailable_indices,
+                          total_snapshots, valid_snapshot_count}}
+        """
+        stats: Dict[str, Any] = {}
+        for market in markets:
+            expected_indices = self._get_market_indices(market)
+            mkt_tl = market_timelines.get(market, [])
+            existing_codes = {t['index_code'] for t in mkt_tl}
+            failed_indices = []
+            for t in mkt_tl:
+                pts = t.get('points', [])
+                if not pts or all(p.get('status') == 'fetch_failed' for p in pts):
+                    failed_indices.append(t['index_code'])
+            unavailable_indices = [ic for ic in expected_indices if ic not in existing_codes]
+            valid_count = sum(
+                1 for t in mkt_tl
+                for p in t.get('points', [])
+                if p.get('price') is not None
+            )
+            total_count = sum(len(t.get('points', [])) for t in mkt_tl)
+            stats[market] = {
+                'market': market,
+                'expected_indices': expected_indices,
+                'rows': mkt_tl,
+                'valid_points': [
+                    p for t in mkt_tl
+                    for p in t.get('points', [])
+                    if p.get('price') is not None
+                ],
+                'failed_indices': failed_indices,
+                'unavailable_indices': unavailable_indices,
+                'total_snapshots': total_count,
+                'valid_snapshot_count': valid_count,
+            }
+        return stats
 
     def _load_stock_timelines_for_decision(self, markets: List[str], market_dates: Dict[str, str]) -> Dict[str, Dict[str, List[Dict[str, Any]]]]:
         """Load all intraday events across all snapshots for the decision day.

@@ -171,6 +171,8 @@ def build_intraday_prompt(
     markets: Optional[set] = None,
     stock_timelines: Optional[Dict[str, Dict[str, Any]]] = None,
     market_timelines: Optional[Dict[str, List[Dict[str, Any]]]] = None,
+    market_timeline_stats: Optional[Dict[str, Any]] = None,
+    historical_snapshot_count: int = 0,
 ) -> str:
     """
     Build the LLM prompt for 14:20 intraday decision.
@@ -226,13 +228,14 @@ def build_intraday_prompt(
         + "）判断市场整体情绪。",
         "8. 结合当日个股走势路径（开盘→高/低点→当前）判断趋势方向，不要只依赖当前单点价格。",
         "9. 观察个股相对大盘强弱：若大盘上涨而个股下跌（或反之），在理由中说明背离风险。",
-        "10. 以Markdown表格形式输出最终决策摘要，并在表格后附简短理由。",
+        "10. 以Markdown表格形式输出最终决策摘要，包含日内走势、大盘环境和相对强弱。",
+        '11. 每行必须引用至少一个指数状态，或说明"指数数据缺失"。',
         "",
         "## 输出格式",
         "",
-        "| 股票 | 当前价 | 建议 | 理由 |",
-        "|------|--------|------|------|",
-        "| 600519(茅台) | 1850.00 | 买入 | 触及次级买入区间，量比正常 |",
+        "| 股票 | 当前价 | 日内走势 | 大盘环境 | 相对强弱 | 数据质量 | 建议 | 理由 |",
+        "|------|--------|----------|----------|----------|----------|------|------|",
+        "| 600519(茅台) | 1850.00 | 开1830→高1860→低1820→收1850(震荡) | 上证+0.5% 上行 | 弱于大盘 | 正常 | 买入 | 触及次级买入区间，量比正常 |",
         "",
         "---",
         "",
@@ -261,10 +264,36 @@ def build_intraday_prompt(
         lines.append(", ".join(sorted(set(snapshot_times))))
         lines.append("")
 
+    # --- Historical snapshot context (standalone decision) ---
+    if 0 < historical_snapshot_count < 2:
+        lines.append("## ⚠️ 日内走势数据不足")
+        lines.append("")
+        if historical_snapshot_count == 0:
+            lines.append("当前仅有决策快照，缺少日内历史走势数据。请基于当前单点价格和昨日阈值给出判断，并在理由中注明'仅有当前快照，趋势不确定'。")
+        else:
+            lines.append("仅有{historical_snapshot_count}个历史快照和当前决策快照，走势数据有限。请谨慎推断趋势方向。")
+        lines.append("")
+
     # --- Market index timeline summary ---
     lines.append("## 大盘指数走势摘要")
     lines.append("")
-    if market_timelines:
+    if market_timeline_stats:
+        market_label = {'cn': 'A股', 'hk': '港股', 'us': '美股'}
+        for market in sorted(market_timelines.keys()):
+            ms = market_timeline_stats.get(market, {})
+            label = market_label.get(market, market.upper())
+            if not ms or not ms.get('expected_indices'):
+                lines.append(f"- {label}: 📡 大盘指数未采集")
+            elif ms.get('failed_indices') and len(ms.get('failed_indices', [])) == len(ms.get('expected_indices', [])):
+                lines.append(f"- {label}: ⚠️ 大盘指数采集失败: {ms['failed_indices']}")
+            elif ms.get('valid_snapshot_count', 0) > 0:
+                lines.append(f"- {label}: 📊 大盘指数走势 ({ms['valid_snapshot_count']}/{ms.get('total_snapshots', 0)} 有效)")
+            else:
+                lines.append(f"- {label}: 📡 大盘指数无有效数据")
+            if ms.get('unavailable_indices'):
+                lines.append(f"  - 未采集到: {ms['unavailable_indices']}")
+        lines.append("")
+    elif market_timelines:
         lines.append(_fmt_market_timeline_summary(market_timelines))
     else:
         lines.append("（大盘指数数据缺失，请勿臆测大盘方向，仅基于个股数据给出判断）")

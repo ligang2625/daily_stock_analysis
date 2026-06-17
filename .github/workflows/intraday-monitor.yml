@@ -44,6 +44,17 @@ jobs:
         run: |
           mkdir -p data logs reports
 
+      - name: 打印盘中监控非敏感配置
+        run: |
+          echo "INTRADAY_MARKET_SNAPSHOT_ENABLED=${INTRADAY_MARKET_SNAPSHOT_ENABLED:-true}"
+          echo "INTRADAY_MARKET_INDICES_CN=${INTRADAY_MARKET_INDICES_CN:-000001,399001,399006}"
+          echo "INTRADAY_MARKET_INDICES_HK=${INTRADAY_MARKET_INDICES_HK:-HSI,HSTECH}"
+          echo "INTRADAY_MARKET_INDICES_US=${INTRADAY_MARKET_INDICES_US:-^GSPC,^IXIC}"
+          echo "REALTIME_SOURCE_PRIORITY=${REALTIME_SOURCE_PRIORITY:-tencent,akshare_sina,efinance,akshare_em}"
+          echo "INTRADAY_INDEX_DATA_SOURCE=${INTRADAY_INDEX_DATA_SOURCE:-dedicated}"
+          echo "INTRADAY_MIN_MARKET_INDEX_COVERAGE=${INTRADAY_MIN_MARKET_INDEX_COVERAGE:-0.0}"
+          echo "INTRADAY_DATA_QUALITY_ALERT_ENABLED=${INTRADAY_DATA_QUALITY_ALERT_ENABLED:-true}"
+
       - name: 恢复业务数据库缓存
         uses: actions/cache@v4
         with:
@@ -122,6 +133,21 @@ jobs:
                   print(row)
           except Exception as exc:
               print("intraday_snapshots recent rows not ready:", exc)
+
+          try:
+              cur.execute("SELECT COUNT(*) FROM intraday_market_snapshots")
+              print("intraday_market_snapshots count=", cur.fetchone()[0])
+              cur.execute("""
+                  SELECT query_date, market, index_code, status, current_price, change_pct, source
+                  FROM intraday_market_snapshots
+                  ORDER BY created_at DESC
+                  LIMIT 12
+              """)
+              print("recent intraday_market_snapshots:")
+              for row in cur.fetchall():
+                  print(row)
+          except Exception as exc:
+              print("intraday_market_snapshots not ready:", exc)
 
           conn.close()
           PY
@@ -297,6 +323,14 @@ jobs:
           INTRADAY_MONITOR_ENABLED: 'true'
           INTRADAY_MONITOR_STOCKS: ${{ vars.INTRADAY_MONITOR_STOCKS || secrets.INTRADAY_MONITOR_STOCKS || '' }}
           TRADING_DAY_CHECK_ENABLED: 'true'
+          # 大盘指数快照配置
+          INTRADAY_MARKET_SNAPSHOT_ENABLED: ${{ vars.INTRADAY_MARKET_SNAPSHOT_ENABLED || 'true' }}
+          INTRADAY_MARKET_INDICES_CN: ${{ vars.INTRADAY_MARKET_INDICES_CN || '000001,399001,399006' }}
+          INTRADAY_MARKET_INDICES_HK: ${{ vars.INTRADAY_MARKET_INDICES_HK || 'HSI,HSTECH' }}
+          INTRADAY_MARKET_INDICES_US: ${{ vars.INTRADAY_MARKET_INDICES_US || '^GSPC,^IXIC' }}
+          INTRADAY_MIN_MARKET_INDEX_COVERAGE: ${{ vars.INTRADAY_MIN_MARKET_INDEX_COVERAGE || '0.0' }}
+          INTRADAY_DATA_QUALITY_ALERT_ENABLED: ${{ vars.INTRADAY_DATA_QUALITY_ALERT_ENABLED || 'true' }}
+          INTRADAY_INDEX_DATA_SOURCE: ${{ vars.INTRADAY_INDEX_DATA_SOURCE || 'dedicated' }}
 
           # 系统配置
           LOG_LEVEL: INFO
@@ -329,6 +363,9 @@ jobs:
           echo "=========================================="
 
           if [ "$ACTION" = "decision" ]; then
+            TODAY=$(TZ='Asia/Shanghai' date '+%Y-%m-%d')
+            RECOVERED=$(sqlite3 data/stock_analysis.db "SELECT COUNT(*) FROM intraday_snapshots WHERE query_date='$TODAY';" 2>/dev/null || echo "0")
+            echo "Recovered snapshots (today=$TODAY): $RECOVERED"
             python main.py --intraday-decision
           else
             python main.py --intraday-snapshot

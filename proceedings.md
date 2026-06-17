@@ -114,3 +114,40 @@ CREATE TABLE intraday_market_snapshots (
 ### 测试
 
 **3277 passed, 16 failed** (16 failed 为预存已知问题，无回归)
+
+## Session 4: 指数数据质量门禁与专用行情路由 (2026-06-17)
+
+### 新增特性
+
+| # | Priority | Feature | Key Change |
+|---|----------|---------|------------|
+| 1 | Critical | 大盘指数数据质量门禁 | `_final_decision_locked()` 覆盖率计算 + quality_alert 标记 + 邮件头部显式大盘状态 |
+| 2 | Critical | 专用指数行情路由 | `_fetch_index_quote()` 按市场分发: CN→AkShare, HK/US→yfinance；配置 `intraday_index_data_source` |
+| 3 | Major | 邮件大盘覆盖率诊断 | `market_timeline_summary` 日志 per-market；邮件附加大盘覆盖率行 |
+| 4 | Major | 全量快照恢复检查 | `historical_snapshot_count` 查询；单点/双点时 prompt 标注走势数据不足 |
+| 5 | Major | 指数数据状态区分 | `_load_market_timeline_stats_for_decision()` 返回未采集/采集失败/有效三类；prompt 差异化展示 |
+| 6 | Major | Workflow 扩展诊断 | 新增配置打印步骤；DB 摘要含 `intraday_market_snapshots` 表；decision 前打印快照数 |
+| 7 | Minor | Prompt 输出表扩展 | 4列→8列：`日内走势\|大盘环境\|相对强弱\|数据质量`；指令要求每行引用指数 |
+| 8 | Minor | 配置入口补充 | 3 新配置项 (coverage gate, alert enabled, data source) |
+
+### 新增配置
+
+| 配置 | 默认值 | 说明 |
+|------|--------|------|
+| `intraday_min_market_index_coverage` | `0.0` | 大盘指数数据质量门禁 (0.0-1.0) |
+| `intraday_data_quality_alert_enabled` | `true` | 大盘指数数据质量告警邮件 |
+| `intraday_index_data_source` | `dedicated` | 指数数据源策略: dedicated/realtime/auto |
+
+### 修改文件
+
+| 文件 | 改动 |
+|------|------|
+| `src/core/intraday_monitor.py` | 4 新指数获取方法, coverage gate, 诊断日志, 历史快照检查, email 覆盖率 |
+| `src/core/intraday_prompt.py` | 8列输出表, 走势数据不足提醒, 指数状态区分 |
+| `src/config.py` | 3 新配置项 |
+| `.github/workflows/intraday-monitor.yml` | 3 新步骤/配置 |
+| `.env.example` | 3 新 env 变量 |
+
+### 测试
+
+**949 passed, 1 failed, 2 skipped** (1 failed 为预存已知 cache 问题，无回归)
