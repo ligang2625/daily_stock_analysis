@@ -328,6 +328,98 @@ def _safe_float(val: Any) -> Optional[float]:
 
 
 # ---------------------------------------------------------------------------
+# Event display helpers
+# ---------------------------------------------------------------------------
+
+
+def classify_event_type_for_display(event_type: str) -> str:
+    """Map event type to display group: buy/take_profit/stop_loss/volume/watch."""
+    buy_types = {"enter_ideal_buy", "enter_secondary_buy", "near_buy_zone"}
+    if event_type in buy_types:
+        return "buy"
+    if event_type == "enter_take_profit":
+        return "take_profit"
+    if event_type == "break_stop_loss":
+        return "stop_loss"
+    if event_type == "unusual_volume":
+        return "volume"
+    return "watch"
+
+
+def aggregate_events_for_display(events: list) -> dict:
+    """Aggregate events by stock, merging unusual_volume into main event.
+
+    Returns dict with keys: buy, take_profit, stop_loss, watch.
+    Each value is list of dicts: stock_code, stock_name, main_event,
+    has_unusual_volume, max_volume_ratio, current_price.
+    """
+    from collections import OrderedDict
+
+    stocks = OrderedDict()
+
+    priority = {
+        "break_stop_loss": 5,
+        "enter_take_profit": 4,
+        "enter_ideal_buy": 3,
+        "enter_secondary_buy": 2,
+        "near_buy_zone": 1,
+        "price_only": 0,
+        "unusual_volume": -1,
+    }
+
+    for event in events:
+        code = event.stock_code
+        if code not in stocks:
+            stocks[code] = {
+                "stock_code": code,
+                "stock_name": event.stock_name,
+                "main_event": None,
+                "main_priority": -1,
+                "has_unusual_volume": False,
+                "max_volume_ratio": None,
+                "all_events": [],
+                "current_price": event.current_price,
+            }
+
+        info = stocks[code]
+        info["all_events"].append(event)
+        info["current_price"] = event.current_price
+
+        ev_priority = priority.get(event.event_type, -1)
+        if ev_priority > info["main_priority"]:
+            info["main_event"] = event
+            info["main_priority"] = ev_priority
+
+        if event.event_type == "unusual_volume":
+            info["has_unusual_volume"] = True
+            if event.volume_ratio is not None:
+                if info["max_volume_ratio"] is None or event.volume_ratio > info["max_volume_ratio"]:
+                    info["max_volume_ratio"] = event.volume_ratio
+
+    result = {"buy": [], "take_profit": [], "stop_loss": [], "watch": []}
+    for code, info in stocks.items():
+        main_ev = info["main_event"]
+        if main_ev is None:
+            group = "watch"
+        else:
+            group = classify_event_type_for_display(main_ev.event_type)
+            if group == "volume":
+                group = "watch"
+
+        entry = {
+            "stock_code": info["stock_code"],
+            "stock_name": info["stock_name"],
+            "main_event": info["main_event"],
+            "has_unusual_volume": info["has_unusual_volume"],
+            "max_volume_ratio": info["max_volume_ratio"],
+            "current_price": info["current_price"],
+        }
+        result[group].append(entry)
+
+    return result
+
+
+# ---------------------------------------------------------------------------
 # IntradayMonitor
 # ---------------------------------------------------------------------------
 
@@ -1650,8 +1742,9 @@ class IntradayMonitor:
         result = self._call_llm(prompt)
 
         if result.status == "success":
+            content = self._normalize_official_decision_content(result.content or "")
             self._send_decision_email(
-                content=result.content,
+                content=content,
                 report_type=EmailReportType.OFFICIAL_DECISION,
                 snapshot_id=snapshot_id,
                 coverage_ratio=coverage_ratio,
@@ -1801,6 +1894,119 @@ class IntradayMonitor:
                 f"{e.current_price:.2f} | {vol} | {chg} | {e.event_type} | {e.description} |"
             )
         return "\n".join(lines)
+
+    def _normalize_official_decision_content(self, raw_content: str) -> str:
+        """Ensure official decision email uses grouped list format.
+
+        1. If content already contains target group headers, return cleaned original.
+        2. If content contains old Markdown table header, parse and regroup.
+        3. If unparseable, return original with warning.
+        """
+        if not raw_content:
+            return raw_content
+
+        # Check if already in grouped format
+        grouped_headers = [
+            "买入信号相关股票",
+            "卖出信号相关股票（止盈）",
+            "卖出信号相关股票（止损）",
+            "观望/无法判断",
+        ]
+        if any(h in raw_content for h in grouped_headers):
+            lines = raw_content.split("\n")
+            cleaned = [l for l in lines if not l.startswith("| 股票 | 当前价 |") and not l.startswith("|------|--------|")]
+            return "\n".join(cleaned)
+
+        # Check for legacy table format
+        if "| 股票 | 当前价 |" in raw_content:
+            logger.warning("Detected legacy table format in LLM output — attempting to normalize to grouped list")
+            lines = raw_content.split("\n")
+            table_start = -1
+            table_end = -1
+            header_line = None
+            for i, line in enumerate(lines):
+                if line.startswith("| 股票 | 当前价 |"):
+                    table_start = i
+                    header_line = line
+                if table_start >= 0 and i > table_start and not line.strip():
+                    table_end = i
+                    break
+                if table_start >= 0 and i > table_start and not line.startswith("|"):
+                    table_end = i
+                    break
+            if table_end == -1:
+                table_end = len(lines)
+
+            if header_line:
+                cols = [c.strip() for c in header_line.strip("|").split("|")]
+            else:
+                cols = ["股票", "当前价", "日内走势", "大盘环境", "相对强弱", "数据质量", "建议", "理由"]
+
+            try:
+                stock_idx = next(i for i, c in enumerate(cols) if "股票" in c)
+                price_idx = next(i for i, c in enumerate(cols) if "当前价" in c)
+                suggestion_idx = next(i for i, c in enumerate(cols) if "建议" in c)
+                reason_idx = next(i for i, c in enumerate(cols) if "理由" in c)
+            except StopIteration:
+                logger.warning("Cannot parse legacy table columns, returning original")
+                return raw_content
+
+            buy_stocks = []
+            take_profit_stocks = []
+            stop_loss_stocks = []
+            watch_stocks = []
+
+            for row_line in lines[table_start + 2:table_end]:
+                row_line = row_line.strip()
+                if not row_line.startswith("|"):
+                    continue
+                cells = [c.strip() for c in row_line.strip("|").split("|")]
+                if len(cells) <= max(stock_idx, suggestion_idx, reason_idx):
+                    continue
+                stock = cells[stock_idx]
+                price = cells[price_idx] if len(cells) > price_idx else ""
+                suggestion = cells[suggestion_idx]
+                reason = cells[reason_idx] if len(cells) > reason_idx else ""
+                context = f"当前价 {price}，{reason}"
+
+                if "买入" in suggestion:
+                    buy_stocks.append(f"- **{stock}**：{context}")
+                elif "止盈" in suggestion or ("卖出" in suggestion and "止盈" in reason):
+                    take_profit_stocks.append(f"- **{stock}**：{context}")
+                elif "止损" in suggestion or ("卖出" in suggestion and "止损" in reason):
+                    stop_loss_stocks.append(f"- **{stock}**：{context}")
+                else:
+                    watch_stocks.append(f"- **{stock}**：{context}")
+
+            result_lines = []
+            result_lines.append("## 决策分析过程")
+            result_lines.append("")
+            result_lines.append("基于规则，对每只触发了事件的股票进行逐一分析：")
+            result_lines.append("")
+            result_lines.append("### 1. 买入信号相关股票")
+            result_lines.append("")
+            result_lines.extend(buy_stocks) if buy_stocks else result_lines.append("（无）")
+            result_lines.append("")
+            result_lines.append("### 2. 卖出信号相关股票（止盈）")
+            result_lines.append("")
+            result_lines.extend(take_profit_stocks) if take_profit_stocks else result_lines.append("（无）")
+            result_lines.append("")
+            result_lines.append("### 3. 卖出信号相关股票（止损）")
+            result_lines.append("")
+            result_lines.extend(stop_loss_stocks) if stop_loss_stocks else result_lines.append("（无）")
+            result_lines.append("")
+            result_lines.append("### 4. 观望/无法判断股票（如有）")
+            result_lines.append("")
+            result_lines.extend(watch_stocks) if watch_stocks else result_lines.append("（无）")
+
+            prefix = [l for l in lines[:table_start] if l.strip()]
+            suffix = [l for l in lines[table_end:] if l.strip()]
+
+            final_lines = prefix + [""] + result_lines + [""] + suffix
+            return "\n".join(final_lines)
+
+        logger.warning("Cannot normalize decision content: no recognized format found")
+        return raw_content
 
     def _send_decision_email(
         self,
