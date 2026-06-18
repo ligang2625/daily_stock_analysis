@@ -159,9 +159,13 @@ class TestAnalysisHistoryPayloadSplit:
             assert payload.payload_size > 0
             assert payload.raw_result is not None
 
-            # Legacy columns should still be populated for backward compat
-            assert history.raw_result is not None
-            assert history.news_content is not None
+            # Phase 1: legacy columns should be NULL — payload lives in payload table only
+            assert history.raw_result is None, "Legacy raw_result should be NULL (payload in payload table)"
+            assert history.news_content is None, "Legacy news_content should be NULL (payload in payload table)"
+            assert history.context_snapshot is None, "Legacy context_snapshot should be NULL (payload in payload table)"
+            # But payload row should have the content
+            assert payload.raw_result is not None, "Payload table should have raw_result"
+            assert payload.news_content is not None, "Payload table should have news_content"
 
     def test_get_analysis_history_payload(self, db):
         """Test the payload helper method."""

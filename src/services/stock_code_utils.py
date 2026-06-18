@@ -185,7 +185,15 @@ def normalize_stock_code_for_storage(code: Optional[str], market: Optional[str] 
             return f"HK{digits}"
 
     # 1-5 digit numeric: HK code (e.g. 00700, 0700, 1810)
+    # BUT: if caller explicitly passes market, respect it first
     if upper.isdigit() and 1 <= len(upper) <= 5:
+        if market is not None:
+            mkt = normalize_market_region(market, code=raw)
+            if mkt != "hk":
+                if mkt == "cn":
+                    return raw.zfill(6)  # treat as CN short code
+                if mkt == "us":
+                    return upper  # unlikely but safe
         return f"HK{upper.zfill(5)}"
 
     # 6-digit numeric: CN code

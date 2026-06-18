@@ -152,6 +152,23 @@ class _FakeHistoryDb:
     def get_latest_analysis_by_query_id(self, query_id: str):
         return self.record if query_id == "query-p2" else None
 
+    def get_analysis_history_payload_dict(self, history_id: int):
+        if history_id == 1 and self.record:
+            return {
+                'raw_result': getattr(self.record, 'raw_result', None),
+                'news_content': getattr(self.record, 'news_content', None),
+                'context_snapshot': getattr(self.record, 'context_snapshot', None),
+                'payload_available': True,
+                'payload_expired': False,
+            }
+        return {
+            'raw_result': None,
+            'news_content': None,
+            'context_snapshot': None,
+            'payload_available': False,
+            'payload_expired': True,
+        }
+
 
 class _FailingHistoryDb:
     def get_analysis_history_by_id(self, record_id: int):

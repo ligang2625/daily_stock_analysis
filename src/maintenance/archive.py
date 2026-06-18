@@ -29,11 +29,10 @@ from src.storage_historical import HistoricalDatabaseManager
 
 logger = logging.getLogger(__name__)
 
-# Tables allowed for Phase 1 deletion (runtime / large-payload rows only)
-# Each tuple: (table_name, timestamp_column)
-# Explicitly NOT including: analysis_history (summary rows), stock_daily (technical)
+# Tables allowed for Phase 1 deletion (runtime rows only — NOT payload/summary/technical)
+# analysis_history_payload is handled explicitly AFTER legacy column nulling.
+# analysis_history and stock_daily are NEVER deleted.
 ALLOWED_DELETE_TABLES: List[Tuple[str, str]] = [
-    ('analysis_history_payload', 'created_at'),
     ('news_intel', 'fetched_at'),
     ('llm_usage', 'called_at'),
     ('agent_provider_turns', 'created_at'),
@@ -43,10 +42,11 @@ ALLOWED_DELETE_TABLES: List[Tuple[str, str]] = [
     ('decision_signals', 'created_at'),
 ]
 
-# Tables to count in dry-run (includes additional tables for reporting)
+# Tables to count in dry-run (includes protected tables for reporting)
 DRY_RUN_COUNT_TABLES: List[Tuple[str, str]] = ALLOWED_DELETE_TABLES + [
-    ('analysis_history', 'created_at'),   # counted but NOT deleted
-    ('stock_daily', 'created_at'),         # counted but NOT deleted
+    ('analysis_history', 'created_at'),       # counted but NEVER deleted
+    ('analysis_history_payload', 'created_at'),  # counted but handled explicitly
+    ('stock_daily', 'created_at'),             # counted but NEVER deleted
 ]
 
 
@@ -81,65 +81,78 @@ def _delete_rows_before_date(
     return result.rowcount or 0
 
 
-def _delete_legacy_payload_rows(
+def _null_legacy_payload_columns(
     session, cutoff_date: date
 ) -> int:
     """
     Null out legacy large payload columns in analysis_history for rows older
-    than cutoff, but ONLY if the corresponding analysis_history_payload row
-    exists (indicating a successful backfill).
+    than cutoff. Does NOT delete the summary row itself.
 
-    This reduces main DB bloat for rows that have already been split.
-    Does NOT delete the summary row itself.
+    This reduces main DB bloat and marks rows as migrated to the payload table.
     """
-    deleted = 0
+    nulled = 0
 
-    # Null raw_result on old rows where payload exists
+    # Null raw_result on old rows
     result = session.execute(
         sa_text(
             "UPDATE analysis_history "
             "SET raw_result = NULL "
-            "WHERE id IN ("
-            "  SELECT ah.id FROM analysis_history ah"
-            "  INNER JOIN analysis_history_payload ahp ON ahp.history_id = ah.id"
-            "  WHERE ah.created_at < :cutoff AND ah.raw_result IS NOT NULL"
-            ")"
+            "WHERE created_at < :cutoff AND raw_result IS NOT NULL"
         ),
         {"cutoff": cutoff_date.isoformat()},
     )
-    deleted += result.rowcount or 0
+    nulled += result.rowcount or 0
 
-    # Null news_content on old rows where payload exists
+    # Null news_content on old rows
     result = session.execute(
         sa_text(
             "UPDATE analysis_history "
             "SET news_content = NULL "
-            "WHERE id IN ("
-            "  SELECT ah.id FROM analysis_history ah"
-            "  INNER JOIN analysis_history_payload ahp ON ahp.history_id = ah.id"
-            "  WHERE ah.created_at < :cutoff AND ah.news_content IS NOT NULL"
-            ")"
+            "WHERE created_at < :cutoff AND news_content IS NOT NULL"
         ),
         {"cutoff": cutoff_date.isoformat()},
     )
-    deleted += result.rowcount or 0
+    nulled += result.rowcount or 0
 
-    # Null context_snapshot on old rows where payload exists
+    # Null context_snapshot on old rows
     result = session.execute(
         sa_text(
             "UPDATE analysis_history "
             "SET context_snapshot = NULL "
-            "WHERE id IN ("
-            "  SELECT ah.id FROM analysis_history ah"
-            "  INNER JOIN analysis_history_payload ahp ON ahp.history_id = ah.id"
-            "  WHERE ah.created_at < :cutoff AND ah.context_snapshot IS NOT NULL"
-            ")"
+            "WHERE created_at < :cutoff AND context_snapshot IS NOT NULL"
         ),
         {"cutoff": cutoff_date.isoformat()},
     )
-    deleted += result.rowcount or 0
+    nulled += result.rowcount or 0
 
-    return deleted
+    return nulled
+
+
+def _delete_old_payload_rows(
+    session, cutoff_date: date
+) -> int:
+    """Delete analysis_history_payload rows older than cutoff."""
+    result = session.execute(
+        sa_text(
+            "DELETE FROM analysis_history_payload "
+            "WHERE created_at < :cutoff"
+        ),
+        {"cutoff": cutoff_date.isoformat()},
+    )
+    return result.rowcount or 0
+
+
+def _count_payload_legacy_cols(session, cutoff_date: date) -> int:
+    """Count legacy payload columns that would be nulled."""
+    row = session.execute(
+        sa_text(
+            "SELECT COUNT(*) FROM analysis_history "
+            "WHERE created_at < :cutoff"
+            "  AND (raw_result IS NOT NULL OR news_content IS NOT NULL OR context_snapshot IS NOT NULL)"
+        ),
+        {"cutoff": cutoff_date.isoformat()},
+    ).fetchone()
+    return row[0] if row else 0
 
 
 def _dry_run(db: DatabaseManager, cutoff_date: date) -> Dict[str, int]:
@@ -157,27 +170,13 @@ def _dry_run(db: DatabaseManager, cutoff_date: date) -> Dict[str, int]:
 
         # Count legacy payload columns that would be nulled
         try:
-            legacy_count = _count_legacy_payload_candidates(session, cutoff_date)
+            legacy_count = _count_payload_legacy_cols(session, cutoff_date)
             counts['analysis_history_legacy_payload_cols'] = legacy_count
         except Exception as exc:
             logger.warning("Dry-run legacy payload count failed: %s", exc)
             counts['analysis_history_legacy_payload_cols'] = 0
 
     return counts
-
-
-def _count_legacy_payload_candidates(session, cutoff_date: date) -> int:
-    """Count rows whose legacy payload could be nulled (has payload row)."""
-    row = session.execute(
-        sa_text(
-            "SELECT COUNT(*) FROM analysis_history ah"
-            " INNER JOIN analysis_history_payload ahp ON ahp.history_id = ah.id"
-            " WHERE ah.created_at < :cutoff"
-            "  AND (ah.raw_result IS NOT NULL OR ah.news_content IS NOT NULL OR ah.context_snapshot IS NOT NULL)"
-        ),
-        {"cutoff": cutoff_date.isoformat()},
-    ).fetchone()
-    return row[0] if row else 0
 
 
 def run_archive(
@@ -189,6 +188,13 @@ def run_archive(
 ) -> int:
     """
     Execute archive maintenance.
+
+    Cleanup order:
+    1. Null legacy large payload columns (raw_result, news_content, context_snapshot)
+    2. Delete expired analysis_history_payload rows
+    3. Delete other allowed runtime tables
+    4. If not --skip-vacuum: wal_checkpoint(TRUNCATE), VACUUM, ANALYZE
+       (outside the destructive transaction)
 
     Returns 0 on success, 1 on error.
     """
@@ -230,10 +236,12 @@ def run_archive(
             for table_name, _ts_col in DRY_RUN_COUNT_TABLES:
                 c = counts.get(table_name, 0)
                 total += c
-                logger.info("  %s: %d rows", table_name, c)
+                protected = table_name in ('analysis_history', 'stock_daily')
+                marker = " (PROTECTED — counted, NOT deleted)" if protected else ""
+                logger.info("  %s: %d rows%s", table_name, c, marker)
             legacy = counts.get('analysis_history_legacy_payload_cols', 0)
             if legacy:
-                logger.info("  analysis_history (legacy payload nulls): %d rows", legacy)
+                logger.info("  analysis_history (legacy payload columns to null): %d columns", legacy)
             logger.info("  TOTAL candidate rows: %d", total + legacy)
             logger.info("=== End dry-run ===")
 
@@ -246,11 +254,43 @@ def run_archive(
             )
             return 0
 
-        # --- Actual deletion (non-dry-run) ---
+        # --- Actual cleanup (non-dry-run) ---
         total_deleted = 0
         total_read = 0
+        legacy_nulled = 0
+        payload_deleted = 0
 
+        # Phase 1: Transaction-protected destructive cleanup
         with db.session_scope() as session:
+            # 1. Count and null legacy payload columns first
+            try:
+                legacy_count = _count_payload_legacy_cols(session, cutoff_date)
+                if legacy_count:
+                    logger.info("  Nulling %d legacy payload columns in analysis_history ...", legacy_count)
+                    legacy_nulled = _null_legacy_payload_columns(session, cutoff_date)
+                    total_read += legacy_count
+                    total_deleted += legacy_nulled
+                    logger.info("  Nulled %d legacy payload columns", legacy_nulled)
+                counts['analysis_history_legacy_payload_cols'] = legacy_nulled
+            except Exception as exc:
+                logger.error("Legacy payload nulling failed: %s", exc)
+                raise
+
+            # 2. Delete old payload rows
+            try:
+                payload_count = _count_rows_before_date(session, 'analysis_history_payload', 'created_at', cutoff_date)
+                if payload_count:
+                    logger.info("  Deleting %d analysis_history_payload rows ...", payload_count)
+                    payload_deleted = _delete_old_payload_rows(session, cutoff_date)
+                    total_read += payload_count
+                    total_deleted += payload_deleted
+                    logger.info("  Deleted %d payload rows", payload_deleted)
+                counts['analysis_history_payload'] = payload_deleted
+            except Exception as exc:
+                logger.error("Payload row deletion failed: %s", exc)
+                raise
+
+            # 3. Delete other allowed runtime tables
             for table_name, ts_col in ALLOWED_DELETE_TABLES:
                 try:
                     count_before = _count_rows_before_date(session, table_name, ts_col, cutoff_date)
@@ -263,30 +303,39 @@ def run_archive(
                     logger.error("Delete failed for %s: %s", table_name, exc)
                     raise
 
-            # Null legacy payload columns on backfilled rows
-            try:
-                legacy_deleted = _delete_legacy_payload_rows(session, cutoff_date)
-                counts['analysis_history_legacy_payload_cols'] = legacy_deleted
-                total_deleted += legacy_deleted
-                total_read += legacy_deleted
-                logger.info("  Nulled %d legacy payload columns in analysis_history", legacy_deleted)
-            except Exception as exc:
-                logger.error("Legacy payload nulling failed: %s", exc)
-                raise
-
-        # VACUUM to reclaim space
+        # 4. SQLite maintenance (outside destructive transaction)
         if not skip_vacuum:
-            logger.info("Running VACUUM ...")
+            logger.info("Running SQLite maintenance (wal_checkpoint + VACUUM + ANALYZE) ...")
             try:
                 with db.session_scope() as session:
-                    session.execute(sa_text("VACUUM"))
-                logger.info("VACUUM complete")
+                    conn = session.connection()
+                    # Checkpoint to flush WAL to main DB file
+                    conn.execute(sa_text("PRAGMA wal_checkpoint(TRUNCATE)"))
+                    session.commit()
+            except Exception as exc:
+                logger.warning("wal_checkpoint(TRUNCATE) failed (non-fatal): %s", exc)
+
+            try:
+                with db.session_scope() as session:
+                    conn = session.connection()
+                    conn.execute(sa_text("VACUUM"))
+                    session.commit()
             except Exception as exc:
                 logger.warning("VACUUM failed (non-fatal): %s", exc)
 
+            try:
+                with db.session_scope() as session:
+                    conn = session.connection()
+                    conn.execute(sa_text("ANALYZE"))
+                    session.commit()
+            except Exception as exc:
+                logger.warning("ANALYZE failed (non-fatal): %s", exc)
+
+            logger.info("SQLite maintenance complete")
+
         logger.info(
-            "Archive complete: deleted=%d rows across %d tables",
-            total_deleted, len(ALLOWED_DELETE_TABLES),
+            "Archive complete: deleted=%d rows (legacy_nulled=%d payload_deleted=%d) across %d tables",
+            total_deleted, legacy_nulled, payload_deleted, len(ALLOWED_DELETE_TABLES) + 1,
         )
 
         historical_db.finish_archive_run(

@@ -34,7 +34,7 @@ except ModuleNotFoundError:
     get_stock_bar = None
 
 from src.config import Config
-from src.storage import DatabaseManager, AnalysisHistory, BacktestResult, DecisionSignalRecord
+from src.storage import DatabaseManager, AnalysisHistory, AnalysisHistoryPayload, BacktestResult, DecisionSignalRecord
 from src.analyzer import AnalysisResult
 from src.services.history_service import HistoryService
 import src.auth as auth
@@ -191,7 +191,12 @@ class AnalysisHistoryTestCase(unittest.TestCase):
             if row is None:
                 self.fail("未找到保存的历史记录")
             self.assertEqual(row.query_id, "query_001")
-            self.assertIsNotNone(row.context_snapshot)
+            # Phase 1: context_snapshot stored in payload table, legacy column is NULL
+            payload_row = session.query(AnalysisHistoryPayload).filter(
+                AnalysisHistoryPayload.history_id == row.id
+            ).first()
+            self.assertIsNotNone(payload_row, "Payload row should exist")
+            self.assertIsNotNone(payload_row.context_snapshot, "Payload table should have context_snapshot")
             self.assertEqual(row.ideal_buy, 125.5)
             self.assertEqual(row.secondary_buy, 120.0)
             self.assertEqual(row.stop_loss, 110.0)
@@ -237,8 +242,15 @@ class AnalysisHistoryTestCase(unittest.TestCase):
             row = session.query(AnalysisHistory).filter(AnalysisHistory.query_id == "query_003").first()
             if row is None:
                 self.fail("未找到保存的历史记录")
-            payload = json.loads(row.raw_result or "{}")
-            self.assertEqual(payload.get("model_used"), "gemini/gemini-2.0-flash")
+            # Phase 1: model_used is a hot column on analysis_history
+            self.assertEqual(row.model_used, "gemini/gemini-2.0-flash")
+            # Also verify payload table has it
+            payload_row = session.query(AnalysisHistoryPayload).filter(
+                AnalysisHistoryPayload.history_id == row.id
+            ).first()
+            self.assertIsNotNone(payload_row, "Payload row should exist")
+            payload_json = json.loads(payload_row.raw_result or "{}")
+            self.assertEqual(payload_json.get("model_used"), "gemini/gemini-2.0-flash")
 
     def test_update_analysis_history_diagnostics_preserves_snapshot_fields(self) -> None:
         """通知发送后补写 diagnostics 时，不应覆盖已有上下文字段。"""
@@ -279,7 +291,12 @@ class AnalysisHistoryTestCase(unittest.TestCase):
             ).first()
             if row is None:
                 self.fail("未找到保存的历史记录")
-            snapshot = json.loads(row.context_snapshot or "{}")
+            # Phase 1: context_snapshot is in payload table
+            payload_row = session.query(AnalysisHistoryPayload).filter(
+                AnalysisHistoryPayload.history_id == row.id
+            ).first()
+            self.assertIsNotNone(payload_row, "Payload row should exist after diagnostics update")
+            snapshot = json.loads(payload_row.context_snapshot or "{}")
             self.assertEqual(snapshot["enhanced_context"]["code"], "600519")
             notification_run = snapshot["diagnostics"]["notification_runs"][-1]
             self.assertEqual(notification_run["status"], "success")
@@ -768,9 +785,29 @@ class AnalysisHistoryTestCase(unittest.TestCase):
             row = session.query(AnalysisHistory).filter(AnalysisHistory.query_id == "query_005").first()
             if row is None:
                 self.fail("未找到保存的历史记录")
-            row.raw_result = {"model_used": "unknown", "extra": "v"}
-            row.model_used = None  # hot column should not shadow dict raw_result intent
+            record_id = row.id
+            # Phase 1: update payload table with dict raw_result (testing dict handling)
+            payload_row = session.query(AnalysisHistoryPayload).filter(
+                AnalysisHistoryPayload.history_id == record_id
+            ).first()
+            if payload_row:
+                payload_row.raw_result = '{"model_used": "unknown", "extra": "v"}'
+            else:
+                payload_row = AnalysisHistoryPayload(
+                    history_id=record_id,
+                    raw_result='{"model_used": "unknown", "extra": "v"}',
+                    news_content="",
+                    context_snapshot="",
+                )
+                session.add(payload_row)
+            # Set hot model_used to None to ensure fallback is tested
+            row.model_used = None
+            # Commit so the payload dict loader sees the changes (it opens a new session)
+            session.commit()
 
+        # Re-fetch record after commit for detail call
+        with self.db.get_session() as session:
+            row = session.query(AnalysisHistory).filter(AnalysisHistory.query_id == "query_005").first()
             service = HistoryService(self.db)
             detail = service._record_to_detail_dict(row)
 

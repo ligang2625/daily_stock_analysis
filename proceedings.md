@@ -205,3 +205,44 @@ CREATE TABLE intraday_market_snapshots (
 ### 测试
 
 **3331 passed, 14 failed, 2 skipped** (14 failed 均为预存已知问题，零回归)
+
+## Session 6: Phase 1 Remediation — 主库持久化层补完 (2026-06-18)
+
+### 修复 / 补完
+
+| # | Priority | Issue | Key Change |
+|---|----------|-------|------------|
+| 1 | Major | 新增 analysis_history 仍向主表写大 payload | `save_analysis_history()` 将 `raw_result`/`news_content`/`context_snapshot` 设为 NULL，仅写入 `analysis_history_payload` |
+| 2 | Major | History list 仍加载并解析大遗留列 | 新增 `get_analysis_history_paginated_summary()` 显式列选择排除大列；list serializer 优先使用热列 |
+| 3 | Major | Detail/markdown 路径未一致使用 payload 表 | 新增 `get_analysis_history_payload_dict()` canonical 加载器，被 detail/markdown/diagnostics 共用；遗留列 fallback |
+| 4 | Major | 归档清理顺序错误（payload 删除先于遗留列置空） | 清理顺序改为：置空遗留列 → 删除 payload 行 → 删除 runtime 表；受保护表显式标记 |
+| 5 | Major | `code_norm` 未被历史筛选和昨日分析全量使用 | `get_history_list()` 计算 `code_norm_candidates` 先匹配复合索引；昨日分析已使用 |
+| 6 | Major | 存量数据未回填 | `backfill_phase1()` 幂等批量回填 code_norm/market/热列/payload 行，SQLite 启动时自动调用 |
+| 7 | Major | `normalize_stock_code_for_storage` 忽略显式 market 参数 | HK heuristic 改在 `market` 未提供时触发；传 `market='cn'` 不走 HK 规则 |
+| 8 | Minor | SQLite 维护不完整 | 归档后执行 `PRAGMA wal_checkpoint(TRUNCATE)` + `VACUUM` + `ANALYZE`（事务外） |
+| 9 | Regression | `_FakeHistoryDb` 缺少 `get_analysis_history_payload_dict` | 3 diagnostics 测试修复 |
+| 10 | Regression | `test_market_review.py` 断言遗留 `news_content` 列 | 改为查询 `analysis_history_payload` 表 |
+
+### 修改文件
+
+| 文件 | 改动 |
+|------|------|
+| `src/storage.py` | payload dict helper, save 遗留列 NULL, paginated summary query, backfill_phase1, diagnostics 写 payload |
+| `src/services/history_service.py` | canonical payload 加载 (detail/markdown/diagnostics), code_norm 筛选, lazy payload fallback |
+| `src/maintenance/archive.py` | 清理顺序 (置空→payload→runtime), wal_checkpoint+VACUUM+ANALYZE, 受保护表标记 |
+| `src/services/stock_code_utils.py` | 显式 market 参数优先于 HK heuristic |
+| `tests/test_analysis_history.py` | pre-existing test fixes |
+| `tests/test_storage_payload_split.py` | Phase 1 compliance updates |
+| `tests/test_run_diagnostics_p2.py` | _FakeHistoryDb mock 补全 |
+| `tests/test_market_review.py` | payload 表断言 |
+
+### 新增文件
+
+| 文件 | 说明 |
+|------|------|
+| `tests/test_history_code_norm_filters.py` | 5 测试：HK 变体过滤、payload detail、过期 payload |
+| `tests/test_archive_sequencing_backfill.py` | 5 测试：归档顺序、dry-run 计数、回填幂等性 |
+
+### 测试
+
+**3364 passed, 14 failed, 2 skipped** (14 failed 均为预存已知问题，零回归)

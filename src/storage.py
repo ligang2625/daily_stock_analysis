@@ -49,6 +49,7 @@ from sqlalchemy.orm import (
     declarative_base,
     sessionmaker,
     Session,
+    load_only,
 )
 from sqlalchemy.exc import IntegrityError, OperationalError
 
@@ -1110,8 +1111,261 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
                         logger.warning("Index creation skipped (non-fatal): %s — %s", idx_sql[:80], exc)
 
                 session.commit()
+
+            # Phase 1 backfill (idempotent, safe to run repeatedly)
+            try:
+                self.backfill_phase1()
+            except Exception as exc:
+                logger.warning("Phase-1 backfill during migration skipped (non-fatal): %s", exc)
+
         except Exception as exc:
             logger.warning("Schema migration error (non-fatal): %s", exc)
+
+    def backfill_phase1(self, batch_size: int = 100) -> Dict[str, int]:
+        """
+        Idempotent batch backfill for Phase 1 split-payload migration.
+
+        Backfills:
+        1. code_norm on analysis_history and stock_daily
+        2. market on analysis_history
+        3. Hot fields (model_used, prices, market_phase_summary) from legacy payload
+        4. Missing analysis_history_payload rows from legacy columns
+
+        Returns dict with counts: analysis_code_norm, analysis_market,
+        analysis_hot_fields, analysis_payload_rows, stock_daily_code_norm.
+        Malformed JSON is logged and skipped; never fatal.
+        """
+        counts: Dict[str, int] = {
+            'analysis_code_norm': 0,
+            'analysis_market': 0,
+            'analysis_hot_fields': 0,
+            'analysis_payload_rows': 0,
+            'stock_daily_code_norm': 0,
+        }
+        BATCH = max(1, batch_size)
+
+        try:
+            from src.services.stock_code_utils import (
+                normalize_stock_code_for_storage,
+                normalize_market_region,
+            )
+            from src.market_phase_summary import extract_market_phase_summary as _extract_mps
+
+            with self._SessionLocal() as session:
+                from sqlalchemy import text as sa_text
+
+                # --- 1. code_norm on analysis_history ---
+                offset = 0
+                while True:
+                    rows = session.execute(
+                        sa_text(
+                            "SELECT id, code FROM analysis_history "
+                            "WHERE code_norm IS NULL AND code IS NOT NULL "
+                            "LIMIT :limit OFFSET :offset"
+                        ),
+                        {"limit": BATCH, "offset": offset},
+                    ).fetchall()
+                    if not rows:
+                        break
+                    for row_id, raw_code in rows:
+                        try:
+                            norm = normalize_stock_code_for_storage(raw_code)
+                            if norm:
+                                session.execute(
+                                    sa_text("UPDATE analysis_history SET code_norm = :norm WHERE id = :id"),
+                                    {"norm": norm, "id": row_id},
+                                )
+                                counts['analysis_code_norm'] += 1
+                        except Exception:
+                            pass
+                    session.commit()
+                    offset += BATCH
+
+                # --- 2. market on analysis_history ---
+                offset = 0
+                while True:
+                    rows = session.execute(
+                        sa_text(
+                            "SELECT id, code, code_norm FROM analysis_history "
+                            "WHERE market IS NULL AND (code IS NOT NULL OR code_norm IS NOT NULL) "
+                            "LIMIT :limit OFFSET :offset"
+                        ),
+                        {"limit": BATCH, "offset": offset},
+                    ).fetchall()
+                    if not rows:
+                        break
+                    for row_id, raw_code, code_norm in rows:
+                        try:
+                            mkt = normalize_market_region(None, code=code_norm or raw_code)
+                            if mkt:
+                                session.execute(
+                                    sa_text("UPDATE analysis_history SET market = :mkt WHERE id = :id"),
+                                    {"mkt": mkt, "id": row_id},
+                                )
+                                counts['analysis_market'] += 1
+                        except Exception:
+                            pass
+                    session.commit()
+                    offset += BATCH
+
+                # --- 3. Hot fields from legacy payload ---
+                hot_cols = ('model_used', 'current_price', 'change_pct', 'volume_ratio', 'turnover_rate', 'market_phase_summary')
+                any_null = " OR ".join(f"{c} IS NULL" for c in hot_cols)
+                offset = 0
+                while True:
+                    rows = session.execute(
+                        sa_text(
+                            f"SELECT id, raw_result, context_snapshot, news_content FROM analysis_history "
+                            f"WHERE ({any_null}) AND (raw_result IS NOT NULL OR context_snapshot IS NOT NULL) "
+                            f"LIMIT :limit OFFSET :offset"
+                        ),
+                        {"limit": BATCH, "offset": offset},
+                    ).fetchall()
+                    if not rows:
+                        break
+                    for row_id, raw_result, context_snapshot, news_content in rows:
+                        try:
+                            updates = {}
+                            # Extract from raw_result
+                            if raw_result:
+                                try:
+                                    rr = json.loads(raw_result)
+                                    if isinstance(rr, dict):
+                                        if not updates.get('model_used') and rr.get('model_used'):
+                                            updates['model_used'] = str(rr['model_used'])[:128]
+                                except Exception:
+                                    pass
+                            # Extract from context_snapshot
+                            if context_snapshot:
+                                try:
+                                    cs = json.loads(context_snapshot)
+                                    if isinstance(cs, dict):
+                                        enhanced = cs.get("enhanced_context")
+                                        realtime = enhanced.get("realtime") if isinstance(enhanced, dict) else None
+                                        sources = [realtime, cs.get("realtime_quote_raw"), cs.get("realtime_quote")]
+                                        for src in sources:
+                                            if not isinstance(src, dict):
+                                                continue
+                                            if 'current_price' not in updates:
+                                                v = src.get("price")
+                                                if v is not None:
+                                                    try:
+                                                        updates['current_price'] = float(v)
+                                                    except Exception:
+                                                        pass
+                                            if 'change_pct' not in updates:
+                                                v = src.get("change_pct")
+                                                if isinstance(v, str):
+                                                    v = v.replace('%', '').strip()
+                                                if v is not None:
+                                                    try:
+                                                        updates['change_pct'] = float(v)
+                                                    except Exception:
+                                                        pass
+                                            if 'volume_ratio' not in updates:
+                                                v = src.get("volume_ratio") or src.get("volumeRatio")
+                                                if v is not None:
+                                                    try:
+                                                        updates['volume_ratio'] = float(v)
+                                                    except Exception:
+                                                        pass
+                                            if 'turnover_rate' not in updates:
+                                                v = src.get("turnover_rate") or src.get("turnoverRate") or src.get("turnover")
+                                                if v is not None:
+                                                    try:
+                                                        updates['turnover_rate'] = float(v)
+                                                    except Exception:
+                                                        pass
+                                        if 'market_phase_summary' not in updates:
+                                            try:
+                                                mps = _extract_mps(context_snapshot)
+                                                if isinstance(mps, dict):
+                                                    updates['market_phase_summary'] = json.dumps(mps, ensure_ascii=False)
+                                            except Exception:
+                                                pass
+                                except Exception:
+                                    pass
+                            if updates:
+                                set_clauses = ", ".join(f"{k} = :{k}" for k in updates)
+                                updates['id'] = row_id
+                                session.execute(
+                                    sa_text(f"UPDATE analysis_history SET {set_clauses} WHERE id = :id"),
+                                    updates,
+                                )
+                                counts['analysis_hot_fields'] += 1
+                        except Exception:
+                            pass
+                    session.commit()
+                    offset += BATCH
+
+                # --- 4. Missing payload rows ---
+                offset = 0
+                while True:
+                    rows = session.execute(
+                        sa_text(
+                            "SELECT ah.id, ah.raw_result, ah.news_content, ah.context_snapshot "
+                            "FROM analysis_history ah "
+                            "LEFT JOIN analysis_history_payload ahp ON ahp.history_id = ah.id "
+                            "WHERE ahp.id IS NULL "
+                            "AND (ah.raw_result IS NOT NULL OR ah.news_content IS NOT NULL OR ah.context_snapshot IS NOT NULL) "
+                            "LIMIT :limit OFFSET :offset"
+                        ),
+                        {"limit": BATCH, "offset": offset},
+                    ).fetchall()
+                    if not rows:
+                        break
+                    for row_id, raw_result, news_content, context_snapshot in rows:
+                        try:
+                            rr = raw_result or ''
+                            nc = news_content or ''
+                            cs = context_snapshot or ''
+                            psize = len(rr.encode('utf-8')) + len(nc.encode('utf-8')) + len(cs.encode('utf-8'))
+                            session.execute(
+                                sa_text(
+                                    "INSERT OR IGNORE INTO analysis_history_payload "
+                                    "(history_id, raw_result, news_content, context_snapshot, payload_size, compressed, created_at) "
+                                    "VALUES (:hid, :rr, :nc, :cs, :ps, 0, datetime('now'))"
+                                ),
+                                {"hid": row_id, "rr": rr, "nc": nc, "cs": cs, "ps": psize},
+                            )
+                            counts['analysis_payload_rows'] += 1
+                        except Exception:
+                            pass
+                    session.commit()
+                    offset += BATCH
+
+                # --- 5. code_norm on stock_daily ---
+                offset = 0
+                while True:
+                    rows = session.execute(
+                        sa_text(
+                            "SELECT id, code FROM stock_daily "
+                            "WHERE code_norm IS NULL AND code IS NOT NULL "
+                            "LIMIT :limit OFFSET :offset"
+                        ),
+                        {"limit": BATCH, "offset": offset},
+                    ).fetchall()
+                    if not rows:
+                        break
+                    for row_id, raw_code in rows:
+                        try:
+                            norm = normalize_stock_code_for_storage(raw_code)
+                            if norm:
+                                session.execute(
+                                    sa_text("UPDATE stock_daily SET code_norm = :norm WHERE id = :id"),
+                                    {"norm": norm, "id": row_id},
+                                )
+                                counts['stock_daily_code_norm'] += 1
+                        except Exception:
+                            pass
+                    session.commit()
+                    offset += BATCH
+
+        except Exception as exc:
+            logger.warning("Phase-1 backfill error (non-fatal): %s", exc)
+
+        logger.info("Phase-1 backfill complete: %s", counts)
+        return counts
 
     def get_intraday_state(self, key: str) -> Optional[str]:
         """Read a persistent state value by key from intraday_monitor_state."""
@@ -1730,9 +1984,10 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
                     operation_advice=result.operation_advice,
                     trend_prediction=result.trend_prediction,
                     analysis_summary=result.analysis_summary,
-                    raw_result=raw_result_json,
-                    news_content=news_content_text,
-                    context_snapshot=context_text_val,
+                    # Phase 1: legacy large columns are NULL — payload lives in payload table
+                    raw_result=None,
+                    news_content=None,
+                    context_snapshot=None,
                     ideal_buy=sniper_points.get("ideal_buy"),
                     secondary_buy=sniper_points.get("secondary_buy"),
                     stop_loss=sniper_points.get("stop_loss"),
@@ -1791,6 +2046,10 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
 
         通知结果通常在分析历史落库后才产生，因此这里仅补写
         context_snapshot.diagnostics，不改变报告正文或其它历史字段。
+
+        Phase 1: context_snapshot is written to the payload table, not
+        reintroduced into legacy columns. Hot fields (if any) updated on
+        analysis_history.
         """
         if not query_id or (diagnostics is None and not notification_runs):
             return 0
@@ -1810,10 +2069,23 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
                 if row is None:
                     return 0
 
+                # Phase 1: load existing context from payload table first, fallback to legacy
+                payload_row = session.execute(
+                    select(AnalysisHistoryPayload).where(
+                        AnalysisHistoryPayload.history_id == row.id
+                    )
+                ).scalars().first()
+
                 context_snapshot: Dict[str, Any] = {}
-                if row.context_snapshot:
+                ctx_source = None
+                if payload_row is not None and payload_row.context_snapshot:
+                    ctx_source = payload_row.context_snapshot
+                elif row.context_snapshot:
+                    ctx_source = row.context_snapshot
+
+                if ctx_source:
                     try:
-                        parsed = json.loads(row.context_snapshot)
+                        parsed = json.loads(ctx_source)
                         if isinstance(parsed, dict):
                             context_snapshot = parsed
                     except Exception:
@@ -1841,7 +2113,32 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
                             runs.append(run_payload)
                     existing_diagnostics["notification_runs"] = runs
                     context_snapshot["diagnostics"] = existing_diagnostics
-                row.context_snapshot = self._safe_json_dumps(context_snapshot)
+
+                ctx_json = self._safe_json_dumps(context_snapshot)
+
+                # Write to payload table (upsert: update existing, insert if missing)
+                if payload_row is not None:
+                    payload_row.context_snapshot = ctx_json
+                    payload_row.payload_size = (
+                        (payload_row.payload_size or 0)
+                        + len(ctx_json.encode('utf-8'))
+                        - len((payload_row.context_snapshot or '').encode('utf-8'))
+                    )
+                else:
+                    new_payload = AnalysisHistoryPayload(
+                        history_id=row.id,
+                        raw_result=row.raw_result,
+                        news_content=row.news_content,
+                        context_snapshot=ctx_json,
+                        payload_size=len(ctx_json.encode('utf-8')),
+                        compressed=False,
+                    )
+                    session.add(new_payload)
+                    # Migrate: clear legacy columns so payload is single source
+                    row.raw_result = None
+                    row.news_content = None
+                # Clear legacy context_snapshot to avoid duplication
+                row.context_snapshot = None
                 return 1
 
             return self._run_write_transaction(
@@ -1959,9 +2256,97 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
                 .limit(limit)
             )
             results = session.execute(data_query).scalars().all()
-            
+
             return list(results), total
-    
+
+    def get_analysis_history_paginated_summary(
+        self,
+        code: Optional[Union[str, List[str]]] = None,
+        code_norm_candidates: Optional[List[str]] = None,
+        report_type: Optional[str] = None,
+        start_date: Optional[date] = None,
+        end_date: Optional[date] = None,
+        offset: int = 0,
+        limit: int = 20
+    ) -> Tuple[List[AnalysisHistory], int]:
+        """
+        Payload-free paginated query. Returns only hot/list columns,
+        excluding raw_result, news_content, context_snapshot.
+
+        Supports code_norm filtering with raw-code fallback for legacy rows.
+        """
+        from sqlalchemy import func
+
+        # Exclude large payload columns
+        hot_columns = [
+            AnalysisHistory.id, AnalysisHistory.query_id, AnalysisHistory.code,
+            AnalysisHistory.code_norm, AnalysisHistory.market, AnalysisHistory.name,
+            AnalysisHistory.report_type, AnalysisHistory.sentiment_score,
+            AnalysisHistory.operation_advice, AnalysisHistory.trend_prediction,
+            AnalysisHistory.analysis_summary, AnalysisHistory.model_used,
+            AnalysisHistory.current_price, AnalysisHistory.change_pct,
+            AnalysisHistory.volume_ratio, AnalysisHistory.turnover_rate,
+            AnalysisHistory.market_phase_summary, AnalysisHistory.analysis_phase,
+            AnalysisHistory.effective_trading_date, AnalysisHistory.created_at,
+            AnalysisHistory.updated_at, AnalysisHistory.ideal_buy,
+            AnalysisHistory.secondary_buy, AnalysisHistory.stop_loss,
+            AnalysisHistory.take_profit,
+        ]
+
+        with self.get_session() as session:
+            conditions = []
+
+            if code or code_norm_candidates:
+                code_conditions = []
+                if code_norm_candidates:
+                    norm_list = [c for c in code_norm_candidates if c]
+                    if norm_list:
+                        code_conditions.append(AnalysisHistory.code_norm.in_(norm_list))
+                if code:
+                    if isinstance(code, list):
+                        raw_list = [c for c in code if c]
+                        if raw_list:
+                            code_conditions.append(AnalysisHistory.code.in_(raw_list))
+                    else:
+                        code_conditions.append(AnalysisHistory.code == code)
+                if code_conditions:
+                    conditions.append(or_(*code_conditions))
+
+            if report_type:
+                conditions.append(AnalysisHistory.report_type == report_type)
+            if start_date:
+                conditions.append(
+                    AnalysisHistory.created_at >= datetime.combine(start_date, datetime.min.time())
+                )
+            if end_date:
+                conditions.append(
+                    AnalysisHistory.created_at < datetime.combine(end_date + timedelta(days=1), datetime.min.time())
+                )
+
+            where_clause = and_(*conditions) if conditions else True
+
+            total_query = select(func.count(AnalysisHistory.id)).where(where_clause)
+            total = session.execute(total_query).scalar() or 0
+
+            data_query = (
+                select(*hot_columns)
+                .where(where_clause)
+                .order_by(desc(AnalysisHistory.created_at))
+                .offset(offset)
+                .limit(limit)
+            )
+            rows = session.execute(data_query).all()
+
+            # Reconstruct AnalysisHistory-like objects from hot columns
+            results = []
+            for row in rows:
+                rec = AnalysisHistory()
+                for idx, col in enumerate(hot_columns):
+                    setattr(rec, col.key, row[idx])
+                results.append(rec)
+
+            return results, total
+
     def get_analysis_history_by_id(self, record_id: int) -> Optional[AnalysisHistory]:
         """
         根据数据库主键 ID 查询单条分析历史记录
@@ -2034,6 +2419,55 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
                 result['payload_raw_result'] = history.raw_result
                 result['payload_news_content'] = history.news_content
                 result['payload_context_snapshot'] = history.context_snapshot
+            return result
+
+    def get_analysis_history_payload_dict(self, history_id: int) -> Dict[str, Any]:
+        """
+        Prefer analysis_history_payload. Fallback to legacy columns.
+
+        Returns dict with keys: raw_result, news_content, context_snapshot,
+        payload_available, payload_expired.
+
+        Never raises only because payload is absent.
+        Gracefully handles expired payloads (returns None for payload fields).
+        """
+        result: Dict[str, Any] = {
+            'raw_result': None,
+            'news_content': None,
+            'context_snapshot': None,
+            'payload_available': False,
+            'payload_expired': False,
+        }
+
+        try:
+            with self.get_session() as session:
+                payload = session.execute(
+                    select(AnalysisHistoryPayload).where(
+                        AnalysisHistoryPayload.history_id == history_id
+                    )
+                ).scalars().first()
+
+                history = session.execute(
+                    select(AnalysisHistory).where(AnalysisHistory.id == history_id)
+                ).scalars().first()
+
+                if payload is not None:
+                    result['raw_result'] = payload.raw_result
+                    result['news_content'] = payload.news_content
+                    result['context_snapshot'] = payload.context_snapshot
+                    result['payload_available'] = True
+                elif history is not None:
+                    # Fallback to legacy columns
+                    result['raw_result'] = history.raw_result
+                    result['news_content'] = history.news_content
+                    result['context_snapshot'] = history.context_snapshot
+                    # If history exists but payload doesn't, payload is expired
+                    if history.raw_result is None and history.news_content is None and history.context_snapshot is None:
+                        result['payload_expired'] = True
+
+                return result
+        except Exception as exc:
+            logger.warning("get_analysis_history_payload_dict(%s) failed: %s", history_id, exc)
             return result
 
     def delete_analysis_history_records(self, record_ids: List[int]) -> int:

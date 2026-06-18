@@ -40,7 +40,7 @@ def _build_optional_module_stubs() -> dict[str, ModuleType]:
 sys.modules.update(_build_optional_module_stubs())
 import src.core.market_review as market_review_module
 from src.config import Config
-from src.storage import AnalysisHistory, DatabaseManager
+from src.storage import AnalysisHistory, AnalysisHistoryPayload, DatabaseManager
 
 run_market_review = market_review_module.run_market_review
 
@@ -409,11 +409,15 @@ class MarketReviewLocalizationTestCase(unittest.TestCase):
                     self.assertEqual(row.code, market_review_module.MARKET_REVIEW_HISTORY_CODE)
                     self.assertEqual(row.name, "大盘复盘")
                     self.assertEqual(row.report_type, market_review_module.MARKET_REVIEW_REPORT_TYPE)
-                    self.assertEqual(row.news_content, "## 今日大盘\n\n复盘正文")
-                    self.assertIn("# 🎯 大盘复盘", row.raw_result)
-                    self.assertIn('"market_light_snapshots"', row.context_snapshot)
-                    self.assertIn('"market_review_payload"', row.context_snapshot)
-                    self.assertIn('"trade_date": "2026-03-06"', row.context_snapshot)
+                    payload = session.query(AnalysisHistoryPayload).filter(
+                        AnalysisHistoryPayload.history_id == row.id
+                    ).first()
+                    self.assertIsNotNone(payload)
+                    self.assertEqual(payload.news_content, "## 今日大盘\n\n复盘正文")
+                    self.assertIn("# 🎯 大盘复盘", payload.raw_result)
+                    self.assertIn('"market_light_snapshots"', payload.context_snapshot)
+                    self.assertIn('"market_review_payload"', payload.context_snapshot)
+                    self.assertIn('"trade_date": "2026-03-06"', payload.context_snapshot)
             finally:
                 DatabaseManager.reset_instance()
                 Config._instance = None

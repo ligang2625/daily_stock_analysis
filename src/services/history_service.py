@@ -144,7 +144,9 @@ class HistoryService:
     ) -> Dict[str, Any]:
         """
         Get history analysis list.
-        
+
+        Phase 1: payload-free query using hot columns and code_norm filtering.
+
         Args:
             stock_code: Stock code filter
             report_type: Report type filter
@@ -152,53 +154,70 @@ class HistoryService:
             end_date: End date (YYYY-MM-DD)
             page: Page number
             limit: Items per page
-            
+
         Returns:
             Dictionary containing total count and items
         """
         try:
+            raw_code_candidates = None
+            code_norm_candidates = None
+
             if stock_code:
-                stock_code = self._history_code_filter_candidates(stock_code)
+                raw_code_candidates = self._history_code_filter_candidates(stock_code)
+                # Also compute normalized candidates for code_norm index
+                try:
+                    from src.services.stock_code_utils import normalize_stock_code_for_storage
+                    norm_set = set()
+                    input_codes = raw_code_candidates if isinstance(raw_code_candidates, list) else [str(stock_code).strip()]
+                    for c in input_codes:
+                        norm = normalize_stock_code_for_storage(c)
+                        if norm:
+                            norm_set.add(norm)
+                    if norm_set:
+                        code_norm_candidates = list(norm_set)
+                except Exception:
+                    pass
 
             # Parse date parameters
             start_dt = None
             end_dt = None
-            
+
             if start_date:
                 try:
                     start_dt = datetime.strptime(start_date, "%Y-%m-%d").date()
                 except ValueError:
                     logger.warning(f"无效的 start_date 格式: {start_date}")
-            
+
             if end_date:
                 try:
                     end_dt = datetime.strptime(end_date, "%Y-%m-%d").date()
                 except ValueError:
                     logger.warning(f"无效的 end_date 格式: {end_date}")
-            
+
             # Calculate offset
             offset = (page - 1) * limit
-            
-            # Use new paginated query method
-            records, total = self.db.get_analysis_history_paginated(
-                code=stock_code,
+
+            # Phase 1: use payload-free summary query with code_norm filtering
+            records, total = self.db.get_analysis_history_paginated_summary(
+                code=raw_code_candidates,
+                code_norm_candidates=code_norm_candidates,
                 report_type=report_type,
                 start_date=start_dt,
                 end_date=end_dt,
                 offset=offset,
                 limit=limit
             )
-            
+
             # Convert to response format
             items = []
             for record in records:
                 items.append(self._record_to_list_item_dict(record))
-            
+
             return {
                 "total": total,
                 "items": items,
             }
-            
+
         except Exception as e:
             logger.error(f"查询历史列表失败: {e}", exc_info=True)
             return {"total": 0, "items": []}
@@ -260,16 +279,41 @@ class HistoryService:
     def _record_to_list_item_dict(self, record) -> Dict[str, Any]:
         # Prefer hot columns when available (Phase 1); fallback to payload for old rows
         model_used_val = getattr(record, "model_used", None)
-        if not model_used_val:
-            raw_result = parse_json_field(getattr(record, "raw_result", None))
-            model_used_val = raw_result.get("model_used") if isinstance(raw_result, dict) else None
+        market_phase_summary = parse_json_field(getattr(record, "market_phase_summary", None))
+        raw_result_for_action = None
+        payload_loaded = False
+
+        # Check if we need to lazily load payload for old records
+        needs_payload = (
+            not model_used_val
+            or not market_phase_summary
+            or getattr(record, "current_price", None) is None
+        )
+
+        if needs_payload and hasattr(record, 'id') and record.id:
+            try:
+                payload = self.db.get_analysis_history_payload_dict(record.id)
+                payload_loaded = True
+                if not model_used_val:
+                    raw_result = parse_json_field(payload.get('raw_result'))
+                    model_used_val = raw_result.get("model_used") if isinstance(raw_result, dict) else None
+                    raw_result_for_action = raw_result
+                if not market_phase_summary:
+                    market_phase_summary = extract_market_phase_summary(payload.get('context_snapshot'))
+            except Exception:
+                pass
+
+        if not payload_loaded:
+            if not model_used_val:
+                raw_result_for_action = parse_json_field(getattr(record, "raw_result", None))
+                model_used_val = raw_result_for_action.get("model_used") if isinstance(raw_result_for_action, dict) else None
+            if not market_phase_summary:
+                market_phase_summary = extract_market_phase_summary(getattr(record, "context_snapshot", None))
+
+        if raw_result_for_action is None:
+            raw_result_for_action = parse_json_field(getattr(record, "raw_result", None))
 
         market_fields = self._extract_history_market_fields_for_record(record)
-        market_phase_summary = parse_json_field(getattr(record, "market_phase_summary", None))
-        if not market_phase_summary:
-            market_phase_summary = extract_market_phase_summary(getattr(record, "context_snapshot", None))
-
-        raw_result_for_action = parse_json_field(getattr(record, "raw_result", None))
         action_fields = self._decision_action_fields_for_record(record, raw_result_for_action)
 
         return {
@@ -297,7 +341,7 @@ class HistoryService:
         hot_vol = getattr(record, "volume_ratio", None)
         hot_turnover = getattr(record, "turnover_rate", None)
 
-        # If all hot columns are populated, use them directly
+        # If any hot columns are populated, use them directly
         if any(v is not None for v in (hot_price, hot_change, hot_vol, hot_turnover)):
             return {
                 "current_price": self._safe_float(hot_price),
@@ -306,8 +350,15 @@ class HistoryService:
                 "turnover_rate": self._safe_float(hot_turnover),
             }
 
-        # Fallback: parse from payload for legacy rows
-        return self._extract_history_market_fields(getattr(record, "context_snapshot", None))
+        # Fallback: try payload table first, then legacy columns
+        context_val = getattr(record, "context_snapshot", None)
+        if context_val is None and hasattr(record, 'id') and record.id:
+            try:
+                payload = self.db.get_analysis_history_payload_dict(record.id)
+                context_val = payload.get('context_snapshot')
+            except Exception:
+                pass
+        return self._extract_history_market_fields(context_val)
 
     def _resolve_record(self, record_id: str):
         """
@@ -379,18 +430,21 @@ class HistoryService:
         Legacy records without diagnostic snapshots return an ``unknown``
         summary instead of failing. Storage and JSON parsing errors are
         propagated so callers can surface backend failures accurately.
+
+        Phase 1: prefers payload-table content, falls back to legacy columns.
         """
         record = self._resolve_record(record_id)
         if not record:
             return None
 
+        payload = self.db.get_analysis_history_payload_dict(record.id)
         return build_run_diagnostic_summary(
             context_snapshot=self._parse_diagnostic_json_field(
-                getattr(record, "context_snapshot", None),
+                payload.get('context_snapshot') or getattr(record, "context_snapshot", None),
                 "context_snapshot",
             ),
             raw_result=self._parse_diagnostic_json_field(
-                getattr(record, "raw_result", None),
+                payload.get('raw_result') or getattr(record, "raw_result", None),
                 "raw_result",
             ),
             report_saved=True,
@@ -404,6 +458,8 @@ class HistoryService:
 
         Uses the same strict JSON parsing behavior as diagnostics so malformed
         persisted payloads surface as backend errors instead of partial graphs.
+
+        Phase 1: prefers payload-table content, falls back to legacy columns.
         """
         record = self._resolve_record(record_id)
         if not record:
@@ -411,14 +467,15 @@ class HistoryService:
 
         from src.services.run_flow import build_history_run_flow_snapshot
 
+        payload = self.db.get_analysis_history_payload_dict(record.id)
         return build_history_run_flow_snapshot(
             record,
             context_snapshot=self._parse_diagnostic_json_field(
-                getattr(record, "context_snapshot", None),
+                payload.get('context_snapshot') or getattr(record, "context_snapshot", None),
                 "context_snapshot",
             ),
             raw_result=self._parse_diagnostic_json_field(
-                getattr(record, "raw_result", None),
+                payload.get('raw_result') or getattr(record, "raw_result", None),
                 "raw_result",
             ),
         )
@@ -504,11 +561,32 @@ class HistoryService:
             return news_content
         return None
 
+    def _extract_market_review_content_payload(self, record, raw_result: Any, payload: Dict[str, Any]) -> Optional[str]:
+        """Return persisted market review content from payload or legacy columns."""
+        if isinstance(raw_result, dict):
+            for field in ("raw_response", "market_review_report"):
+                content = raw_result.get(field)
+                if isinstance(content, str) and content.strip():
+                    return content
+
+        news_content = payload.get('news_content') if payload else None
+        if isinstance(news_content, str) and news_content.strip():
+            return news_content
+
+        news_content = getattr(record, "news_content", None)
+        if isinstance(news_content, str) and news_content.strip():
+            return news_content
+        return None
+
     def _record_to_detail_dict(self, record) -> Dict[str, Any]:
         """
         Convert an AnalysisHistory ORM record to a detail response dict.
+
+        Phase 1: prefers payload-table content, falls back to legacy columns.
         """
-        raw_result = parse_json_field(record.raw_result)
+        # Load canonical payload (prefers analysis_history_payload, falls back to legacy)
+        payload = self.db.get_analysis_history_payload_dict(record.id)
+        raw_result = parse_json_field(payload.get('raw_result'))
 
         model_used = getattr(record, "model_used", None)
         if not model_used:
@@ -517,15 +595,19 @@ class HistoryService:
         sniper_points = self._get_display_sniper_points(record, raw_result)
 
         context_snapshot = None
-        if record.context_snapshot:
-            try:
-                context_snapshot = json.loads(record.context_snapshot)
-            except json.JSONDecodeError:
-                context_snapshot = record.context_snapshot
+        ctx_raw = payload.get('context_snapshot')
+        if ctx_raw:
+            if isinstance(ctx_raw, dict):
+                context_snapshot = ctx_raw
+            elif isinstance(ctx_raw, str):
+                try:
+                    context_snapshot = json.loads(ctx_raw)
+                except json.JSONDecodeError:
+                    context_snapshot = ctx_raw
 
         market_review_content = None
         if getattr(record, "report_type", None) == "market_review":
-            market_review_content = self._extract_market_review_content(record, raw_result)
+            market_review_content = self._extract_market_review_content_payload(record, raw_result, payload)
 
         action_fields = self._decision_action_fields_for_record(record, raw_result)
         return {
@@ -547,9 +629,11 @@ class HistoryService:
             "secondary_buy": sniper_points.get("secondary_buy"),
             "stop_loss": sniper_points.get("stop_loss"),
             "take_profit": sniper_points.get("take_profit"),
-            "news_content": market_review_content or record.news_content,
+            "news_content": market_review_content or payload.get('news_content') or record.news_content,
             "raw_result": raw_result,
             "context_snapshot": context_snapshot,
+            "payload_available": payload.get('payload_available', False),
+            "payload_expired": payload.get('payload_expired', False),
         }
 
     def _decision_action_fields_for_record(self, record, raw_result: Any) -> Dict[str, Any]:
@@ -733,8 +817,12 @@ class HistoryService:
             logger.warning(f"get_markdown_report: record not found for {record_id}")
             return None
 
-        # Rebuild AnalysisResult from raw_result
-        raw_result = parse_json_field(record.raw_result)
+        # Phase 1: prefer payload table, fallback to legacy columns
+        payload_dict = self.db.get_analysis_history_payload_dict(record.id)
+        raw_result = parse_json_field(payload_dict.get('raw_result'))
+        if not raw_result:
+            # Try legacy column as ultimate fallback
+            raw_result = parse_json_field(getattr(record, 'raw_result', None))
         if not raw_result:
             logger.error(f"get_markdown_report: raw_result is empty for {record_id}")
             raise MarkdownReportGenerationError(
@@ -743,7 +831,7 @@ class HistoryService:
             )
 
         if getattr(record, "report_type", None) == "market_review":
-            markdown_report = self._extract_market_review_content(record, raw_result)
+            markdown_report = self._extract_market_review_content_payload(record, raw_result, payload_dict)
             if markdown_report:
                 return markdown_report
             logger.error(f"get_markdown_report: market review report is empty for {record_id}")
@@ -753,7 +841,7 @@ class HistoryService:
             )
 
         try:
-            result = self._rebuild_analysis_result(raw_result, record)
+            result = self._rebuild_analysis_result(raw_result, record, payload_dict)
         except Exception as e:
             logger.error(f"get_markdown_report: failed to rebuild AnalysisResult for {record_id}: {e}", exc_info=True)
             raise MarkdownReportGenerationError(
@@ -781,7 +869,8 @@ class HistoryService:
     def _rebuild_analysis_result(
         self,
         raw_result: Dict[str, Any],
-        record
+        record,
+        payload_dict: Optional[Dict[str, Any]] = None,
     ) -> Optional[AnalysisResult]:
         """
         Rebuild an AnalysisResult object from stored raw_result dict.
@@ -789,6 +878,7 @@ class HistoryService:
         Args:
             raw_result: The parsed raw_result JSON dict
             record: The AnalysisHistory ORM record
+            payload_dict: Optional payload dict from get_analysis_history_payload_dict
 
         Returns:
             AnalysisResult object or None
@@ -821,7 +911,7 @@ class HistoryService:
                 fundamental_analysis=raw_result.get("fundamental_analysis", ""),
                 sector_position=raw_result.get("sector_position", ""),
                 company_highlights=raw_result.get("company_highlights", ""),
-                news_summary=raw_result.get("news_summary", record.news_content or ""),
+                news_summary=raw_result.get("news_summary", (payload_dict or {}).get('news_content') or getattr(record, 'news_content', '') or ''),
                 market_sentiment=raw_result.get("market_sentiment", ""),
                 hot_topics=raw_result.get("hot_topics", ""),
                 analysis_summary=raw_result.get("analysis_summary", record.analysis_summary or ""),
