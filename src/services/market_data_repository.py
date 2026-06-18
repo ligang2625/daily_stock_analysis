@@ -281,24 +281,50 @@ class MarketDataRepository:
         try:
             from sqlalchemy import text as sa_text
             with self._main_db.session_scope() as session:
-                main_rows = session.execute(
-                    sa_text(
-                        "SELECT id, code, code_norm, market, effective_trading_date, "
-                        "report_type, analysis_phase, current_price, change_pct, "
-                        "volume_ratio, turnover_rate, ideal_buy, secondary_buy, "
-                        "stop_loss, take_profit, sentiment_score, operation_advice, "
-                        "trend_prediction, analysis_summary, context_snapshot, "
-                        "raw_result, created_at "
-                        "FROM analysis_history "
-                        "WHERE code_norm = :cn "
-                        "  AND analysis_phase = 'postmarket' "
-                        "  AND (report_type IS NULL OR report_type != 'market_review') "
-                        "  AND created_at >= :start_date "
-                        "ORDER BY created_at DESC "
-                        "LIMIT :limit"
-                    ),
-                    {"cn": code_norm, "start_date": main_start.isoformat(), "limit": limit},
-                ).fetchall()
+                # Prefer payload table via LEFT JOIN; fall back to legacy query if table missing
+                main_rows = None
+                try:
+                    main_rows = session.execute(
+                        sa_text(
+                            "SELECT ah.id, ah.code, ah.code_norm, ah.market, ah.effective_trading_date, "
+                            "ah.report_type, ah.analysis_phase, ah.current_price, ah.change_pct, "
+                            "ah.volume_ratio, ah.turnover_rate, ah.ideal_buy, ah.secondary_buy, "
+                            "ah.stop_loss, ah.take_profit, ah.sentiment_score, ah.operation_advice, "
+                            "ah.trend_prediction, ah.analysis_summary, "
+                            "COALESCE(ahp.context_snapshot, ah.context_snapshot) AS context_snapshot, "
+                            "COALESCE(ahp.raw_result, ah.raw_result) AS raw_result, "
+                            "ah.created_at "
+                            "FROM analysis_history ah "
+                            "LEFT JOIN analysis_history_payload ahp ON ah.id = ahp.history_id "
+                            "WHERE ah.code_norm = :cn "
+                            "  AND ah.analysis_phase = 'postmarket' "
+                            "  AND (ah.report_type IS NULL OR ah.report_type != 'market_review') "
+                            "  AND ah.created_at >= :start_date "
+                            "ORDER BY ah.created_at DESC "
+                            "LIMIT :limit"
+                        ),
+                        {"cn": code_norm, "start_date": main_start.isoformat(), "limit": limit},
+                    ).fetchall()
+                except Exception as exc:
+                    logger.warning("Payload-aware postmarket query failed (may be old DB): %s", exc)
+                    main_rows = session.execute(
+                        sa_text(
+                            "SELECT id, code, code_norm, market, effective_trading_date, "
+                            "report_type, analysis_phase, current_price, change_pct, "
+                            "volume_ratio, turnover_rate, ideal_buy, secondary_buy, "
+                            "stop_loss, take_profit, sentiment_score, operation_advice, "
+                            "trend_prediction, analysis_summary, context_snapshot, "
+                            "raw_result, created_at "
+                            "FROM analysis_history "
+                            "WHERE code_norm = :cn "
+                            "  AND analysis_phase = 'postmarket' "
+                            "  AND (report_type IS NULL OR report_type != 'market_review') "
+                            "  AND created_at >= :start_date "
+                            "ORDER BY created_at DESC "
+                            "LIMIT :limit"
+                        ),
+                        {"cn": code_norm, "start_date": main_start.isoformat(), "limit": limit},
+                    ).fetchall()
 
                 for row in main_rows:
                     trade_date = (str(row[4]) if row[4] else str(row[20])[:10]) if row[20] else ""
@@ -373,17 +399,37 @@ class MarketDataRepository:
         try:
             from sqlalchemy import text as sa_text
             with self._main_db.session_scope() as session:
-                main_rows = session.execute(
-                    sa_text(
-                        "SELECT id, effective_trading_date, context_snapshot, created_at "
-                        "FROM analysis_history "
-                        "WHERE report_type = 'market_review' "
-                        "  AND created_at >= :start_date "
-                        "ORDER BY created_at DESC "
-                        "LIMIT :limit"
-                    ),
-                    {"start_date": main_start.isoformat(), "limit": limit},
-                ).fetchall()
+                # Prefer payload table via LEFT JOIN; fall back to legacy query if table missing
+                rows_raw = None
+                try:
+                    rows_raw = session.execute(
+                        sa_text(
+                            "SELECT ah.id, ah.effective_trading_date, "
+                            "COALESCE(ahp.context_snapshot, ah.context_snapshot) AS context_snapshot, "
+                            "ah.created_at "
+                            "FROM analysis_history ah "
+                            "LEFT JOIN analysis_history_payload ahp ON ah.id = ahp.history_id "
+                            "WHERE ah.report_type = 'market_review' "
+                            "  AND ah.created_at >= :start_date "
+                            "ORDER BY ah.created_at DESC "
+                            "LIMIT :limit"
+                        ),
+                        {"start_date": main_start.isoformat(), "limit": limit},
+                    ).fetchall()
+                except Exception as exc:
+                    logger.warning("Payload-aware market_review query failed (may be old DB): %s", exc)
+                    rows_raw = session.execute(
+                        sa_text(
+                            "SELECT id, effective_trading_date, context_snapshot, created_at "
+                            "FROM analysis_history "
+                            "WHERE report_type = 'market_review' "
+                            "  AND created_at >= :start_date "
+                            "ORDER BY created_at DESC "
+                            "LIMIT :limit"
+                        ),
+                        {"start_date": main_start.isoformat(), "limit": limit},
+                    ).fetchall()
+                main_rows = rows_raw
 
                 for row in main_rows:
                     trade_date = str(row[1]) if row[1] else (str(row[3])[:10] if row[3] else "")

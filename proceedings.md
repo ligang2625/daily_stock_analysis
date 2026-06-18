@@ -282,3 +282,33 @@ CREATE TABLE intraday_market_snapshots (
 ### 测试
 
 **3364 + 35 = 3399 passed, 14 failed, 2 skipped** (14 failed 均为预存已知问题，零回归)
+
+## Session 8: Phase 2 Remediation — Payload Split Compatibility (2026-06-18)
+
+### 修复项
+
+| # | Priority | Fix | Key Change |
+|---|----------|-----|------------|
+| 1 | Critical | Archive extractors payload-split aware | LEFT JOIN `analysis_history_payload` with COALESCE for `raw_result`/`context_snapshot`/`news_content`; legacy fallback |
+| 2 | Critical | MarketDataRepository payload-split aware | LEFT JOIN in main-side `get_market_light_daily`/`get_postmarket_technical_summary` |
+| 3 | Major | Cutoff boundary strict `<` | All 4 extractors use `< :cutoff` instead of `<=`; aligns with cleanup semantics |
+| 4 | Major | Intraday upsert idempotent with NULL snapshot_id | Normalize NULL to `legacy:{row_id}` |
+| 5 | Minor | Composite indexes | 4 query-path indexes matching repository patterns |
+
+### 新增文件
+
+| 文件 | 说明 |
+|------|------|
+| `tests/test_phase2_payload_split_extractors.py` | 6 测试：payload 表提取、cutoff 边界、幂等性、仓库跨边界去重 |
+
+### 修改文件
+
+| 文件 | 改动 |
+|------|------|
+| `src/maintenance/archive_extractors.py` | payload LEFT JOIN + cutoff `<` + NULL snapshot_id normalization |
+| `src/services/market_data_repository.py` | payload LEFT JOIN for main-side queries |
+| `src/storage_historical.py` | 4 composite indexes |
+
+### 测试
+
+**410+ passed, 0 regressions** (仅 3 预存 scheduler failures)

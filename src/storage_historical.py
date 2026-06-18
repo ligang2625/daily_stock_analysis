@@ -107,6 +107,7 @@ class HistoricalStockDaily(HistoricalBase):
         UniqueConstraint('code_norm', 'trade_date', name='uix_hsd_code_norm_date'),
         Index('ix_hsd_code_norm', 'code_norm'),
         Index('ix_hsd_trade_date', 'trade_date'),
+        Index('ix_hsd_code_norm_trade_date', 'code_norm', 'trade_date'),
     )
 
 
@@ -140,6 +141,8 @@ class HistoricalIntradayQuotePoint(HistoricalBase):
                          name='uix_hiqp_code_ts_sid'),
         Index('ix_hiqp_code_norm', 'stock_code_norm'),
         Index('ix_hiqp_query_date', 'query_date'),
+        Index('ix_hiqp_code_norm_query_date', 'stock_code_norm', 'query_date'),
+        Index('ix_hiqp_code_norm_timestamp', 'stock_code_norm', 'timestamp'),
     )
 
 
@@ -183,6 +186,7 @@ class HistoricalPostmarketTechnicalSummary(HistoricalBase):
                          name='uix_hpts_code_date_phase_type'),
         Index('ix_hpts_code_norm', 'code_norm'),
         Index('ix_hpts_trade_date', 'trade_date'),
+        Index('ix_hpts_code_norm_trade_date', 'code_norm', 'trade_date'),
     )
 
 
@@ -206,6 +210,7 @@ class HistoricalMarketLightDaily(HistoricalBase):
         UniqueConstraint('region', 'trade_date', name='uix_hmld_region_date'),
         Index('ix_hmld_region', 'region'),
         Index('ix_hmld_trade_date', 'trade_date'),
+        Index('ix_hmld_region_trade_date', 'region', 'trade_date'),
     )
 
 

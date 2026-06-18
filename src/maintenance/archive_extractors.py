@@ -94,7 +94,7 @@ def extract_stock_daily(
             "SELECT id, code, date, open, high, low, close, pct_chg, volume, "
             "amount, volume_ratio, data_source, ma5, ma10, ma20 "
             "FROM stock_daily "
-            "WHERE date <= :cutoff "
+            "WHERE date < :cutoff "
             "ORDER BY code, date"
         ),
         {"cutoff": cutoff_date.isoformat()},
@@ -167,7 +167,7 @@ def extract_intraday_quote_points(
     cutoff_date: date,
 ) -> List[Dict[str, Any]]:
     """
-    Read intraday_events with query_date <= cutoff_date, parse raw_quote
+    Read intraday_events with query_date < cutoff_date, parse raw_quote
     JSON for turnover / amount / current_volume / technical_position /
     price_position, and return rows for HistoricalIntradayQuotePoint.
     """
@@ -198,7 +198,7 @@ def extract_intraday_quote_points(
         rows_raw = connection.execute(
             sa_text(
                 f"SELECT {cols_str} FROM intraday_events "
-                "WHERE query_date <= :cutoff "
+                "WHERE query_date < :cutoff "
                 "ORDER BY query_date, timestamp"
             ),
             {"cutoff": cutoff_date.isoformat()},
@@ -229,9 +229,14 @@ def extract_intraday_quote_points(
                 technical_position = _coerce_str(raw_quote_json.get('technical_position'))
                 price_position = _coerce_str(raw_quote_json.get('price_position'))
 
+            row_id = row[0]
             snapshot_id = None
             if len(row) > 12:
                 snapshot_id = row[12]
+            # Normalize NULL snapshot_id to non-null for true idempotent upsert
+            # (SQLite allows duplicate NULLs in unique constraints)
+            if not snapshot_id:
+                snapshot_id = f"legacy:{row_id}"
 
             results.append({
                 'query_date': str(row[1]) if row[1] else '',
@@ -281,22 +286,47 @@ def extract_postmarket_technical_summaries(
         normalize_market_region,
     )
 
-    rows_raw = session.execute(
-        sa_text(
-            "SELECT id, code, code_norm, market, name, report_type, analysis_phase, "
-            "sentiment_score, operation_advice, trend_prediction, analysis_summary, "
-            "raw_result, context_snapshot, news_content, "
-            "ideal_buy, secondary_buy, stop_loss, take_profit, "
-            "current_price, change_pct, volume_ratio, turnover_rate, "
-            "created_at, effective_trading_date "
-            "FROM analysis_history "
-            "WHERE analysis_phase = 'postmarket' "
-            "  AND (report_type IS NULL OR report_type != 'market_review') "
-            "  AND created_at <= :cutoff "
-            "ORDER BY created_at"
-        ),
-        {"cutoff": cutoff_date.isoformat()},
-    ).fetchall()
+    # Try payload-aware query first; fall back to legacy query if payload table doesn't exist
+    rows_raw = None
+    try:
+        rows_raw = session.execute(
+            sa_text(
+                "SELECT ah.id, ah.code, ah.code_norm, ah.market, ah.name, "
+                "ah.report_type, ah.analysis_phase, "
+                "ah.sentiment_score, ah.operation_advice, ah.trend_prediction, ah.analysis_summary, "
+                "COALESCE(ahp.raw_result, ah.raw_result) AS raw_result, "
+                "COALESCE(ahp.context_snapshot, ah.context_snapshot) AS context_snapshot, "
+                "COALESCE(ahp.news_content, ah.news_content) AS news_content, "
+                "ah.ideal_buy, ah.secondary_buy, ah.stop_loss, ah.take_profit, "
+                "ah.current_price, ah.change_pct, ah.volume_ratio, ah.turnover_rate, "
+                "ah.created_at, ah.effective_trading_date "
+                "FROM analysis_history ah "
+                "LEFT JOIN analysis_history_payload ahp ON ah.id = ahp.history_id "
+                "WHERE ah.analysis_phase = 'postmarket' "
+                "  AND (ah.report_type IS NULL OR ah.report_type != 'market_review') "
+                "  AND ah.created_at < :cutoff "
+                "ORDER BY ah.created_at"
+            ),
+            {"cutoff": cutoff_date.isoformat()},
+        ).fetchall()
+    except Exception as exc:
+        logger.warning("Payload-aware postmarket query failed (may be old DB without payload table): %s", exc)
+        rows_raw = session.execute(
+            sa_text(
+                "SELECT id, code, code_norm, market, name, report_type, analysis_phase, "
+                "sentiment_score, operation_advice, trend_prediction, analysis_summary, "
+                "raw_result, context_snapshot, news_content, "
+                "ideal_buy, secondary_buy, stop_loss, take_profit, "
+                "current_price, change_pct, volume_ratio, turnover_rate, "
+                "created_at, effective_trading_date "
+                "FROM analysis_history "
+                "WHERE analysis_phase = 'postmarket' "
+                "  AND (report_type IS NULL OR report_type != 'market_review') "
+                "  AND created_at < :cutoff "
+                "ORDER BY created_at"
+            ),
+            {"cutoff": cutoff_date.isoformat()},
+        ).fetchall()
 
     results: List[Dict[str, Any]] = []
     for row in rows_raw:
@@ -338,6 +368,8 @@ def extract_postmarket_technical_summaries(
 
             if payload_fallback:
                 # Try context_snapshot first (structured), then raw_result
+                # Accumulate from both columns instead of early-breaking,
+                # so partial data in one column doesn't block the other.
                 for raw_payload in (row[12], row[11]):  # context_snapshot, raw_result
                     payload = _safe_json_parse(raw_payload)
                     if not payload:
@@ -363,9 +395,6 @@ def extract_postmarket_technical_summaries(
                     ma60 = ma60 or _safe_float(payload.get('ma60'))
                     support_level = support_level or _safe_float(payload.get('support_level')) or _safe_float(payload.get('support'))
                     resistance_level = resistance_level or _safe_float(payload.get('resistance_level')) or _safe_float(payload.get('resistance'))
-
-                    if any(v is not None for v in (ma5, ma10, ma20, ma60, support_level, resistance_level)):
-                        break
 
             bias5 = _compute_bias(close, ma5)
             bias10 = _compute_bias(close, ma10)
@@ -422,17 +451,35 @@ def extract_market_light_daily(
     """
     from sqlalchemy import text as sa_text
 
-    rows_raw = session.execute(
-        sa_text(
-            "SELECT id, code, code_norm, market, effective_trading_date, "
-            "context_snapshot, created_at "
-            "FROM analysis_history "
-            "WHERE report_type = 'market_review' "
-            "  AND created_at <= :cutoff "
-            "ORDER BY created_at"
-        ),
-        {"cutoff": cutoff_date.isoformat()},
-    ).fetchall()
+    # Try payload-aware query first; fall back to legacy query if payload table doesn't exist
+    rows_raw = None
+    try:
+        rows_raw = session.execute(
+            sa_text(
+                "SELECT ah.id, ah.code, ah.code_norm, ah.market, ah.effective_trading_date, "
+                "COALESCE(ahp.context_snapshot, ah.context_snapshot) AS context_snapshot, "
+                "ah.created_at "
+                "FROM analysis_history ah "
+                "LEFT JOIN analysis_history_payload ahp ON ah.id = ahp.history_id "
+                "WHERE ah.report_type = 'market_review' "
+                "  AND ah.created_at < :cutoff "
+                "ORDER BY ah.created_at"
+            ),
+            {"cutoff": cutoff_date.isoformat()},
+        ).fetchall()
+    except Exception as exc:
+        logger.warning("Payload-aware market_review query failed (may be old DB without payload table): %s", exc)
+        rows_raw = session.execute(
+            sa_text(
+                "SELECT id, code, code_norm, market, effective_trading_date, "
+                "context_snapshot, created_at "
+                "FROM analysis_history "
+                "WHERE report_type = 'market_review' "
+                "  AND created_at < :cutoff "
+                "ORDER BY created_at"
+            ),
+            {"cutoff": cutoff_date.isoformat()},
+        ).fetchall()
 
     results: List[Dict[str, Any]] = []
     for row in rows_raw:
