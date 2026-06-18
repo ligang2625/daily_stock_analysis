@@ -6,10 +6,16 @@ Phase 1: Deletes expired runtime records and large payloads from the main
 database. Summary and technical rows (analysis_history, stock_daily) are
 NOT deleted.
 
+Phase 2: Before Phase 1 cleanup, extracts structured technical history from
+the main database and upserts it into historical_market.db.
+
 Usage:
     python -m src.maintenance.archive --days 5 --dry-run
     python -m src.maintenance.archive --cutoff-date 2026-06-10
     python -m src.maintenance.archive --days 5 --skip-vacuum
+    python -m src.maintenance.archive --days 5 --technical-only
+    python -m src.maintenance.archive --days 5 --skip-technical-archive
+    python -m src.maintenance.archive --days 5 --validate-only
 """
 
 from __future__ import annotations
@@ -26,6 +32,7 @@ from sqlalchemy import text as sa_text, func, select as sa_select
 from src.config import get_config
 from src.storage import DatabaseManager
 from src.storage_historical import HistoricalDatabaseManager
+from src.maintenance.archive_extractors import extract_phase2_technical_history
 
 logger = logging.getLogger(__name__)
 
@@ -179,22 +186,49 @@ def _dry_run(db: DatabaseManager, cutoff_date: date) -> Dict[str, int]:
     return counts
 
 
+def _run_phase2_technical_archive(
+    db: DatabaseManager,
+    historical_db: HistoricalDatabaseManager,
+    cutoff_date: date,
+    dry_run: bool = False,
+) -> Dict[str, Any]:
+    """
+    Run Phase 2 technical extraction and return stats dict.
+
+    On failure, raises the exception so the caller can handle the safety gate.
+    """
+    return extract_phase2_technical_history(
+        main_db=db,
+        historical_db=historical_db,
+        cutoff_date=cutoff_date,
+        dry_run=dry_run,
+    )
+
+
 def run_archive(
     *,
     days: int = 5,
     dry_run: bool = False,
     cutoff_date: Optional[date] = None,
     skip_vacuum: bool = False,
+    technical_only: bool = False,
+    skip_technical_archive: bool = False,
+    validate_only: bool = False,
 ) -> int:
     """
     Execute archive maintenance.
 
-    Cleanup order:
-    1. Null legacy large payload columns (raw_result, news_content, context_snapshot)
-    2. Delete expired analysis_history_payload rows
-    3. Delete other allowed runtime tables
-    4. If not --skip-vacuum: wal_checkpoint(TRUNCATE), VACUUM, ANALYZE
+    Order:
+    1. (Phase 2) Extract structured technical history into historical_market.db
+       (skip if --skip-technical-archive)
+    2. Null legacy large payload columns (raw_result, news_content, context_snapshot)
+    3. Delete expired analysis_history_payload rows
+    4. Delete other allowed runtime tables
+    5. If not --skip-vacuum: wal_checkpoint(TRUNCATE), VACUUM, ANALYZE
        (outside the destructive transaction)
+
+    Steps 2-5 are skipped in --technical-only mode.
+    Step 1 is skipped in --skip-technical-archive mode.
 
     Returns 0 on success, 1 on error.
     """
@@ -207,8 +241,9 @@ def run_archive(
     days_val = (date.today() - cutoff_date).days
 
     logger.info(
-        "Archive maintenance starting: cutoff=%s days_back=%s dry_run=%s",
-        cutoff_str, days_val, dry_run,
+        "Archive maintenance starting: cutoff=%s days_back=%s dry_run=%s "
+        "technical_only=%s skip_technical=%s validate_only=%s",
+        cutoff_str, days_val, dry_run, technical_only, skip_technical_archive, validate_only,
     )
 
     db = DatabaseManager.get_instance()
@@ -225,38 +260,109 @@ def run_archive(
     )
 
     counts: Dict[str, int] = {}
+    total_deleted = 0
+    total_read = 0
+    total_written = 0
 
     try:
+        # ------------------------------------------------------------------
+        # Phase 2: Technical archive extraction
+        # ------------------------------------------------------------------
+        if not skip_technical_archive:
+            tech_dry_run = dry_run or validate_only
+            logger.info("--- Phase 2: Technical history extraction (dry_run=%s) ---", tech_dry_run)
+            try:
+                phase2_stats = _run_phase2_technical_archive(
+                    db=db,
+                    historical_db=historical_db,
+                    cutoff_date=cutoff_date,
+                    dry_run=tech_dry_run,
+                )
+                tech_read = sum(
+                    s['read'] for s in phase2_stats.values()
+                    if isinstance(s, dict) and 'read' in s
+                )
+                tech_written = sum(
+                    s['written'] for s in phase2_stats.values()
+                    if isinstance(s, dict) and 'written' in s
+                )
+                total_read += tech_read
+                total_written += tech_written
+                logger.info(
+                    "Phase 2 extraction complete: read=%s written=%s details=%s",
+                    tech_read, tech_written,
+                    {k: {'read': v.get('read', 0), 'written': v.get('written', 0)}
+                     for k, v in phase2_stats.items() if isinstance(v, dict)},
+                )
+            except Exception as exc:
+                logger.error("Phase 2 technical archive failed: %s", exc)
+                historical_db.finish_archive_run(
+                    run_id=run_id,
+                    success=False,
+                    rows_read=total_read,
+                    rows_written=total_written,
+                    rows_deleted=0,
+                    error_message=f"Phase2 extraction failed: {str(exc)[:1900]}",
+                )
+                return 1
+
+        # --- validate-only: stop after technical extraction ---
+        if validate_only:
+            logger.info("--- validate-only mode: stopping after technical extraction ---")
+            historical_db.finish_archive_run(
+                run_id=run_id,
+                success=True,
+                rows_read=total_read,
+                rows_written=total_written,
+                rows_deleted=0,
+            )
+            return 0
+
+        # --- technical-only: stop after technical extraction, no main DB cleanup ---
+        if technical_only:
+            logger.info("--- technical-only mode: stopping after technical extraction ---")
+            historical_db.finish_archive_run(
+                run_id=run_id,
+                success=True,
+                rows_read=total_read,
+                rows_written=total_written,
+                rows_deleted=0,
+            )
+            return 0
+
+        # ------------------------------------------------------------------
+        # Phase 1: Dry-run or actual cleanup
+        # ------------------------------------------------------------------
         if dry_run:
             logger.info("--- DRY RUN --- No data will be deleted ---")
             counts = _dry_run(db, cutoff_date)
 
             logger.info("=== Dry-run results (cutoff: %s) ===", cutoff_str)
-            total = 0
+            dry_total = 0
             for table_name, _ts_col in DRY_RUN_COUNT_TABLES:
                 c = counts.get(table_name, 0)
-                total += c
+                dry_total += c
                 protected = table_name in ('analysis_history', 'stock_daily')
                 marker = " (PROTECTED — counted, NOT deleted)" if protected else ""
                 logger.info("  %s: %d rows%s", table_name, c, marker)
             legacy = counts.get('analysis_history_legacy_payload_cols', 0)
             if legacy:
                 logger.info("  analysis_history (legacy payload columns to null): %d columns", legacy)
-            logger.info("  TOTAL candidate rows: %d", total + legacy)
+            logger.info("  TOTAL candidate rows: %d", dry_total + legacy)
             logger.info("=== End dry-run ===")
+
+            total_read += dry_total + legacy
 
             historical_db.finish_archive_run(
                 run_id=run_id,
                 success=True,
-                rows_read=total + legacy,
-                rows_written=0,
+                rows_read=total_read,
+                rows_written=total_written,
                 rows_deleted=0,
             )
             return 0
 
         # --- Actual cleanup (non-dry-run) ---
-        total_deleted = 0
-        total_read = 0
         legacy_nulled = 0
         payload_deleted = 0
 
@@ -309,7 +415,6 @@ def run_archive(
             try:
                 with db.session_scope() as session:
                     conn = session.connection()
-                    # Checkpoint to flush WAL to main DB file
                     conn.execute(sa_text("PRAGMA wal_checkpoint(TRUNCATE)"))
                     session.commit()
             except Exception as exc:
@@ -334,15 +439,17 @@ def run_archive(
             logger.info("SQLite maintenance complete")
 
         logger.info(
-            "Archive complete: deleted=%d rows (legacy_nulled=%d payload_deleted=%d) across %d tables",
+            "Archive complete: deleted=%d rows (legacy_nulled=%d payload_deleted=%d) "
+            "across %d tables | historical_written=%d",
             total_deleted, legacy_nulled, payload_deleted, len(ALLOWED_DELETE_TABLES) + 1,
+            total_written,
         )
 
         historical_db.finish_archive_run(
             run_id=run_id,
             success=True,
             rows_read=total_read,
-            rows_written=0,
+            rows_written=total_written,
             rows_deleted=total_deleted,
         )
         return 0
@@ -352,7 +459,8 @@ def run_archive(
         historical_db.finish_archive_run(
             run_id=run_id,
             success=False,
-            rows_read=sum(counts.values()),
+            rows_read=total_read,
+            rows_written=total_written,
             rows_deleted=0,
             error_message=str(exc)[:2000],
         )
@@ -380,6 +488,18 @@ def main(argv: Optional[List[str]] = None) -> int:
         '--skip-vacuum', action='store_true',
         help='Skip VACUUM after deletion',
     )
+    parser.add_argument(
+        '--technical-only', action='store_true',
+        help='Only extract Phase 2 technical history; skip main DB cleanup',
+    )
+    parser.add_argument(
+        '--skip-technical-archive', action='store_true',
+        help='Skip Phase 2 technical extraction entirely',
+    )
+    parser.add_argument(
+        '--validate-only', action='store_true',
+        help='Run Phase 2 extraction in dry-run mode and stop (no writes, no cleanup)',
+    )
 
     args = parser.parse_args(argv)
 
@@ -401,6 +521,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         dry_run=args.dry_run,
         cutoff_date=cutoff_date,
         skip_vacuum=args.skip_vacuum,
+        technical_only=args.technical_only,
+        skip_technical_archive=args.skip_technical_archive,
+        validate_only=args.validate_only,
     )
 
 

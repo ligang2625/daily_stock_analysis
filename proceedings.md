@@ -246,3 +246,39 @@ CREATE TABLE intraday_market_snapshots (
 ### 测试
 
 **3364 passed, 14 failed, 2 skipped** (14 failed 均为预存已知问题，零回归)
+
+## Session 7: Phase 2 — 技术面历史结构化 (2026-06-18)
+
+### 新增特性
+
+| # | Priority | Feature | Key Change |
+|---|----------|---------|------------|
+| 1 | Major | 历史库 4 张业务表 | `HistoricalStockDaily`, `HistoricalIntradayQuotePoint`, `HistoricalPostmarketTechnicalSummary`, `HistoricalMarketLightDaily` ORM + 唯一约束 + 复合索引 + 幂等 upsert |
+| 2 | Major | 技术面归档抽取器 | `archive_extractors.py` 含 4 个 extractor + `extract_phase2_technical_history` 入口；stock_daily pre_close/bias 计算，intraday raw_quote JSON 解析，postmarket hot fields + payload 补充，market_light 抽取 |
+| 3 | Major | Archive CLI 集成 | `--technical-only`, `--skip-technical-archive`, `--validate-only`；extraction 失败安全门禁阻止主库 cleanup |
+| 4 | Major | MarketDataRepository | 统一查询层：recent→主库/old→历史库路由，跨边界合并去重，HK code 归一化，历史库缺失降级 |
+| 5 | Major | Phase 2 测试覆盖 | 35 新测试覆盖 schema、extractor、archive 集成、repository、market light 归档 |
+
+### 新增文件
+
+| 文件 | 说明 |
+|------|------|
+| `src/maintenance/archive_extractors.py` | 4 extractors + 统一入口 |
+| `src/services/market_data_repository.py` | 双库统一查询层 |
+| `tests/test_historical_storage_schema.py` | 7 测试：表存在、幂等 init、upsert 幂等、可空字段 |
+| `tests/test_technical_archive_extractors.py` | 9 测试：stock_daily、intraday、postmarket、market_light extraction |
+| `tests/test_archive_phase2_integration.py` | 7 测试：dry-run、technical-only、validate-only、safety gate |
+| `tests/test_market_data_repository.py` | 9 测试：主库/历史库/跨边界路由、HK code、降级 |
+| `tests/test_market_light_daily_archive.py` | 5 测试：幂等 upsert、缺失字段容错、多 region |
+
+### 修改文件
+
+| 文件 | 改动 |
+|------|------|
+| `src/storage_historical.py` | 4 新 ORM model + 4 upsert 方法 |
+| `src/maintenance/archive.py` | Phase 2 extraction step + 3 CLI flags + safety gate |
+| `src/config.py` | `historical_database_path` env var wiring |
+
+### 测试
+
+**3364 + 35 = 3399 passed, 14 failed, 2 skipped** (14 failed 均为预存已知问题，零回归)
