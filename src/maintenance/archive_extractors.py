@@ -532,6 +532,90 @@ def extract_market_light_daily(
 
 
 # ---------------------------------------------------------------------------
+# Extractor: intraday_market_snapshots -> historical_market_index_points
+# ---------------------------------------------------------------------------
+
+def extract_market_index_points(
+    connection,
+    cutoff_date: date,
+) -> List[Dict[str, Any]]:
+    """
+    Read intraday_market_snapshots with query_date < cutoff_date, map fields
+    to HistoricalMarketIndexPoint schema, and compute derived labels.
+
+    Returns a list of dicts suitable for
+    HistoricalDatabaseManager.upsert_market_index_points_batch().
+    """
+    from sqlalchemy import text as sa_text
+
+    try:
+        rows_raw = connection.execute(
+            sa_text(
+                "SELECT query_date, market, index_code, index_name, "
+                "timestamp, market_local_timestamp, snapshot_id, "
+                "current_price, change_pct, open_price, high_price, low_price, "
+                "prev_close, volume, amount, status "
+                "FROM intraday_market_snapshots "
+                "WHERE query_date < :cutoff "
+                "ORDER BY market, index_code, market_local_timestamp"
+            ),
+            {"cutoff": cutoff_date.isoformat()},
+        ).fetchall()
+    except Exception as exc:
+        logger.warning("Failed to query intraday_market_snapshots: %s", exc)
+        return []
+
+    results: List[Dict[str, Any]] = []
+    for row in rows_raw:
+        try:
+            change_pct = _safe_float(row[8])
+
+            # Compute derived labels
+            if change_pct is not None:
+                if change_pct > 0.5:
+                    trend_label = 'rising'
+                elif change_pct < -0.5:
+                    trend_label = 'falling'
+                else:
+                    trend_label = 'flat'
+                strength_label = 'strong' if abs(change_pct) > 2 else 'neutral'
+            else:
+                trend_label = 'insufficient'
+                strength_label = 'insufficient'
+
+            snapshot_id = str(row[6]) if row[6] else ''
+            # Normalize NULL snapshot_id for idempotent upsert
+            if not snapshot_id:
+                snapshot_id = ''
+
+            results.append({
+                'query_date': str(row[0]) if row[0] else '',
+                'market': str(row[1]) if row[1] else '',
+                'index_code': str(row[2]) if row[2] else '',
+                'index_name': str(row[3]) if row[3] else None,
+                'timestamp': str(row[4]) if row[4] else None,
+                'market_local_timestamp': str(row[5]) if row[5] else '',
+                'snapshot_id': snapshot_id,
+                'current_price': _safe_float(row[7]),
+                'change_pct': change_pct,
+                'open': _safe_float(row[9]),
+                'high': _safe_float(row[10]),
+                'low': _safe_float(row[11]),
+                'pre_close': _safe_float(row[12]),
+                'volume': _safe_float(row[13]),
+                'amount': _safe_float(row[14]),
+                'trend_label': trend_label,
+                'strength_label': strength_label,
+                'breadth_label': None,
+                'status': str(row[15]) if row[15] else 'valid',
+            })
+        except Exception as exc:
+            logger.warning("Failed to parse market index row: %s", exc)
+
+    return results
+
+
+# ---------------------------------------------------------------------------
 # Unified entry point
 # ---------------------------------------------------------------------------
 
@@ -553,6 +637,7 @@ def extract_phase2_technical_history(
         'intraday_quote_points': {'read': 0, 'written': 0},
         'postmarket_technical_summary': {'read': 0, 'written': 0},
         'market_light_daily': {'read': 0, 'written': 0},
+        'market_index_points': {'read': 0, 'written': 0},
         'dry_run': dry_run,
     }
 
@@ -610,6 +695,20 @@ def extract_phase2_technical_history(
                     stats['market_light_daily']['written'])
     except Exception as exc:
         logger.error("extract_market_light_daily failed: %s", exc)
+        raise
+
+    # 5. Extract market_index_points (Phase 3)
+    try:
+        with main_db.session_scope() as session:
+            conn = session.connection()
+            rows = extract_market_index_points(conn, cutoff_date)
+        stats['market_index_points']['read'] = len(rows)
+        if rows and not dry_run:
+            stats['market_index_points']['written'] = historical_db.upsert_market_index_points_batch(rows)
+        logger.info("extract_market_index_points: read=%s written=%s", len(rows),
+                    stats['market_index_points']['written'])
+    except Exception as exc:
+        logger.error("extract_market_index_points failed: %s", exc)
         raise
 
     total_read = sum(s['read'] for s in stats.values() if isinstance(s, dict) and 'read' in s)

@@ -32,6 +32,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 <!-- 每条独立一行追加到本段末尾，无需分类标题，合并时冲突最小 -->
 - [修复] 桌面发布打包改用冻结可执行文件运行时探针校验 `alphasift.dsa_adapter`，避免 macOS PyInstaller 将模块内嵌进可执行文件时被文件系统/zip 扫描误判为缺失。
 - [改进] 盘中决策邮件最终建议区改为按买入/卖出止盈/卖出止损/观望分组列表，不再使用Markdown总表；新增事件预分类与放量事件合并，新增邮件内容规范化兜底，新增决策格式自动化测试。
+- [新功能] 新增大盘指数快照历史归档: `historical_market_index_points` 表 + batch upsert + 趋势/强度衍生标签
+- [新功能] 大盘指数归档 extractor: 从 `intraday_market_snapshots` 抽取旧数据到历史库，支持空 snapshot_id 标准化
+- [新功能] `MarketDataRepository.get_market_index_trend`: 跨主库/历史库统一读取大盘指数走势，自动去重合并
+- [新功能] `intraday_relative_strength` 模块: 系统计算个股相对大盘强弱(涨跌幅/背离/方向标签)，注入 prompt 供 LLM 引用
+- [改进] `intraday_monitor.py` 决策大盘加载优先走 Repository，失败降级到直接 SQL
+- [改进] `_apply_schema_migrations` 补全 `intraday_market_snapshots` 缺少的 `timestamp`/`error_message` 列
+- [测试] 新增大盘指数快照/历史归档/Repository 路由/相对强弱计算与 Prompt 注入 5 个测试文件(33 个测试)
 
 ## [3.21.0] - 2026-06-07
 

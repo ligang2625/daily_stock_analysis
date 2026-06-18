@@ -506,6 +506,126 @@ class MarketDataRepository:
         return results
 
     # ------------------------------------------------------------------
+    # get_market_index_trend
+    # ------------------------------------------------------------------
+
+    def get_market_index_trend(
+        self,
+        market: str,
+        query_date: Optional[str] = None,
+        index_code: Optional[str] = None,
+        days_back: int = 30,
+        limit: int = 500,
+    ) -> List[Dict[str, Any]]:
+        """
+        Get market index trend data for a given market.
+
+        Routes to main DB (intraday_market_snapshots) for recent/current dates
+        and historical DB (historical_market_index_points) for older data.
+        Results are merged and deduplicated by (market, index_code, query_date,
+        market_local_timestamp, snapshot_id).
+        """
+        from sqlalchemy import text as sa_text
+
+        main_start, boundary = self._split_date_range(days_back)
+        results: List[Dict[str, Any]] = []
+        seen_keys: set = set()
+
+        # --- Main DB query ---
+        try:
+            with self._main_db.session_scope() as session:
+                conn = session.connection()
+
+                if query_date:
+                    date_filter = "query_date = :qd"
+                    params: dict = {"mkt": market, "qd": query_date, "limit": limit}
+                else:
+                    date_filter = "query_date >= :start_date"
+                    params = {"mkt": market, "start_date": main_start.isoformat(), "limit": limit}
+
+                if index_code:
+                    index_filter = "AND index_code = :ic"
+                    params["ic"] = index_code
+                else:
+                    index_filter = ""
+
+                main_rows = conn.execute(
+                    sa_text(
+                        f"SELECT query_date, market, index_code, index_name, "
+                        f"timestamp, market_local_timestamp, current_price, change_pct, "
+                        f"open_price, high_price, low_price, prev_close, volume, amount, "
+                        f"status, snapshot_id "
+                        f"FROM intraday_market_snapshots "
+                        f"WHERE market = :mkt "
+                        f"  AND {date_filter} "
+                        f"  {index_filter} "
+                        f"ORDER BY index_code, market_local_timestamp DESC "
+                        f"LIMIT :limit"
+                    ),
+                    params,
+                ).fetchall()
+
+                for row in main_rows:
+                    ic = str(row[2]) if row[2] else ''
+                    ts = str(row[5]) if row[5] else ''
+                    sid = str(row[15]) if len(row) > 15 and row[15] else ''
+                    key = f"{market}_{ic}_{ts}_{sid}"
+                    if key not in seen_keys:
+                        seen_keys.add(key)
+                        results.append(self._market_index_main_dict(row))
+        except Exception as exc:
+            logger.warning("Main DB market_index query failed for market %s: %s", market, exc)
+
+        # --- Historical DB query ---
+        if not query_date or query_date < boundary.isoformat():
+            try:
+                with self._historical_db.get_session() as session:
+                    from sqlalchemy import text as sa_text_hist
+
+                    hist_params: dict = {"mkt": market, "limit": limit * 2}
+                    if query_date:
+                        hist_date_filter = "query_date = :qd"
+                        hist_params["qd"] = query_date
+                    else:
+                        hist_date_filter = "query_date < :boundary"
+                        hist_params["boundary"] = boundary.isoformat()
+
+                    if index_code:
+                        index_filter = "AND index_code = :ic"
+                        hist_params["ic"] = index_code
+                    else:
+                        index_filter = ""
+
+                    hist_rows = session.execute(
+                        sa_text_hist(
+                            f"SELECT query_date, market, index_code, index_name, "
+                            f"timestamp, market_local_timestamp, current_price, change_pct, "
+                            f"open, high, low, pre_close, volume, amount, "
+                            f"status, trend_label, strength_label, breadth_label "
+                            f"FROM historical_market_index_points "
+                            f"WHERE market = :mkt "
+                            f"  AND {hist_date_filter} "
+                            f"  {index_filter} "
+                            f"ORDER BY market_local_timestamp DESC "
+                            f"LIMIT :limit"
+                        ),
+                        hist_params,
+                    ).fetchall()
+
+                    for row in hist_rows:
+                        ic = str(row[2]) if row[2] else ''
+                        ts = str(row[5]) if row[5] else ''
+                        key = f"{market}_{ic}_{ts}_"
+                        if key not in seen_keys:
+                            seen_keys.add(key)
+                            results.append(self._market_index_historical_dict(row))
+            except Exception as exc:
+                logger.warning("Historical DB market_index query failed for market %s: %s", market, exc)
+
+        results.sort(key=lambda r: (r.get('index_code', ''), r.get('market_local_timestamp', '')))
+        return results
+
+    # ------------------------------------------------------------------
     # Private row-to-dict converters
     # ------------------------------------------------------------------
 
@@ -698,4 +818,60 @@ class MarketDataRepository:
             'risk_level': row[25],
             'technical_summary': str(row[26]) if len(row) > 26 and row[26] else None,
             'source_db': 'historical',
+        }
+
+    @staticmethod
+    def _market_index_main_dict(row) -> Dict[str, Any]:
+        """Convert a main DB intraday_market_snapshots row to unified dict.
+        SELECT order: query_date(0), market(1), index_code(2), index_name(3),
+        timestamp(4), market_local_timestamp(5), current_price(6), change_pct(7),
+        open_price(8), high_price(9), low_price(10), prev_close(11),
+        volume(12), amount(13), status(14), snapshot_id(15)
+        """
+        return {
+            'source_db': 'main',
+            'query_date': str(row[0]) if row[0] else '',
+            'market': str(row[1]) if row[1] else '',
+            'index_code': str(row[2]) if row[2] else '',
+            'index_name': str(row[3]) if row[3] else None,
+            'timestamp': str(row[4]) if row[4] else None,
+            'market_local_timestamp': str(row[5]) if row[5] else '',
+            'current_price': row[6] if len(row) > 6 else None,
+            'change_pct': row[7] if len(row) > 7 else None,
+            'open': row[8] if len(row) > 8 else None,
+            'high': row[9] if len(row) > 9 else None,
+            'low': row[10] if len(row) > 10 else None,
+            'pre_close': row[11] if len(row) > 11 else None,
+            'volume': row[12] if len(row) > 12 else None,
+            'amount': row[13] if len(row) > 13 else None,
+            'status': str(row[14]) if len(row) > 14 and row[14] else 'valid',
+        }
+
+    @staticmethod
+    def _market_index_historical_dict(row) -> Dict[str, Any]:
+        """Convert a historical DB historical_market_index_points row to unified dict.
+        SELECT order: query_date(0), market(1), index_code(2), index_name(3),
+        timestamp(4), market_local_timestamp(5), current_price(6), change_pct(7),
+        open(8), high(9), low(10), pre_close(11), volume(12), amount(13),
+        status(14), trend_label(15), strength_label(16), breadth_label(17)
+        """
+        return {
+            'source_db': 'historical',
+            'query_date': str(row[0]) if row[0] else '',
+            'market': str(row[1]) if row[1] else '',
+            'index_code': str(row[2]) if row[2] else '',
+            'index_name': str(row[3]) if row[3] else None,
+            'timestamp': str(row[4]) if row[4] else None,
+            'market_local_timestamp': str(row[5]) if row[5] else '',
+            'current_price': row[6] if len(row) > 6 else None,
+            'change_pct': row[7] if len(row) > 7 else None,
+            'open': row[8] if len(row) > 8 else None,
+            'high': row[9] if len(row) > 9 else None,
+            'low': row[10] if len(row) > 10 else None,
+            'pre_close': row[11] if len(row) > 11 else None,
+            'volume': row[12] if len(row) > 12 else None,
+            'amount': row[13] if len(row) > 13 else None,
+            'status': str(row[14]) if len(row) > 14 and row[14] else 'valid',
+            'trend_label': str(row[15]) if len(row) > 15 and row[15] else None,
+            'strength_label': str(row[16]) if len(row) > 16 and row[16] else None,
         }

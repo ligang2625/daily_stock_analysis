@@ -312,3 +312,52 @@ CREATE TABLE intraday_market_snapshots (
 ### 测试
 
 **410+ passed, 0 regressions** (仅 3 预存 scheduler failures)
+
+## Session 9: Phase 3 — 盘中决策升级：大盘指数归档与相对强弱计算 (2026-06-18)
+
+### 新增特性
+
+| # | Priority | Feature | Key Change |
+|---|----------|---------|------------|
+| 1 | Major | `IntradayMarketSnapshot` ORM + schema migration | ORM model + `timestamp`/`error_message` 列 migration；`UniqueConstraint('market', 'index_code', 'market_local_timestamp', 'snapshot_id')` |
+| 2 | Major | `HistoricalMarketIndexPoint` + batch upsert | 历史库新 ORM；trend_label/strength_label/breadth_label 衍生标签；空 snapshot_id→'' 标准化 |
+| 3 | Major | Market index archive extractor | 从主库 `intraday_market_snapshots` 抽取旧数据写历史库；field mapping (open_price→open)；`extract_phase2_technical_history` 集成 step 5 |
+| 4 | Major | `MarketDataRepository.get_market_index_trend` | 跨主库/历史库路由；按 retention boundary 拆分查询；`(market, index_code, market_local_timestamp, snapshot_id)` 去重 |
+| 5 | Major | Decision 大盘加载优先走 Repository | `_try_repo_market_timelines()` 优先；失败降级到直接 SQL；无回归风险 |
+| 6 | Major | `intraday_relative_strength` 模块 | 系统计算个股涨跌幅/路径标签/基准涨跌幅/相对 spread/强弱标签/背离标记；`summarize_relative_strength()` + `format_relative_strength_section()` |
+| 7 | Major | Prompt 动态相对强弱注入 | 取代静态 LLM 自行对比；markdown 表 + 系统计算标签供 LLM 直接引用 |
+
+### 修复项
+
+| # | Priority | Fix | Key Change |
+|---|----------|-----|------------|
+| 1 | Major | NULL `market_local_timestamp` 在 UNIQUE constraint 不可靠 | SQLite 视 NULL 为 distinct；extractor 和 converter 统一 normalize 为空字符串 `''` |
+| 2 | Minor | 测试 fixture `snap_id` 使用前未赋值 | `archive_env` fixture 中 `snap_id = days_ago * 100` 移到 `conn.execute()` 前 |
+| 3 | Minor | 测试无效 placeholder 代码 | `test_upsert_idempotent` 废弃 `cnt1` 伪计数变量删除 |
+
+### 修改文件
+
+| 文件 | 改动 |
+|------|------|
+| `src/storage_historical.py` | `HistoricalMarketIndexPoint` ORM + upsert + 索引 |
+| `src/maintenance/archive_extractors.py` | `extract_market_index_points()` + composite step + NULL market_local_timestamp normalize |
+| `src/services/market_data_repository.py` | `get_market_index_trend()` + 跨库路由 + market_local_timestamp normalize |
+| `src/storage.py` | `IntradayMarketSnapshot` ORM + schema migration (timestamp/error_message) |
+| `src/core/intraday_monitor.py` | `_try_repo_market_timelines()` + relative strength wiring |
+| `src/core/intraday_prompt.py` | `relative_strength_summary` param + dynamic section |
+| `docs/CHANGELOG.md` | 7 条 Phase 3 变更 |
+
+### 新增文件
+
+| 文件 | 说明 |
+|------|------|
+| `src/core/intraday_relative_strength.py` | 系统相对强弱 summarizer (176 行) |
+| `tests/test_market_index_snapshots.py` | 9 测试：ORM/schema/persist/unique constraint/config |
+| `tests/test_market_index_archive.py` | 6 测试：cutoff/field mapping/labels/idempotent/table |
+| `tests/test_market_data_repository_market_index.py` | 5 测试：main/历史/跨边界/index code filter |
+| `tests/test_intraday_prompt_relative_strength.py` | 10 测试：强弱/背离/缺失/prefix/prompt injection |
+| `tests/test_intraday_decision_market_context.py` | 6 测试：market summary/stock timeline/relative strength/缺失/fallback/no LLM |
+
+### 测试
+
+**19 (Phase 2) + 33 (Phase 3) = 52 passed, 0 regressions**

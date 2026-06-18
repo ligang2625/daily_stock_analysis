@@ -1727,6 +1727,20 @@ class IntradayMonitor:
             market_timelines, decision_markets, decision_market_dates,
         )
 
+        # --- Relative strength summary ---
+        relative_strength_summary = None
+        try:
+            from src.core.intraday_relative_strength import (
+                summarize_relative_strength,
+                format_relative_strength_section,
+            )
+            rs = summarize_relative_strength(stock_timelines, market_timelines)
+            if rs:
+                relative_strength_summary = format_relative_strength_section(rs)
+        except Exception as exc:
+            logger.debug("Relative strength summary skipped: %s", exc)
+            relative_strength_summary = None
+
         prompt = build_intraday_prompt(
             events=all_events,
             yesterday_analysis=self._yesterday_analysis,
@@ -1736,6 +1750,7 @@ class IntradayMonitor:
             market_timelines=market_timelines,
             market_timeline_stats=market_timeline_stats,
             historical_snapshot_count=historical_snapshot_count,
+            relative_strength_summary=relative_strength_summary,
         )
 
         # Call LLM via unified analyzer
@@ -2659,7 +2674,7 @@ class IntradayMonitor:
                     logger.info("[市场指数] %s index_code=%s: 无行情数据", market.upper(), code)
                     results.append({
                         'index_code': code, 'status': 'data_unavailable',
-                        'market': market,
+                        'market': market, 'error_message': 'no quote data returned',
                     })
                     continue
                 results.append(quote)
@@ -2667,7 +2682,7 @@ class IntradayMonitor:
                 logger.warning("[市场指数] %s index_code=%s 获取失败: %s", market.upper(), code, exc)
                 results.append({
                     'index_code': code, 'status': 'fetch_failed',
-                    'market': market,
+                    'market': market, 'error_message': str(exc)[:500],
                 })
         return results
 
@@ -2861,9 +2876,9 @@ class IntradayMonitor:
                         "(snapshot_id, run_id, query_date, market, market_local_timestamp, "
                         "index_code, index_name, current_price, open_price, prev_close, "
                         "high_price, low_price, change_pct, volume, amount, source, "
-                        "status, raw_quote, created_at) "
+                        "status, raw_quote, error_message, timestamp, created_at) "
                         "VALUES (:sid, :rid, :qd, :mkt, :mlt, :ic, :iname, :cp, :op, :pc, "
-                        ":hp, :lp, :chpct, :vol, :amt, :src, :st, :rq, :ca)"
+                        ":hp, :lp, :chpct, :vol, :amt, :src, :st, :rq, :err, :ts, :ca)"
                     ), {
                         "sid": snapshot_id, "rid": run_id, "qd": query_date,
                         "mkt": market, "mlt": market_local_ts,
@@ -2880,6 +2895,8 @@ class IntradayMonitor:
                         "src": idx.get('source') or None,
                         "st": idx.get('status', 'data_unavailable'),
                         "rq": raw,
+                        "err": idx.get('error_message'),
+                        "ts": idx.get('timestamp'),
                         "ca": created_at,
                     })
                 session.commit()
@@ -2914,9 +2931,18 @@ class IntradayMonitor:
 
     def _load_market_timelines_for_decision(self, markets: List[str], market_dates: Dict[str, str]) -> Dict[str, List[Dict[str, Any]]]:
         """Load all market index snapshots for the decision day, grouped by market+index_code.
-        Returns {market: [{index_code, index_name, timestamps: [{ts, price, change_pct}], ...}]}
+
+        Tries repository-backed path first (unified main+historical), falls back
+        to direct main DB SQL. Returns {market: [{index_code, index_name, points: [{ts, price, change_pct}], ...}]}
         """
         timelines: Dict[str, List[Dict[str, Any]]] = {}
+
+        # Try repository-backed path first
+        repo_result = self._try_repo_market_timelines(markets, market_dates)
+        if repo_result is not None:
+            return repo_result
+
+        # Fallback: direct main DB SQL
         self._ensure_intraday_market_snapshots_table()
         try:
             with self._db.session_scope() as session:
@@ -2934,7 +2960,6 @@ class IntradayMonitor:
                     ), {"qd": query_date, "mkt": market}).fetchall()
                     if not rows:
                         continue
-                    # Group by index_code
                     index_map: Dict[str, Dict[str, Any]] = {}
                     for row in rows:
                         ic = str(row[0] or "")
@@ -2957,7 +2982,6 @@ class IntradayMonitor:
                                 'change_pct': float(row[3]) if row[3] is not None else 0,
                                 'timestamp': str(row[4]) if row[4] else '',
                             })
-                            # Track high/low across snapshots
                             price_val = float(row[2])
                             if entry['high_price'] is None or price_val > entry['high_price']:
                                 entry['high_price'] = price_val
@@ -2967,6 +2991,63 @@ class IntradayMonitor:
         except Exception as exc:
             logger.warning("[市场指数] 加载市场指数时间线失败: %s", exc)
         return timelines
+
+    def _try_repo_market_timelines(self, markets: List[str], market_dates: Dict[str, str]) -> Optional[Dict[str, List[Dict[str, Any]]]]:
+        """Try to load market timelines via MarketDataRepository.
+
+        Returns None if repository is unavailable or fails (caller falls back to direct SQL).
+        """
+        try:
+            from src.services.market_data_repository import MarketDataRepository
+            from src.storage_historical import HistoricalDatabaseManager
+
+            hist_db_path = getattr(self, '_historical_db_path', None)
+            if hist_db_path:
+                historical_db = HistoricalDatabaseManager(hist_db_path)
+            else:
+                historical_db = HistoricalDatabaseManager()
+            repo = MarketDataRepository(self._db, historical_db)
+
+            timelines: Dict[str, List[Dict[str, Any]]] = {}
+            for market in markets:
+                query_date = market_dates.get(market) or self._get_market_query_date(market)
+                rows = repo.get_market_index_trend(market=market, query_date=query_date)
+                if not rows:
+                    continue
+
+                # Group by index_code
+                index_map: Dict[str, Dict[str, Any]] = {}
+                for r in rows:
+                    ic = r.get('index_code', '')
+                    if not ic:
+                        continue
+                    if ic not in index_map:
+                        index_map[ic] = {
+                            'index_code': ic,
+                            'index_name': r.get('index_name') or ic,
+                            'points': [],
+                            'open_price': r.get('open'),
+                            'prev_close': r.get('pre_close'),
+                            'high_price': r.get('high'),
+                            'low_price': r.get('low'),
+                        }
+                    entry = index_map[ic]
+                    if r.get('status') == 'valid' and r.get('current_price') is not None:
+                        entry['points'].append({
+                            'price': float(r['current_price']),
+                            'change_pct': float(r['change_pct']) if r.get('change_pct') is not None else 0,
+                            'timestamp': str(r.get('market_local_timestamp') or ''),
+                        })
+                        price_val = float(r['current_price'])
+                        if entry['high_price'] is None or price_val > entry['high_price']:
+                            entry['high_price'] = price_val
+                        if entry['low_price'] is None or price_val < entry['low_price']:
+                            entry['low_price'] = price_val
+                timelines[market] = list(index_map.values())
+            return timelines
+        except Exception as exc:
+            logger.debug("Repository-backed market timelines unavailable, falling back to direct SQL: %s", exc)
+            return None
 
     def _load_market_timeline_stats_for_decision(
         self,

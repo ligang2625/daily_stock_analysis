@@ -173,6 +173,7 @@ def build_intraday_prompt(
     market_timelines: Optional[Dict[str, List[Dict[str, Any]]]] = None,
     market_timeline_stats: Optional[Dict[str, Any]] = None,
     historical_snapshot_count: int = 0,
+    relative_strength_summary: Optional[str] = None,
 ) -> str:
     """
     Build the LLM prompt for 14:20 intraday decision.
@@ -324,9 +325,17 @@ def build_intraday_prompt(
     lines.append("")
 
     # --- Relative strength analysis ---
-    lines.append("## 个股相对大盘强弱")
+    lines.append("## 个股相对大盘强弱（系统计算）")
     lines.append("")
-    if market_timelines and stock_timelines:
+    if relative_strength_summary:
+        lines.append(relative_strength_summary)
+        lines.append("")
+        lines.append("说明：相对强弱标签由系统根据个股与基准指数的涨跌幅差值自动计算。")
+        lines.append("- 强于大盘: 个股涨幅 > 基准涨幅 + 1%")
+        lines.append("- 弱于大盘: 个股涨幅 < 基准涨幅 - 1%")
+        lines.append("- 跟随大盘: 个股涨跌幅与基准偏差在 ±1% 以内")
+        lines.append("- 背离信号提示方向不一致，需关注持续性")
+    elif market_timelines and stock_timelines:
         lines.append("请对比上面的「个股走势摘要」与「大盘指数走势摘要」，判断每支股票的日内走势是否与大盘同步：")
         lines.append("- 若个股跟随大盘上涨/下跌，趋势可信度较高")
         lines.append("- 若个股逆大盘上涨（大盘跌个股涨），可能受到特殊消息驱动，关注持续性")

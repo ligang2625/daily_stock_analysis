@@ -215,6 +215,46 @@ class HistoricalMarketLightDaily(HistoricalBase):
 
 
 # ---------------------------------------------------------------------------
+# Phase 3 historical tables
+# ---------------------------------------------------------------------------
+
+class HistoricalMarketIndexPoint(HistoricalBase):
+    """Archived market index snapshot data extracted from intraday_market_snapshots."""
+
+    __tablename__ = 'historical_market_index_points'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    query_date = Column(String(16), nullable=False)
+    market = Column(String(8), nullable=False)
+    index_code = Column(String(32), nullable=False)
+    index_name = Column(String(64), nullable=True)
+    timestamp = Column(String(32), nullable=True)
+    market_local_timestamp = Column(String(32), nullable=True)
+    snapshot_id = Column(String(64), nullable=False, default='')
+    current_price = Column(Float, nullable=True)
+    change_pct = Column(Float, nullable=True)
+    open = Column(Float, nullable=True)
+    high = Column(Float, nullable=True)
+    low = Column(Float, nullable=True)
+    pre_close = Column(Float, nullable=True)
+    volume = Column(Float, nullable=True)
+    amount = Column(Float, nullable=True)
+    trend_label = Column(String(16), nullable=True)
+    strength_label = Column(String(16), nullable=True)
+    breadth_label = Column(String(16), nullable=True)
+    status = Column(String(16), nullable=False, default='valid')
+    created_at = Column(DateTime, nullable=False, default=datetime.now)
+
+    __table_args__ = (
+        UniqueConstraint('market', 'index_code', 'market_local_timestamp', 'snapshot_id',
+                         name='uq_hist_market_index_point'),
+        Index('ix_hist_market_index_timeline', 'market', 'index_code', 'query_date', 'market_local_timestamp'),
+        Index('ix_hist_market_index_query_date', 'query_date'),
+        Index('ix_hist_market_index_market', 'market'),
+    )
+
+
+# ---------------------------------------------------------------------------
 # HistoricalDatabaseManager
 # ---------------------------------------------------------------------------
 
@@ -448,6 +488,53 @@ class HistoricalDatabaseManager:
                         'operation_advice': row.get('operation_advice'),
                         'risk_level': row.get('risk_level'),
                         'technical_summary': row.get('technical_summary'),
+                    },
+                )
+                session.execute(stmt)
+                written += 1
+            session.commit()
+        except Exception:
+            session.rollback()
+            raise
+        finally:
+            session.close()
+        return written
+
+    def upsert_market_index_points_batch(self, rows: List[Dict[str, Any]]) -> int:
+        """Idempotent upsert of HistoricalMarketIndexPoint rows.
+
+        Normalizes NULL snapshot_id to '' before upsert to avoid SQLite
+        unique-constraint NULL duplication issue.
+        """
+        if not rows:
+            return 0
+        session = self.get_session()
+        written = 0
+        try:
+            for row in rows:
+                # Normalize NULL snapshot_id for idempotent upsert
+                sid = row.get('snapshot_id')
+                if not sid:
+                    sid = ''
+                    row['snapshot_id'] = sid
+                stmt = sqlite_insert(HistoricalMarketIndexPoint).values(**row).on_conflict_do_update(
+                    index_elements=['market', 'index_code', 'market_local_timestamp', 'snapshot_id'],
+                    set_={
+                        'query_date': row.get('query_date'),
+                        'index_name': row.get('index_name'),
+                        'timestamp': row.get('timestamp'),
+                        'current_price': row.get('current_price'),
+                        'change_pct': row.get('change_pct'),
+                        'open': row.get('open'),
+                        'high': row.get('high'),
+                        'low': row.get('low'),
+                        'pre_close': row.get('pre_close'),
+                        'volume': row.get('volume'),
+                        'amount': row.get('amount'),
+                        'trend_label': row.get('trend_label'),
+                        'strength_label': row.get('strength_label'),
+                        'breadth_label': row.get('breadth_label'),
+                        'status': row.get('status', 'valid'),
                     },
                 )
                 session.execute(stmt)

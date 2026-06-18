@@ -904,6 +904,49 @@ class DecisionSignalRecord(Base):
     )
 
 
+class IntradayMarketSnapshot(Base):
+    """
+    Market index snapshot captured during intraday monitoring.
+
+    One row per index per snapshot attempt. Status tracks data quality:
+    - valid: quote fetched successfully
+    - data_unavailable: quote API returned empty/missing data
+    - fetch_failed: quote API raised an exception
+    """
+
+    __tablename__ = 'intraday_market_snapshots'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    query_date = Column(String(16), nullable=False)
+    market = Column(String(8), nullable=False)
+    index_code = Column(String(32), nullable=False)
+    index_name = Column(String(64), nullable=True)
+    timestamp = Column(String(32), nullable=True)
+    market_local_timestamp = Column(String(32), nullable=True)
+    snapshot_id = Column(String(64), nullable=False, default='')
+    run_id = Column(String(64), nullable=True)
+    current_price = Column(Float, nullable=True)
+    change_pct = Column(Float, nullable=True)
+    open_price = Column(Float, nullable=True)
+    high_price = Column(Float, nullable=True)
+    low_price = Column(Float, nullable=True)
+    prev_close = Column(Float, nullable=True)
+    volume = Column(Float, nullable=True)
+    amount = Column(Float, nullable=True)
+    source = Column(String(64), nullable=True)
+    status = Column(String(16), nullable=False, default='valid')
+    error_message = Column(Text, nullable=True)
+    raw_quote = Column(Text, nullable=True)
+    created_at = Column(String(32), nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint('market', 'index_code', 'market_local_timestamp', 'snapshot_id',
+                         name='uq_intraday_market_snapshot'),
+        Index('ix_intraday_market_snapshots_timeline', 'query_date', 'market',
+              'index_code', 'market_local_timestamp'),
+    )
+
+
 class _DatabaseManagerMeta(type):
     """Serialize DatabaseManager construction across __new__ and __init__."""
 
@@ -1109,6 +1152,23 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
                         conn.execute(sa_text(idx_sql))
                     except Exception as exc:
                         logger.warning("Index creation skipped (non-fatal): %s — %s", idx_sql[:80], exc)
+
+                # --- Phase 3: Add missing columns to intraday_market_snapshots ---
+                try:
+                    ims_info = conn.execute(sa_text("PRAGMA table_info('intraday_market_snapshots')")).fetchall()
+                    ims_cols = {row[1] for row in ims_info}
+                    if 'timestamp' not in ims_cols:
+                        conn.execute(sa_text(
+                            "ALTER TABLE intraday_market_snapshots ADD COLUMN timestamp TEXT"
+                        ))
+                        logger.info("Schema migration: added intraday_market_snapshots.timestamp")
+                    if 'error_message' not in ims_cols:
+                        conn.execute(sa_text(
+                            "ALTER TABLE intraday_market_snapshots ADD COLUMN error_message TEXT"
+                        ))
+                        logger.info("Schema migration: added intraday_market_snapshots.error_message")
+                except Exception as exc:
+                    logger.warning("Schema migration for intraday_market_snapshots skipped: %s", exc)
 
                 session.commit()
 
