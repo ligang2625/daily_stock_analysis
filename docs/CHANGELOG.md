@@ -39,6 +39,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - [改进] `intraday_monitor.py` 决策大盘加载优先走 Repository，失败降级到直接 SQL
 - [改进] `_apply_schema_migrations` 补全 `intraday_market_snapshots` 缺少的 `timestamp`/`error_message` 列
 - [测试] 新增大盘指数快照/历史归档/Repository 路由/相对强弱计算与 Prompt 注入 5 个测试文件(33 个测试)
+- [修复] `intraday_market_snapshots` DDL 补齐 `timestamp`/`error_message` 列 + 幂等列迁移 + timeline/status 索引，修复 fresh DB INSERT 报 unknown column
+- [修复] Prompt 大盘走势节中 stats 分支吞掉 trend 表：拆为独立"数据质量"+"指数走势"子段，stats 和 trends 同时输出
+- [修复] Prompt `historical_snapshot_count==0` 提示不可达：三路显式分支 (==0/==1/>=2)，修复缺少 f-string
+- [测试] Phase 3 后续修复：DDL schema/persist error 状态/Repository 跨库路由/archive field mapping/Prompt 双节输出/数据不足路径(27 测试)
 
 ## [3.21.0] - 2026-06-07
 

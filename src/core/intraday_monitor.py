@@ -2604,7 +2604,11 @@ class IntradayMonitor:
             logger.warning("持久化快照状态失败: %s", exc)
 
     def _ensure_intraday_market_snapshots_table(self) -> None:
-        """Create intraday_market_snapshots table if not exists."""
+        """Create intraday_market_snapshots table if not exists.
+
+        Note: intraday_market_snapshots is the canonical market-index snapshot table
+        (see persistence_optimization_strategy.md for naming context).
+        """
         try:
             with self._db.session_scope() as session:
                 conn = session.connection()
@@ -2616,6 +2620,7 @@ class IntradayMonitor:
                     "run_id TEXT, "
                     "query_date TEXT NOT NULL, "
                     "market TEXT NOT NULL, "
+                    "timestamp TEXT, "
                     "market_local_timestamp TEXT, "
                     "index_code TEXT NOT NULL, "
                     "index_name TEXT, "
@@ -2628,11 +2633,25 @@ class IntradayMonitor:
                     "volume REAL, "
                     "amount REAL, "
                     "source TEXT, "
+                    "error_message TEXT, "
                     "status TEXT NOT NULL DEFAULT 'valid', "
                     "raw_quote TEXT, "
                     "created_at TEXT NOT NULL, "
                     "UNIQUE(snapshot_id, market, index_code))"
                 ))
+                # Idempotent column migration for existing tables
+                info = conn.execute(sa_text(
+                    "PRAGMA table_info('intraday_market_snapshots')"
+                )).fetchall()
+                existing_cols = {row[1] for row in info}
+                if 'timestamp' not in existing_cols:
+                    conn.execute(sa_text(
+                        "ALTER TABLE intraday_market_snapshots ADD COLUMN timestamp TEXT"
+                    ))
+                if 'error_message' not in existing_cols:
+                    conn.execute(sa_text(
+                        "ALTER TABLE intraday_market_snapshots ADD COLUMN error_message TEXT"
+                    ))
                 conn.execute(sa_text(
                     "CREATE INDEX IF NOT EXISTS idx_intraday_market_snapshots_day "
                     "ON intraday_market_snapshots(query_date, market, index_code)"
@@ -2640,6 +2659,14 @@ class IntradayMonitor:
                 conn.execute(sa_text(
                     "CREATE INDEX IF NOT EXISTS idx_intraday_market_snapshots_snapshot "
                     "ON intraday_market_snapshots(snapshot_id, market)"
+                ))
+                conn.execute(sa_text(
+                    "CREATE INDEX IF NOT EXISTS idx_intraday_market_snapshots_timeline "
+                    "ON intraday_market_snapshots(query_date, market, index_code, market_local_timestamp)"
+                ))
+                conn.execute(sa_text(
+                    "CREATE INDEX IF NOT EXISTS idx_intraday_market_snapshots_status "
+                    "ON intraday_market_snapshots(query_date, market, status)"
                 ))
                 session.commit()
                 logger.info("intraday_market_snapshots 表已就绪")
@@ -2852,7 +2879,11 @@ class IntradayMonitor:
         self, snapshot_id: str, run_id: str, market: str,
         index_quotes: List[Dict[str, Any]],
     ) -> None:
-        """Persist market index snapshots to intraday_market_snapshots table."""
+        """Persist market index snapshots to intraday_market_snapshots table.
+
+        intraday_market_snapshots is canonical market-index snapshot table
+        (see persistence_optimization_strategy.md).
+        """
         self._ensure_intraday_market_snapshots_table()
         query_date = self._get_market_query_date(market)
         try:
@@ -2896,7 +2927,7 @@ class IntradayMonitor:
                         "st": idx.get('status', 'data_unavailable'),
                         "rq": raw,
                         "err": idx.get('error_message'),
-                        "ts": idx.get('timestamp'),
+                        "ts": idx.get('timestamp') or market_local_ts,
                         "ca": created_at,
                     })
                 session.commit()

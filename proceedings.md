@@ -347,6 +347,48 @@ CREATE TABLE intraday_market_snapshots (
 | `src/core/intraday_prompt.py` | `relative_strength_summary` param + dynamic section |
 | `docs/CHANGELOG.md` | 7 条 Phase 3 变更 |
 
+## Session 10: Phase 3 Remediation — Schema mismatch, Prompt stats/trends 修复, 测试补全 (2026-06-22)
+
+### 修复项
+
+| # | Severity | Fix | Key Change |
+|---|----------|-----|------------|
+| 1 | Critical | `intraday_market_snapshots` DDL 缺少 `timestamp`/`error_message` 列 | DDL 补齐 + 幂等列迁移 (PRAGMA table_info + ALTER ADD COLUMN) + `idx_intraday_market_snapshots_timeline`/`status` 索引 |
+| 2 | Major | Prompt market_timeline_stats 分支吞掉 trend 表 | 拆为独立 "### 数据质量" + "### 指数走势" 子段，stats 和 trends 同时输出 |
+| 3 | Major | `historical_snapshot_count==0` 提示不可达 (外层 `0 < count < 2`) | 显式三路分支 (==0/==1/>=2)，修复非 f-string 字符串 |
+| 4 | Major | 测试覆盖不足 | 4 新测试文件 (27 测试)：DDL schema、persist error 状态、extractor field mapping、Repository 跨库路由、Prompt 双节输出、snapshot_count 路径 |
+| 5 | Minor | 表名命名与策略文档不一致 | 3 处添加 `persistence_optimization_strategy.md` 注释 |
+
+### 修改文件
+
+| 文件 | 改动 |
+|------|------|
+| `src/core/intraday_monitor.py` | DDL 补齐 + migration + 2 索引 + persist timestamp fallback + 命名注释 |
+| `src/core/intraday_prompt.py` | market index 节双分支 + snapshot_count 三路修复 |
+| `src/maintenance/archive_extractors.py` | 命名注释 |
+| `src/services/market_data_repository.py` | 命名注释 |
+
+### 新增文件
+
+| 文件 | 测试数 |
+|------|--------|
+| `tests/test_phase3_market_index_snapshots.py` | 7 |
+| `tests/test_phase3_market_index_archive.py` | 4 |
+| `tests/test_phase3_market_data_repository_index.py` | 6 |
+| `tests/test_phase3_intraday_prompt_market_context.py` | 8 |
+
+### 测试
+
+**22 new + 52 existing = 74 passed, 0 regression**
+
+### Phase 3 收口确认
+
+- 大盘指数快照可稳定写入主库 (DDL 已补齐)
+- Prompt 同时输出覆盖率摘要和实际指数走势表
+- 单点行情/大盘缺失时 Prompt 明确约束 LLM 不得过度推断
+- 第三阶段核心路径具备离线测试覆盖 (27 测试)
+- 可以进入 Phase 4
+
 ### 新增文件
 
 | 文件 | 说明 |

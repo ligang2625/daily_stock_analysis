@@ -281,19 +281,23 @@ def build_intraday_prompt(
         lines.append("")
 
     # --- Historical snapshot context (standalone decision) ---
-    if 0 < historical_snapshot_count < 2:
+    if historical_snapshot_count == 0:
         lines.append("## ⚠️ 日内走势数据不足")
         lines.append("")
-        if historical_snapshot_count == 0:
-            lines.append("当前仅有决策快照，缺少日内历史走势数据。请基于当前单点价格和昨日阈值给出判断，并在理由中注明'仅有当前快照，趋势不确定'。")
-        else:
-            lines.append("仅有{historical_snapshot_count}个历史快照和当前决策快照，走势数据有限。请谨慎推断趋势方向。")
+        lines.append("当前仅有决策快照，缺少日内历史走势数据。请基于当前单点价格和昨日阈值给出判断，并在理由中注明'仅有当前快照，趋势不确定'。")
+        lines.append("")
+    elif historical_snapshot_count == 1:
+        lines.append("## ⚠️ 日内走势数据不足")
+        lines.append("")
+        lines.append(f"仅有{historical_snapshot_count}个历史快照和当前决策快照，走势数据有限。请谨慎推断趋势方向。")
         lines.append("")
 
     # --- Market index timeline summary ---
     lines.append("## 大盘指数走势摘要")
     lines.append("")
+
     if market_timeline_stats:
+        lines.append("### 数据质量")
         market_label = {'cn': 'A股', 'hk': '港股', 'us': '美股'}
         for market in sorted(market_timelines.keys()):
             ms = market_timeline_stats.get(market, {})
@@ -309,7 +313,9 @@ def build_intraday_prompt(
             if ms.get('unavailable_indices'):
                 lines.append(f"  - 未采集到: {ms['unavailable_indices']}")
         lines.append("")
-    elif market_timelines:
+
+    if market_timelines:
+        lines.append("### 指数走势")
         lines.append(_fmt_market_timeline_summary(market_timelines))
     else:
         lines.append("（大盘指数数据缺失，请勿臆测大盘方向，仅基于个股数据给出判断）")

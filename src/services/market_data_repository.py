@@ -520,8 +520,10 @@ class MarketDataRepository:
         """
         Get market index trend data for a given market.
 
-        Routes to main DB (intraday_market_snapshots) for recent/current dates
-        and historical DB (historical_market_index_points) for older data.
+        Routes to main DB (intraday_market_snapshots, the canonical
+        market-index snapshot table — see persistence_optimization_strategy.md)
+        for recent/current dates and historical DB (historical_market_index_points)
+        for older data.
         Results are merged and deduplicated by (market, index_code, query_date,
         market_local_timestamp, snapshot_id).
         """
@@ -823,6 +825,10 @@ class MarketDataRepository:
     @staticmethod
     def _market_index_main_dict(row) -> Dict[str, Any]:
         """Convert a main DB intraday_market_snapshots row to unified dict.
+
+        intraday_market_snapshots is canonical market-index snapshot table
+        (see persistence_optimization_strategy.md).
+
         SELECT order: query_date(0), market(1), index_code(2), index_name(3),
         timestamp(4), market_local_timestamp(5), current_price(6), change_pct(7),
         open_price(8), high_price(9), low_price(10), prev_close(11),

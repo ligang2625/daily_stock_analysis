@@ -543,6 +543,9 @@ def extract_market_index_points(
     Read intraday_market_snapshots with query_date < cutoff_date, map fields
     to HistoricalMarketIndexPoint schema, and compute derived labels.
 
+    intraday_market_snapshots is canonical market-index snapshot table
+    (see persistence_optimization_strategy.md).
+
     Returns a list of dicts suitable for
     HistoricalDatabaseManager.upsert_market_index_points_batch().
     """
