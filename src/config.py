@@ -887,6 +887,8 @@ class Config:
     historical_backup_dir: str = "./data/backups"
     historical_backup_retention_days: int = 14
     historical_backup_run_before_archive: bool = True
+    # 归档前备份失败是否阻塞归档（默认阻塞）
+    historical_backup_required_before_archive: bool = True
     sqlite_busy_timeout_ms: int = 5000
     sqlite_write_retry_max: int = 3
     sqlite_write_retry_base_delay: float = 0.1
@@ -1736,6 +1738,7 @@ class Config:
             historical_backup_dir=os.getenv('HISTORICAL_BACKUP_DIR', './data/backups'),
             historical_backup_retention_days=parse_env_int(os.getenv('HISTORICAL_BACKUP_RETENTION_DAYS'), 14, field_name='HISTORICAL_BACKUP_RETENTION_DAYS', minimum=1),
             historical_backup_run_before_archive=parse_env_bool(os.getenv('HISTORICAL_BACKUP_RUN_BEFORE_ARCHIVE'), default=True),
+            historical_backup_required_before_archive=parse_env_bool(os.getenv('HISTORICAL_BACKUP_REQUIRED_BEFORE_ARCHIVE'), default=True),
             sqlite_wal_enabled=os.getenv('SQLITE_WAL_ENABLED', 'true').lower() == 'true',
             sqlite_busy_timeout_ms=parse_env_int(
                 os.getenv('SQLITE_BUSY_TIMEOUT_MS'),

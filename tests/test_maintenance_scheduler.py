@@ -189,6 +189,7 @@ class TestArchiveMaintenanceJob:
             'historical_backup_dir': './data/backups',
             'historical_backup_retention_days': 14,
             'historical_backup_run_before_archive': False,
+            'historical_backup_required_before_archive': True,
         }
         defaults.update(overrides)
         return config_class(**defaults)
@@ -286,6 +287,7 @@ class TestArchiveMaintenanceJob:
 
         def fake_backup(**kw):
             events.append('backup')
+            return 0
 
         def fake_run_archive(**kw):
             events.append('archive')
@@ -297,13 +299,14 @@ class TestArchiveMaintenanceJob:
 
         assert events == ['backup', 'archive']
 
-    def test_backup_failure_does_not_block_archive(self, config_class):
-        """Backup failure is logged but archive still proceeds."""
+    def test_backup_failure_does_not_block_archive_when_not_required(self, config_class):
+        """Backup failure is logged but archive proceeds when not required."""
         config = self._make_config(
             config_class,
             archive_validate_before_cleanup=False,
             historical_backup_enabled=True,
             historical_backup_run_before_archive=True,
+            historical_backup_required_before_archive=False,
         )
         job = self._build_and_get_archive_job(config)
         assert job is not None
@@ -323,6 +326,123 @@ class TestArchiveMaintenanceJob:
             job()
 
         assert events == ['backup', 'archive']
+
+    def test_backup_failure_blocks_archive_when_required(self, config_class):
+        """When backup is required and returns non-zero, archive is skipped."""
+        config = self._make_config(
+            config_class,
+            archive_validate_before_cleanup=False,
+            historical_backup_enabled=True,
+            historical_backup_run_before_archive=True,
+            historical_backup_required_before_archive=True,
+        )
+        job = self._build_and_get_archive_job(config)
+        assert job is not None
+
+        events = []
+
+        def fake_backup(**kw):
+            events.append('backup')
+            return 1  # Simulate backup failure
+
+        def fake_run_archive(**kw):
+            events.append('archive')
+            return 0
+
+        with patch('src.maintenance.backup.run_backup', side_effect=fake_backup), \
+             patch('src.maintenance.archive.run_archive', side_effect=fake_run_archive):
+            job()
+
+        assert events == ['backup']  # archive NOT called
+
+    def test_backup_failure_allows_archive_when_not_required(self, config_class):
+        """When backup is not required and returns non-zero, archive proceeds."""
+        config = self._make_config(
+            config_class,
+            archive_validate_before_cleanup=False,
+            historical_backup_enabled=True,
+            historical_backup_run_before_archive=True,
+            historical_backup_required_before_archive=False,
+        )
+        job = self._build_and_get_archive_job(config)
+        assert job is not None
+
+        events = []
+
+        def fake_backup(**kw):
+            events.append('backup')
+            return 1
+
+        def fake_run_archive(**kw):
+            events.append('archive')
+            return 0
+
+        with patch('src.maintenance.backup.run_backup', side_effect=fake_backup), \
+             patch('src.maintenance.archive.run_archive', side_effect=fake_run_archive):
+            job()
+
+        assert events == ['backup', 'archive']
+
+    def test_backup_success_then_archive_with_validation(self, config_class):
+        """Successful backup followed by validation then actual archive."""
+        config = self._make_config(
+            config_class,
+            archive_validate_before_cleanup=True,
+            historical_backup_enabled=True,
+            historical_backup_run_before_archive=True,
+            historical_backup_required_before_archive=True,
+        )
+        job = self._build_and_get_archive_job(config)
+        assert job is not None
+
+        events = []
+
+        def fake_backup(**kw):
+            events.append('backup')
+            return 0
+
+        def fake_run_archive(*, days, dry_run, skip_vacuum, validate_only, **kw):
+            events.append(f'archive_validate_only={validate_only}')
+            return 0
+
+        with patch('src.maintenance.backup.run_backup', side_effect=fake_backup), \
+             patch('src.maintenance.archive.run_archive', side_effect=fake_run_archive):
+            job()
+
+        assert len(events) == 3, f"Expected 3 events, got: {events}"
+        assert events[0] == 'backup'
+        assert events[1] == 'archive_validate_only=True'
+        assert events[2] == 'archive_validate_only=False'
+
+    def test_backup_success_no_validation(self, config_class):
+        """Successful backup then archive without validation preflight."""
+        config = self._make_config(
+            config_class,
+            archive_validate_before_cleanup=False,
+            historical_backup_enabled=True,
+            historical_backup_run_before_archive=True,
+            historical_backup_required_before_archive=True,
+        )
+        job = self._build_and_get_archive_job(config)
+        assert job is not None
+
+        events = []
+
+        def fake_backup(**kw):
+            events.append('backup')
+            return 0
+
+        def fake_run_archive(*, days, dry_run, skip_vacuum, validate_only, **kw):
+            events.append(f'archive_validate_only={validate_only}')
+            return 0
+
+        with patch('src.maintenance.backup.run_backup', side_effect=fake_backup), \
+             patch('src.maintenance.archive.run_archive', side_effect=fake_run_archive):
+            job()
+
+        assert len(events) == 2, f"Expected 2 events, got: {events}"
+        assert events[0] == 'backup'
+        assert events[1] == 'archive_validate_only=False'
 
     def test_no_negative_backup_interval(self, config_class):
         """Archive interval of 1 hour should not create a 0 or 30-second

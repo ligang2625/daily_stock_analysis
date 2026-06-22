@@ -522,3 +522,26 @@ CREATE TABLE intraday_market_snapshots (
 ### 测试
 
 **54 Phase 4 (21 new + 33 existing) + 32 Phase 3 = 86 passed, 0 regressions**
+
+## Session 14: Phase 4 Follow-up — pre-archive backup failure blocks archive (2026-06-22)
+
+### 修复项
+
+| # | Severity | Fix | Key Change |
+|---|----------|-----|------------|
+| 1 | Major | 归档前备份失败未阻断归档 | `historical_backup_required_before_archive=True` (默认) 时，`run_backup()` 返回非 0 → 跳过 archive；设为 false 则 best-effort |
+| 2 | Minor | 补充 backup 阻断/放行调度测试 | 4 新测试 `test_backup_failure_blocks_archive_when_required` / `...allows_archive_when_not_required` / `backup_success_then_archive_with_validation` / `backup_success_no_validation` |
+| 3 | Minor | GH Actions 维护 workflow 确认 | `.github/workflows/db-maintenance.yml` 已验证存在，完整 4 mode (diagnostics/archive-dry-run/archive/backup)，无需修改 |
+
+### 修改文件
+
+| 文件 | 改动 |
+|------|------|
+| `src/config.py` | 新增 `historical_backup_required_before_archive: bool = True` + env 解析 |
+| `main.py` | `_archive_maintenance_job()` backup block 捕获 rc，按配置阻断/放行 |
+| `.env.example` | 新增 `HISTORICAL_BACKUP_REQUIRED_BEFORE_ARCHIVE=true` 注释 |
+| `tests/test_maintenance_scheduler.py` | 4 新测试 + 1 重命名 + 1 修复 (fake_backup return 0) |
+
+### 测试
+
+**57 Phase 4 (3 new + 54 existing) + 32 Phase 3 = 89 passed, 1 pre-existing failure** (Config singleton leak in `test_db_diagnostics.py`, unmodified)

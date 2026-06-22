@@ -871,11 +871,11 @@ def build_maintenance_background_tasks(config, config_provider) -> list:
             from src.maintenance.archive import run_archive
             cfg = config_provider()
 
-            # 1. Pre-archive backup (best-effort, does not block archive)
+            # 1. Pre-archive backup (required by default, blocks archive on failure)
             if run_backup_first:
                 from src.maintenance.backup import run_backup as do_backup
                 try:
-                    do_backup(
+                    rc = do_backup(
                         historical_only=True,
                         main_only=False,
                         backup_all=False,
@@ -883,8 +883,17 @@ def build_maintenance_background_tasks(config, config_provider) -> list:
                         retention_days=getattr(cfg, 'historical_backup_retention_days', 14),
                         cleanup_old=True,
                     )
+                    if rc != 0:
+                        required = getattr(cfg, 'historical_backup_required_before_archive', True)
+                        if required:
+                            logger.error("[Backup] Pre-archive backup failed (rc=%d), skipping archive", rc)
+                            return
+                        logger.warning("[Backup] Pre-archive backup failed (rc=%d), continuing (not required)", rc)
                 except Exception as exc:
                     logger.exception("[Backup] Pre-archive backup failed: %s", exc)
+                    if getattr(cfg, 'historical_backup_required_before_archive', True):
+                        logger.error("[Backup] Blocking archive because backup is required")
+                        return
 
             # 2. Validation preflight (if configured)
             if getattr(cfg, 'archive_validate_before_cleanup', True):
