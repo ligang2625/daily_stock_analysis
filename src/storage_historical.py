@@ -366,6 +366,60 @@ class HistoricalDatabaseManager:
         finally:
             session.close()
 
+    def get_last_run(self) -> Optional[ArchiveRun]:
+        """Return the most recent archive run (any status), or None."""
+        from sqlalchemy import desc, select as sa_select
+
+        session = self.get_session()
+        try:
+            run = session.execute(
+                sa_select(ArchiveRun)
+                .order_by(desc(ArchiveRun.started_at))
+                .limit(1)
+            ).scalars().first()
+            return run
+        except Exception:
+            return None
+        finally:
+            session.close()
+
+    def get_recent_archive_runs(self, limit: int = 10) -> list:
+        """Return the most recent archive runs, ordered by started_at desc."""
+        from sqlalchemy import desc, select as sa_select
+
+        session = self.get_session()
+        try:
+            runs = session.execute(
+                sa_select(ArchiveRun)
+                .order_by(desc(ArchiveRun.started_at))
+                .limit(limit)
+            ).scalars().all()
+            return list(runs)
+        except Exception:
+            return []
+        finally:
+            session.close()
+
+    def get_failed_runs_since(self, since: datetime) -> list:
+        """Return archive runs that failed on or after the given datetime."""
+        from sqlalchemy import select as sa_select
+
+        session = self.get_session()
+        try:
+            runs = session.execute(
+                sa_select(ArchiveRun)
+                .where(
+                    ArchiveRun.status == 'failed',
+                    ArchiveRun.started_at >= since,
+                )
+                .order_by(ArchiveRun.started_at.desc())
+            ).scalars().all()
+            return list(runs)
+        except Exception:
+            return []
+        finally:
+            session.close()
+
     # ------------------------------------------------------------------
     # Phase 2 upsert methods (idempotent)
     # ------------------------------------------------------------------

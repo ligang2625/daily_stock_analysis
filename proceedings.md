@@ -430,3 +430,66 @@ CREATE TABLE intraday_market_snapshots (
 ### 测试
 
 **10 new + 42 existing Phase 3 = 52 passed, 0 regressions**
+
+## Session 12: Phase 4 — 长期维护与可观测性 (2026-06-22)
+
+### 新增特性
+
+| # | Priority | Feature | Key Change |
+|---|----------|---------|------------|
+| 1 | Major | Phase 4 配置项 | 12 新 `Config` 字段 + env 解析 + `.env.example` 文档化 |
+| 2 | Major | 数据库诊断模块 | `db_diagnostics.py` — CLI text/json, 主库/历史库指标, readonly, fresh DB 兼容 |
+| 3 | Major | 归档健康检查 | `archive_health.py` — stale/fail 检测, exit codes 0/1, `--soft-fail` |
+| 4 | Major | 历史库备份 | `backup.py` — SQLite backup API, `--compress`, `--cleanup-old`, retention cleanup |
+| 5 | Major | 定时归档/诊断调度 | `main.py` — 3 个维护 bg task, 由 config 控制开关, overlap 防护, 默认禁用 |
+| 6 | Major | Phase 4 测试覆盖 | 33 测试：diagnostics/health/backup/scheduler/umbrella CLI |
+| 7 | Minor | GitHub Actions 维护工作流 | `db-maintenance.yml` — manual dispatch (diagnostics/archive-dry-run/archive/backup) |
+| 8 | Minor | 统一维护 CLI | `scripts/maintenance.py` — archive/diagnostics/backup/health 子命令 |
+
+### 新增配置
+
+| 配置 | 默认值 | 说明 |
+|------|--------|------|
+| `archive_enabled` | `False` | 启用定时归档 |
+| `archive_retention_days` | `5` | 归档保留天数 |
+| `archive_interval_hours` | `24` | 归档执行间隔 |
+| `archive_run_on_start` | `False` | 启动时立即归档 |
+| `archive_skip_vacuum` | `False` | 跳过归档后 VACUUM |
+| `archive_validate_before_cleanup` | `True` | 归档前验证 |
+| `db_diagnostics_enabled` | `False` | 启用定时诊断 |
+| `db_diagnostics_interval_hours` | `24` | 诊断执行间隔 |
+| `db_diagnostics_output_dir` | `./logs/db_diagnostics` | 诊断输出目录 |
+| `historical_backup_enabled` | `False` | 启用备份 |
+| `historical_backup_dir` | `./data/backups` | 备份目录 |
+| `historical_backup_retention_days` | `14` | 备份保留天数 |
+| `historical_backup_run_before_archive` | `True` | 归档前自动备份 |
+
+### 新增文件
+
+| 文件 | 说明 |
+|------|------|
+| `src/maintenance/db_diagnostics.py` | DB 诊断 CLI (text/json/output) |
+| `src/maintenance/archive_health.py` | 归档健康检查 CLI (stale/fail/exit code) |
+| `src/maintenance/backup.py` | SQLite 备份 CLI (compress/cleanup) |
+| `scripts/maintenance.py` | 统一维护 CLI 入口 |
+| `scripts/__init__.py` | scripts 包标记 |
+| `.github/workflows/db-maintenance.yml` | 可选维护工作流 |
+| `tests/test_db_diagnostics.py` | 6 测试 |
+| `tests/test_archive_health.py` | 6 测试 |
+| `tests/test_historical_backup.py` | 6 测试 |
+| `tests/test_maintenance_scheduler.py` | 9 测试 |
+| `tests/test_maintenance_cli.py` | 6 测试 |
+
+### 修改文件
+
+| 文件 | 改动 |
+|------|------|
+| `src/config.py` | 12 新 config 字段 + env 解析 |
+| `src/storage_historical.py` | 3 新 helper: get_last_run/get_recent_runs/get_failed_runs |
+| `main.py` | 3 维护 bg task (archive/diagnostics/backup) |
+| `.env.example` | Phase 4 配置文档段 |
+| `src/maintenance/archive_health.py` | `last_success_info` 增加 `status` 字段 |
+
+### 测试
+
+**33 Phase 4 + 32 Phase 3 = 65 passed, 0 regressions**

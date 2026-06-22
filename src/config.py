@@ -870,6 +870,23 @@ class Config:
     historical_database_path: str = "./data/historical_market.db"
     archive_retention_days: int = 5
     sqlite_wal_enabled: bool = True
+
+    # === Phase 4: 维护与可观测性配置 ===
+    # 归档维护
+    archive_enabled: bool = False
+    archive_interval_hours: int = 24
+    archive_run_on_start: bool = False
+    archive_skip_vacuum: bool = False
+    archive_validate_before_cleanup: bool = True
+    # 数据库诊断
+    db_diagnostics_enabled: bool = False
+    db_diagnostics_interval_hours: int = 24
+    db_diagnostics_output_dir: str = "./logs/db_diagnostics"
+    # 历史库备份
+    historical_backup_enabled: bool = False
+    historical_backup_dir: str = "./data/backups"
+    historical_backup_retention_days: int = 14
+    historical_backup_run_before_archive: bool = True
     sqlite_busy_timeout_ms: int = 5000
     sqlite_write_retry_max: int = 3
     sqlite_write_retry_base_delay: float = 0.1
@@ -1705,6 +1722,20 @@ class Config:
             prefetch_realtime_quotes=os.getenv('PREFETCH_REALTIME_QUOTES', 'true').lower() == 'true',
             database_path=os.getenv('DATABASE_PATH', './data/stock_analysis.db'),
             historical_database_path=os.getenv('HISTORICAL_DATABASE_PATH', './data/historical_market.db'),
+            archive_retention_days=parse_env_int(os.getenv('ARCHIVE_RETENTION_DAYS'), 5, field_name='ARCHIVE_RETENTION_DAYS', minimum=1),
+            # Phase 4: 维护与可观测性配置
+            archive_enabled=parse_env_bool(os.getenv('ARCHIVE_ENABLED'), default=False),
+            archive_interval_hours=parse_env_int(os.getenv('ARCHIVE_INTERVAL_HOURS'), 24, field_name='ARCHIVE_INTERVAL_HOURS', minimum=1),
+            archive_run_on_start=parse_env_bool(os.getenv('ARCHIVE_RUN_ON_START'), default=False),
+            archive_skip_vacuum=parse_env_bool(os.getenv('ARCHIVE_SKIP_VACUUM'), default=False),
+            archive_validate_before_cleanup=parse_env_bool(os.getenv('ARCHIVE_VALIDATE_BEFORE_CLEANUP'), default=True),
+            db_diagnostics_enabled=parse_env_bool(os.getenv('DB_DIAGNOSTICS_ENABLED'), default=False),
+            db_diagnostics_interval_hours=parse_env_int(os.getenv('DB_DIAGNOSTICS_INTERVAL_HOURS'), 24, field_name='DB_DIAGNOSTICS_INTERVAL_HOURS', minimum=1),
+            db_diagnostics_output_dir=os.getenv('DB_DIAGNOSTICS_OUTPUT_DIR', './logs/db_diagnostics'),
+            historical_backup_enabled=parse_env_bool(os.getenv('HISTORICAL_BACKUP_ENABLED'), default=False),
+            historical_backup_dir=os.getenv('HISTORICAL_BACKUP_DIR', './data/backups'),
+            historical_backup_retention_days=parse_env_int(os.getenv('HISTORICAL_BACKUP_RETENTION_DAYS'), 14, field_name='HISTORICAL_BACKUP_RETENTION_DAYS', minimum=1),
+            historical_backup_run_before_archive=parse_env_bool(os.getenv('HISTORICAL_BACKUP_RUN_BEFORE_ARCHIVE'), default=True),
             sqlite_wal_enabled=os.getenv('SQLITE_WAL_ENABLED', 'true').lower() == 'true',
             sqlite_busy_timeout_ms=parse_env_int(
                 os.getenv('SQLITE_BUSY_TIMEOUT_MS'),

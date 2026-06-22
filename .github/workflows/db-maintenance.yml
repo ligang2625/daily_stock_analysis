@@ -1,0 +1,98 @@
+name: DB Maintenance
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'Maintenance operation'
+        required: true
+        type: choice
+        default: 'diagnostics'
+        options:
+          - diagnostics
+          - archive-dry-run
+          - archive
+          - backup
+      archive_days:
+        description: 'Archive retention days (for archive/archive-dry-run)'
+        required: false
+        type: string
+        default: '5'
+  schedule:
+    # Disabled by default; remove comments below to enable conservative weekdaily run
+    # - cron: '30 20 * * 1-5'
+
+permissions:
+  contents: read
+
+jobs:
+  maintenance:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install schedule
+
+      - name: Setup environment
+        run: |
+          cp .env.example .env
+          echo "DATABASE_PATH=./data/dsa_maintenance_ci.db" >> .env
+          echo "HISTORICAL_DATABASE_PATH=./data/dsa_maintenance_ci_historical.db" >> .env
+
+      - name: Run diagnostics
+        if: ${{ github.event.inputs.mode == 'diagnostics' || github.event_name == 'schedule' }}
+        run: |
+          python -m src.maintenance.db_diagnostics --format json
+          mkdir -p logs/db_diagnostics
+          python -m src.maintenance.db_diagnostics --format json --output logs/db_diagnostics/latest.json
+
+      - name: Run archive dry-run
+        if: ${{ github.event.inputs.mode == 'archive-dry-run' }}
+        run: |
+          python -m src.maintenance.archive --days ${{ github.event.inputs.archive_days || '5' }} --dry-run
+
+      - name: Run archive (actual)
+        if: ${{ github.event.inputs.mode == 'archive' }}
+        run: |
+          python -m src.maintenance.archive --days ${{ github.event.inputs.archive_days || '5' }}
+
+      - name: Run backup
+        if: ${{ github.event.inputs.mode == 'backup' }}
+        run: |
+          mkdir -p data/backups
+          python -m src.maintenance.backup --historical-only --output-dir data/backups --cleanup-old --retention-days 14
+
+      - name: Upload diagnostics artifact
+        if: ${{ github.event.inputs.mode == 'diagnostics' || github.event_name == 'schedule' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: db-diagnostics
+          path: logs/db_diagnostics/
+          retention-days: 7
+
+      - name: Upload backup artifact
+        if: ${{ github.event.inputs.mode == 'backup' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: db-backup
+          path: data/backups/
+          retention-days: 7

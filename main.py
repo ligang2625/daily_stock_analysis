@@ -1141,6 +1141,91 @@ def main() -> int:
                     "name": "agent_event_monitor",
                 })
 
+            # Phase 4: Register archive maintenance background task
+            if getattr(config, 'archive_enabled', False):
+                archive_interval_hours = max(1, getattr(config, 'archive_interval_hours', 24))
+                archive_run_on_start = getattr(config, 'archive_run_on_start', False)
+
+                def _run_archive_maintenance_job():
+                    from src.maintenance.archive import run_archive
+                    cfg = _reload_runtime_config()
+                    run_archive(
+                        days=cfg.archive_retention_days,
+                        dry_run=False,
+                        skip_vacuum=cfg.archive_skip_vacuum,
+                        technical_only=False,
+                        skip_technical_archive=False,
+                        validate_only=cfg.archive_validate_before_cleanup,
+                    )
+
+                background_tasks.append({
+                    "task": _run_archive_maintenance_job,
+                    "interval_seconds": archive_interval_hours * 3600,
+                    "run_immediately": archive_run_on_start,
+                    "name": "archive_maintenance",
+                })
+
+            # Phase 4: Register database diagnostics background task
+            if getattr(config, 'db_diagnostics_enabled', False):
+                diagnostics_interval_hours = max(1, getattr(config, 'db_diagnostics_interval_hours', 24))
+                diagnostics_output_dir = getattr(config, 'db_diagnostics_output_dir', './logs/db_diagnostics')
+
+                def _run_diagnostics_maintenance_job():
+                    import os as _os
+                    import json as _json
+                    from datetime import datetime
+                    from src.maintenance.db_diagnostics import generate_diagnostics
+
+                    cfg = _reload_runtime_config()
+                    try:
+                        report = generate_diagnostics(retention_days=cfg.archive_retention_days)
+                        diag_dir = _os.path.join(
+                            getattr(cfg, 'db_diagnostics_output_dir', './logs/db_diagnostics'),
+                        )
+                        _os.makedirs(diag_dir, exist_ok=True)
+                        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                        out_path = _os.path.join(diag_dir, f"diagnostics_{ts}.json")
+                        with open(out_path, 'w', encoding='utf-8') as f:
+                            _json.dump(report, f, ensure_ascii=False, indent=2, default=str)
+                        logger.info("[Diagnostics] Report written: %s (status=%s)", out_path, report.get('status', '?'))
+                    except Exception as e:
+                        logger.exception("[Diagnostics] Failed: %s", e)
+
+                background_tasks.append({
+                    "task": _run_diagnostics_maintenance_job,
+                    "interval_seconds": diagnostics_interval_hours * 3600,
+                    "run_immediately": False,
+                    "name": "db_diagnostics",
+                })
+
+                # Backup before archive if configured
+                if getattr(config, 'historical_backup_enabled', False) and \
+                   getattr(config, 'historical_backup_run_before_archive', True) and \
+                   getattr(config, 'archive_enabled', False):
+                    backup_dir = getattr(config, 'historical_backup_dir', './data/backups')
+
+                    def _run_backup_maintenance_job():
+                        from src.maintenance.backup import run_backup as do_backup
+                        cfg = _reload_runtime_config()
+                        try:
+                            do_backup(
+                                historical_only=True,
+                                main_only=False,
+                                backup_all=False,
+                                output_dir=getattr(cfg, 'historical_backup_dir', './data/backups'),
+                                retention_days=getattr(cfg, 'historical_backup_retention_days', 14),
+                                cleanup_old=True,
+                            )
+                        except Exception as e:
+                            logger.exception("[Backup] Failed: %s", e)
+
+                    background_tasks.append({
+                        "task": _run_backup_maintenance_job,
+                        "interval_seconds": archive_interval_hours * 3600 - 3600,
+                        "run_immediately": archive_run_on_start,
+                        "name": "historical_backup",
+                    })
+
             for entry in background_tasks:
                 scheduler.add_background_task(
                     task=entry["task"],
