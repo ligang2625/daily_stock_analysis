@@ -403,3 +403,30 @@ CREATE TABLE intraday_market_snapshots (
 ### 测试
 
 **19 (Phase 2) + 33 (Phase 3) = 52 passed, 0 regressions**
+
+## Session 11: Phase 3 Follow-up — `historical_snapshot_count` query fix + test regression (2026-06-22)
+
+### 修复项
+
+| # | Severity | Fix | Key Change |
+|---|----------|-----|------------|
+| 1 | Major | `final_decision()` 查询不存在的 `snapshot_type` 列 | SQL 改为 `WHERE query_date IN (...placeholders) AND status IN ('completed', 'partial')`；`decision_market_dates.values()` 全市场日期而非单 CN 默认 |
+| 2 | Minor | HK/US-only final decision 日期 fallback 不准确 | 动态 `market_dates_list` + 参数化 IN 子句，仅 dict 空时回退服务器日期 |
+| 3 | Minor | 归档日志仍标 "Phase 2" | `"Phase 2/3 extraction complete"`；docstring 同步更新 |
+
+### 新增文件
+
+| 文件 | 测试数 |
+|------|--------|
+| `tests/test_intraday_market_snapshots_schema.py` | 10 |
+
+### 修改文件
+
+| 文件 | 改动 |
+|------|------|
+| `src/core/intraday_monitor.py` | `historical_snapshot_count` SQL 重写 + 多市场日期参数化 |
+| `src/maintenance/archive_extractors.py` | 日志 "Phase 2/3" + docstring 更新 |
+
+### 测试
+
+**10 new + 42 existing Phase 3 = 52 passed, 0 regressions**

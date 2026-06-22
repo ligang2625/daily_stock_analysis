@@ -1706,18 +1706,20 @@ class IntradayMonitor:
         try:
             with self._db.session_scope() as session:
                 from sqlalchemy import text as sa_text
-                primary_date = decision_market_dates.get('cn') or datetime.now().strftime('%Y-%m-%d')
+                market_dates_list = list(decision_market_dates.values()) if decision_market_dates else [datetime.now().strftime('%Y-%m-%d')]
+                placeholders = ", ".join([f":qd{i}" for i in range(len(market_dates_list))])
+                params = {f"qd{i}": d for i, d in enumerate(market_dates_list)}
                 row = session.execute(
                     sa_text(
-                        "SELECT COUNT(*) FROM intraday_snapshots "
-                        "WHERE query_date = :qd AND snapshot_type != 'decision'"
+                        f"SELECT COUNT(*) FROM intraday_snapshots "
+                        f"WHERE query_date IN ({placeholders}) AND status IN ('completed', 'partial')"
                     ),
-                    {"qd": primary_date},
+                    params,
                 ).scalar()
                 historical_snapshot_count = row or 0
                 logger.info(
-                    "historical_snapshots count=%d for query_date=%s",
-                    historical_snapshot_count, primary_date,
+                    "historical_snapshots count=%d for market_dates=%s",
+                    historical_snapshot_count, market_dates_list,
                 )
         except Exception as exc:
             logger.warning("查询历史快照数失败: %s", exc)

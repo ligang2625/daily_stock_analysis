@@ -629,7 +629,8 @@ def extract_phase2_technical_history(
     dry_run: bool = False,
 ) -> Dict[str, Any]:
     """
-    Run all Phase 2 extractors and (if not dry_run) write to historical DB.
+    Run all Phase 2 extractors (and Phase 3 market index points) and
+    (if not dry_run) write to historical DB.
 
     Returns a dict with per-extractor stats: {read_count, written_count}
     """
@@ -716,7 +717,7 @@ def extract_phase2_technical_history(
 
     total_read = sum(s['read'] for s in stats.values() if isinstance(s, dict) and 'read' in s)
     total_written = sum(s['written'] for s in stats.values() if isinstance(s, dict) and 'written' in s)
-    logger.info("Phase 2 extraction complete: total_read=%s total_written=%s dry_run=%s",
+    logger.info("Phase 2/3 extraction complete: total_read=%s total_written=%s dry_run=%s",
                 total_read, total_written, dry_run)
 
     return stats
