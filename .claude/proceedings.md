@@ -106,3 +106,38 @@
 ## 验证
 - 无新代码改动（变更已在磁盘，仅首次 commit）
 - `.bug-fix-pipeline/plan.md` + `.omc/` 保留为本地产物，不入库
+
+---
+
+### Session 19: 盘中决策备用 LLM 渠道 Fallback (2026-06-22)
+
+## 改动概要
+
+盘中决策链路新增可独立配置的备用 LLM 渠道：主 LLM 失败时自动按可配置条件重试备用 LLM，避免直接进入 LLM_FAILURE_ALERT。备用 LLM 使用 `litellm.completion()` 直接调用，不经过主 analyzer。
+
+## 修改文件
+
+**`src/config.py`** (+18 fields, +18 parsing lines):
+- Config 新增 9 个 `intraday_llm_fallback_*` 字段（enabled/protocol/base_url/api_key/model/temperature/max_tokens/timeout_sec/retry_on）
+- `from_env` 新增对应环境变量解析，temperature/max_tokens 可选值用预计算变量避免 `parse_env_float(None)` 崩溃
+
+**`src/core/intraday_monitor.py`** (+200 lines):
+- `LLMResult` 扩展 6 个审计字段：provider/model/base_url_host/attempts/primary_error_message/fallback_error_message
+- 新增 `_call_llm_with_fallback()` 主备 LLM 编排
+- 新增 `_should_try_fallback_llm()` fallback 条件校验
+- 新增 `_call_fallback_llm()` 直接调用 litellm.completion() 实现
+- `_final_decision_locked()` 改用 `_call_llm_with_fallback()`；备用成功时邮件追加来源标注；失败时两路错误分别展示
+- `__init__` 增加 fallback 启动日志（显示 model/base_url_host/retry_on）
+
+**`.github/workflows/intraday-monitor.yml`** (+7 lines):
+- 增加 6 项 `INTRADAY_LLM_FALLBACK_*` 环境变量映射
+
+**`.env.example`** (+10 lines):
+- 增加 fallback 配置示例
+
+**`tests/test_intraday_monitor_llm_fallback.py`** (新文件, 174 行):
+- 3 个测试类、13 个测试方法：LLMResult 扩展字段、should_try_fallback 条件分支（6 种）、call_llm_with_fallback 主备切换（4 种）
+
+## 验证
+- 13 passed, 0 failed（新测试）
+- 编译检查：OK

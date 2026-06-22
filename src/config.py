@@ -956,6 +956,16 @@ class Config:
     intraday_decision_lock_ttl_seconds: int = 300
     # 盘中 LLM 调用 max_tokens（防止报告截断）
     intraday_llm_max_tokens: int = 4096
+    # 盘中决策备用 LLM 配置
+    intraday_llm_fallback_enabled: bool = False
+    intraday_llm_fallback_protocol: str = "openai"
+    intraday_llm_fallback_base_url: Optional[str] = None
+    intraday_llm_fallback_api_key: Optional[str] = None
+    intraday_llm_fallback_model: Optional[str] = None
+    intraday_llm_fallback_temperature: Optional[float] = None
+    intraday_llm_fallback_max_tokens: Optional[int] = None
+    intraday_llm_fallback_timeout_sec: int = 60
+    intraday_llm_fallback_retry_on: str = "config_error,rate_limited,network_error,empty_response"
     # 是否在盘中快照中同步抓取大盘指数行情
     intraday_market_snapshot_enabled: bool = True
     # A股大盘指数代码（逗号分隔），默认：上证指数、深证成指、创业板指
@@ -1494,6 +1504,22 @@ class Config:
         if report_show_llm_model_raw is not None and not report_show_llm_model_raw.strip():
             report_show_llm_model = False
 
+        # Compute optional fallback values (parse_env_float/parse_env_int require typed defaults)
+        _fallback_temp_raw = os.getenv('INTRADAY_LLM_FALLBACK_TEMPERATURE')
+        _fallback_temperature: Optional[float] = None
+        if _fallback_temp_raw and str(_fallback_temp_raw).strip():
+            try:
+                _fallback_temperature = float(str(_fallback_temp_raw).strip())
+            except (TypeError, ValueError):
+                pass
+        _fallback_maxtok_raw = os.getenv('INTRADAY_LLM_FALLBACK_MAX_TOKENS')
+        _fallback_max_tokens: Optional[int] = None
+        if _fallback_maxtok_raw and str(_fallback_maxtok_raw).strip():
+            try:
+                _fallback_max_tokens = int(str(_fallback_maxtok_raw).strip())
+            except (TypeError, ValueError):
+                pass
+
         return cls(
             stock_list=stock_list,
             feishu_app_id=os.getenv('FEISHU_APP_ID'),
@@ -1805,6 +1831,15 @@ class Config:
             intraday_hk_batch_primary_timeout=parse_env_float(os.getenv('INTRADAY_HK_BATCH_PRIMARY_TIMEOUT'), 20.0, field_name='INTRADAY_HK_BATCH_PRIMARY_TIMEOUT', minimum=5.0),
             intraday_hk_batch_fallback_timeout=parse_env_float(os.getenv('INTRADAY_HK_BATCH_FALLBACK_TIMEOUT'), 60.0, field_name='INTRADAY_HK_BATCH_FALLBACK_TIMEOUT', minimum=10.0),
             intraday_llm_max_tokens=parse_env_int(os.getenv('INTRADAY_LLM_MAX_TOKENS'), 4096, field_name='INTRADAY_LLM_MAX_TOKENS', minimum=256, maximum=16384),
+            intraday_llm_fallback_enabled=os.getenv('INTRADAY_LLM_FALLBACK_ENABLED', 'false').lower() == 'true',
+            intraday_llm_fallback_protocol=os.getenv('INTRADAY_LLM_FALLBACK_PROTOCOL', 'openai'),
+            intraday_llm_fallback_base_url=os.getenv('INTRADAY_LLM_FALLBACK_BASE_URL'),
+            intraday_llm_fallback_api_key=os.getenv('INTRADAY_LLM_FALLBACK_API_KEY'),
+            intraday_llm_fallback_model=os.getenv('INTRADAY_LLM_FALLBACK_MODEL'),
+            intraday_llm_fallback_temperature=_fallback_temperature,
+            intraday_llm_fallback_max_tokens=_fallback_max_tokens,
+            intraday_llm_fallback_timeout_sec=parse_env_int(os.getenv('INTRADAY_LLM_FALLBACK_TIMEOUT_SEC'), 60, field_name='INTRADAY_LLM_FALLBACK_TIMEOUT_SEC', minimum=1),
+            intraday_llm_fallback_retry_on=os.getenv('INTRADAY_LLM_FALLBACK_RETRY_ON', 'config_error,rate_limited,network_error,empty_response'),
             intraday_market_snapshot_enabled=os.getenv('INTRADAY_MARKET_SNAPSHOT_ENABLED', 'true').lower() == 'true',
             intraday_market_indices_cn=os.getenv('INTRADAY_MARKET_INDICES_CN', '000001,399001,399006'),
             intraday_market_indices_hk=os.getenv('INTRADAY_MARKET_INDICES_HK', 'HSI,HSTECH'),

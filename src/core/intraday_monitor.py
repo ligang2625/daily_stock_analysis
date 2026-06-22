@@ -34,6 +34,7 @@ import sqlite3
 from enum import Enum
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
+import litellm
 from src.core.intraday_prompt import format_intraday_event_time
 from data_provider.realtime_types import SnapshotQuoteProcessResult, SnapshotQuoteStatus
 from src.utils.stock_code import normalize_stock_code_key, normalize_stock_code_for_history_query
@@ -141,6 +142,12 @@ class LLMResult:
     status: str  # "success" | "config_error" | "rate_limited" | "network_error" | "empty_response"
     content: Optional[str] = None
     error_message: Optional[str] = None
+    provider: Optional[str] = None       # "primary" | "fallback"
+    model: Optional[str] = None
+    base_url_host: Optional[str] = None  # host from base_url (no API key leakage)
+    attempts: int = 1
+    primary_error_message: Optional[str] = None
+    fallback_error_message: Optional[str] = None
 
 
 class LLMConfigError(Exception):
@@ -466,6 +473,23 @@ class IntradayMonitor:
         self._expired_requests: set = set()
         self._current_run_id = uuid.uuid4().hex[:12]
         self._current_snapshot_id: Optional[str] = None
+
+        # Startup logging for fallback LLM config
+        if self._config.intraday_llm_fallback_enabled:
+            fb_model = self._config.intraday_llm_fallback_model or "not set"
+            fb_host = "not set"
+            if self._config.intraday_llm_fallback_base_url:
+                try:
+                    from urllib.parse import urlparse
+                    fb_host = urlparse(self._config.intraday_llm_fallback_base_url).netloc or "unknown"
+                except Exception:
+                    fb_host = "parse-error"
+            logger.info(
+                "Fallback LLM enabled: model=%s base_url_host=%s retry_on=%s",
+                fb_model, fb_host, self._config.intraday_llm_fallback_retry_on,
+            )
+        else:
+            logger.info("Fallback LLM disabled")
 
     def _get_llm_analyzer(self):
         """Return the injected analyzer, or create one lazily from config (fallback)."""
@@ -1755,11 +1779,20 @@ class IntradayMonitor:
             relative_strength_summary=relative_strength_summary,
         )
 
-        # Call LLM via unified analyzer
-        result = self._call_llm(prompt)
+        # Call LLM via unified analyzer with fallback
+        result = self._call_llm_with_fallback(prompt)
 
         if result.status == "success":
             content = self._normalize_official_decision_content(result.content or "")
+            # Prepend fallback indicator if applicable
+            if result.provider == "fallback":
+                fallback_lines = [
+                    f"> LLM来源: fallback",
+                    f"> 主LLM状态: {result.primary_error_message or 'unknown'}",
+                    f"> 备用模型: {result.model or 'unknown'}",
+                    "",
+                ]
+                content = "\n".join(fallback_lines) + content
             self._send_decision_email(
                 content=content,
                 report_type=EmailReportType.OFFICIAL_DECISION,
@@ -1775,10 +1808,37 @@ class IntradayMonitor:
             )
         elif result.status == "config_error":
             logger.error("LLM config error, no email sent: %s", result.error_message)
-            # Optionally: send LLM_FAILURE_ALERT but only if config allows
             if getattr(self._config, 'intraday_send_llm_failure_alert', True):
+                # Build content with fallback details if available
+                if result.fallback_error_message:
+                    fail_content = (
+                        f"## LLM 调用失败（配置错误）\n\n"
+                        f"### 主 LLM\n"
+                        f"- 状态: config_error\n"
+                        f"- 错误: {result.primary_error_message or result.error_message}\n\n"
+                        f"### 备用 LLM\n"
+                        f"- 状态: config_error\n"
+                        f"- 错误: {result.fallback_error_message}\n"
+                        f"- 模型: {result.model or 'N/A'}\n\n"
+                        f"### 建议检查\n"
+                        f"- INTRADAY_LLM_FALLBACK_ENABLED\n"
+                        f"- INTRADAY_LLM_FALLBACK_BASE_URL\n"
+                        f"- INTRADAY_LLM_FALLBACK_API_KEY\n"
+                        f"- INTRADAY_LLM_FALLBACK_MODEL\n"
+                    )
+                elif result.provider == "fallback":
+                    fail_content = (
+                        f"## LLM 调用失败\n\n"
+                        f"### 主 LLM\n"
+                        f"- 状态: config_error\n"
+                        f"- 错误: {result.primary_error_message or result.error_message}\n\n"
+                        f"### 备用 LLM\n"
+                        f"- 未尝试（配置不完整或未启用）\n"
+                    )
+                else:
+                    fail_content = f"LLM调用失败（配置错误），请检查模型配置。\n错误: {result.error_message}"
                 self._send_decision_email(
-                    content=f"LLM调用失败（配置错误），请检查模型配置。\n错误: {result.error_message}",
+                    content=fail_content,
                     report_type=EmailReportType.LLM_FAILURE_ALERT,
                     snapshot_id=snapshot_id,
                     coverage_ratio=coverage_ratio,
@@ -1791,11 +1851,34 @@ class IntradayMonitor:
         else:
             # network_error, rate_limited, empty_response
             if getattr(self._config, 'intraday_send_llm_failure_alert', True):
-                if getattr(self._config, 'intraday_send_raw_summary_on_llm_failure', False):
-                    llm_fail_markets = {self._get_market_for_stock(c) for c in stock_codes if self._get_market_for_stock(c)}
-                    raw = self._build_raw_summary(all_events, markets=llm_fail_markets)
+                if result.fallback_error_message:
+                    # Both primary and fallback failed
+                    raw = (
+                        f"## LLM 调用失败\n\n"
+                        f"### 主 LLM\n"
+                        f"- 状态: {result.status}\n"
+                        f"- 错误: {result.primary_error_message or result.error_message}\n\n"
+                        f"### 备用 LLM\n"
+                        f"- 状态: {result.status}\n"
+                        f"- 错误: {result.fallback_error_message}\n"
+                        f"- 模型: {result.model or 'N/A'}\n"
+                        f"- 主机: {result.base_url_host or 'N/A'}\n"
+                    )
+                elif result.provider == "fallback":
+                    raw = (
+                        f"## LLM 调用失败\n\n"
+                        f"### 主 LLM\n"
+                        f"- 状态: {result.status}\n"
+                        f"- 错误: {result.primary_error_message or result.error_message}\n\n"
+                        f"### 备用 LLM\n"
+                        f"- 未尝试（配置不完整或未启用）\n"
+                    )
                 else:
-                    raw = f"LLM调用失败: {result.status}\n{result.error_message}"
+                    if getattr(self._config, 'intraday_send_raw_summary_on_llm_failure', False):
+                        llm_fail_markets = {self._get_market_for_stock(c) for c in stock_codes if self._get_market_for_stock(c)}
+                        raw = self._build_raw_summary(all_events, markets=llm_fail_markets)
+                    else:
+                        raw = f"LLM调用失败: {result.status}\n{result.error_message}"
                 self._send_decision_email(
                     content=raw,
                     report_type=EmailReportType.LLM_FAILURE_ALERT,
@@ -1891,6 +1974,152 @@ class IntradayMonitor:
                 return True
         # Do NOT use bare "auth" — too broad
         return False
+
+    def _call_llm_with_fallback(self, prompt: str) -> LLMResult:
+        """Call primary LLM, fall back to backup LLM on failure if configured."""
+        primary = self._call_llm(prompt)
+        primary.provider = "primary"
+        if primary.status == "success":
+            return primary
+
+        if not self._should_try_fallback_llm(primary.status):
+            return primary
+
+        fallback = self._call_fallback_llm(prompt, primary)
+        if fallback.status == "success":
+            fallback.provider = "fallback"
+            fallback.primary_error_message = primary.error_message
+            fallback.attempts = primary.attempts + fallback.attempts
+            logger.info(
+                "Fallback LLM succeeded. provider=%s model=%s base_url=%s",
+                fallback.provider, fallback.model, fallback.base_url_host,
+            )
+            return fallback
+
+        # Both failed — merge errors
+        merged = LLMResult(
+            status=primary.status,
+            content=None,
+            error_message=f"主LLM: {primary.error_message}; 备用LLM: {fallback.error_message}",
+            provider="fallback",
+            model=fallback.model,
+            base_url_host=fallback.base_url_host,
+            attempts=primary.attempts + fallback.attempts,
+            primary_error_message=primary.error_message,
+            fallback_error_message=fallback.error_message,
+        )
+        return merged
+
+    def _should_try_fallback_llm(self, primary_status: str) -> bool:
+        """Check whether fallback LLM should be attempted based on config and primary status."""
+        config = self._config
+        if not config.intraday_llm_fallback_enabled:
+            logger.info("Fallback LLM disabled (INTRADAY_LLM_FALLBACK_ENABLED=false)")
+            return False
+        if not config.intraday_llm_fallback_model or not config.intraday_llm_fallback_api_key:
+            logger.warning(
+                "Fallback LLM enabled but incomplete config: model=%s api_key=%s",
+                config.intraday_llm_fallback_model,
+                "set" if config.intraday_llm_fallback_api_key else "missing",
+            )
+            return False
+        # Check if this status qualifies for retry
+        retry_on = set(
+            s.strip() for s in config.intraday_llm_fallback_retry_on.split(",") if s.strip()
+        )
+        should_retry = primary_status in retry_on
+        logger.info(
+            "Fallback decision: status=%s retry_on=%s should_retry=%s",
+            primary_status, retry_on, should_retry,
+        )
+        return should_retry
+
+    def _call_fallback_llm(self, prompt: str, primary_result: LLMResult) -> LLMResult:
+        """Call the fallback LLM using direct litellm.completion()."""
+        config = self._config
+        fallback_model = config.intraday_llm_fallback_model or ""
+        fallback_api_key = config.intraday_llm_fallback_api_key or ""
+        fallback_base_url = config.intraday_llm_fallback_base_url or ""
+        fallback_timeout = config.intraday_llm_fallback_timeout_sec
+
+        # Determine max_tokens
+        fallback_max_tokens = config.intraday_llm_fallback_max_tokens or config.intraday_llm_max_tokens
+
+        # Determine temperature
+        fallback_temperature = config.llm_temperature
+        if config.intraday_llm_fallback_temperature is not None:
+            fallback_temperature = config.intraday_llm_fallback_temperature
+
+        # Extract base_url host for logging (no API key leakage)
+        base_url_host = None
+        try:
+            from urllib.parse import urlparse
+            parsed = urlparse(fallback_base_url)
+            base_url_host = parsed.netloc or parsed.hostname
+        except Exception:
+            base_url_host = fallback_base_url.split("://")[-1].split("/")[0] if "://" in fallback_base_url else fallback_base_url
+
+        logger.info(
+            "Calling fallback LLM: model=%s base_url=%s max_tokens=%s temperature=%s timeout=%s",
+            fallback_model, base_url_host, fallback_max_tokens, fallback_temperature, fallback_timeout,
+        )
+
+        try:
+            response = litellm.completion(
+                model=fallback_model,
+                api_key=fallback_api_key,
+                api_base=fallback_base_url,
+                messages=[
+                    {"role": "system", "content": INTRADAY_SYSTEM_PROMPT},
+                    {"role": "user", "content": prompt},
+                ],
+                max_tokens=fallback_max_tokens,
+                temperature=fallback_temperature,
+                timeout=fallback_timeout,
+            )
+            text = response.choices[0].message.content if response.choices else None
+            if not text or not text.strip():
+                logger.warning("Fallback LLM returned empty response")
+                return LLMResult(
+                    status="empty_response",
+                    error_message="Fallback LLM returned empty response",
+                    model=fallback_model,
+                    base_url_host=base_url_host,
+                    provider="fallback",
+                )
+            logger.info("Fallback LLM call succeeded: model=%s", fallback_model)
+            return LLMResult(
+                status="success",
+                content=str(text),
+                model=fallback_model,
+                base_url_host=base_url_host,
+                provider="fallback",
+            )
+        except Exception as exc:
+            error_str = str(exc)
+            logger.error("Fallback LLM call failed: %s", error_str)
+            # Classify the error
+            status = "network_error"
+            lowered = error_str.lower()
+            config_keywords = (
+                "authenticationerror", "unauthorized", "forbidden",
+                "invalid api key", "incorrect api key", "credential",
+                "invalid x-goog", "permission denied", "access denied",
+                "apikey",
+            )
+            if any(kw in lowered for kw in config_keywords):
+                status = "config_error"
+            elif "ratelimit" in lowered or "rate_limit" in lowered or "429" in error_str:
+                status = "rate_limited"
+            elif "timeout" in lowered or "connection" in lowered:
+                status = "network_error"
+            return LLMResult(
+                status=status,
+                error_message=error_str,
+                model=fallback_model,
+                base_url_host=base_url_host,
+                provider="fallback",
+            )
 
     def _build_raw_summary(self, events: List[IntradayEvent], markets: Optional[set] = None) -> str:
         """Build raw data summary when LLM fails."""

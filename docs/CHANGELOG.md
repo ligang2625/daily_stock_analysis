@@ -39,6 +39,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - [改进] `intraday_monitor.py` 决策大盘加载优先走 Repository，失败降级到直接 SQL
 - [改进] `_apply_schema_migrations` 补全 `intraday_market_snapshots` 缺少的 `timestamp`/`error_message` 列
 - [测试] 新增大盘指数快照/历史归档/Repository 路由/相对强弱计算与 Prompt 注入 5 个测试文件(33 个测试)
+- [新功能] 盘中决策新增备用 LLM 渠道 fallback：主 LLM 失败时按可配置重试条件自动调用备用 LLM；备用成功时在决策邮件标注来源；两路均失败时发送合并错误详情告警
+- [改进] LLMResult 扩展 provider/model/base_url_host/attempts/primary_error_message/fallback_error_message 字段，支持 fallback 审计追踪
+- [改进] 新增 9 项 INTRADAY_LLM_FALLBACK_* 配置项，支持独立配置备用渠道 base URL/API key/model/temperature/max_tokens/timeout/retry_on
+- [改进] 新增 workflow 环境变量映射 INTRADAY_LLM_FALLBACK_*，支持 GitHub Actions Secrets/Variables 注入
+- [测试] 新增 13 个 fallback 逻辑测试（LLMResult 扩展字段、_should_try_fallback_llm 条件分支、_call_llm_with_fallback 主备切换）
 - [修复] `intraday_market_snapshots` DDL 补齐 `timestamp`/`error_message` 列 + 幂等列迁移 + timeline/status 索引，修复 fresh DB INSERT 报 unknown column
 - [修复] Prompt 大盘走势节中 stats 分支吞掉 trend 表：拆为独立"数据质量"+"指数走势"子段，stats 和 trends 同时输出
 - [修复] Prompt `historical_snapshot_count==0` 提示不可达：三路显式分支 (==0/==1/>=2)，修复缺少 f-string
