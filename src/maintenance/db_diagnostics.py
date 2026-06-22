@@ -31,17 +31,17 @@ from src.storage_historical import HistoricalDatabaseManager
 
 logger = logging.getLogger(__name__)
 
-TABLES_TO_PROBE = [
-    'analysis_history',
-    'analysis_history_payload',
-    'stock_daily',
-    'news_intel',
-    'llm_usage',
-    'agent_provider_turns',
-    'conversation_messages',
-    'fundamental_snapshot',
-    'alert_triggers',
-    'decision_signals',
+MAIN_TABLES_TO_PROBE = [
+    ('analysis_history', 'created_at'),
+    ('analysis_history_payload', 'created_at'),
+    ('stock_daily', 'created_at'),
+    ('news_intel', 'fetched_at'),
+    ('llm_usage', 'called_at'),
+    ('agent_provider_turns', 'created_at'),
+    ('conversation_messages', 'created_at'),
+    ('fundamental_snapshot', 'created_at'),
+    ('alert_triggers', 'triggered_at'),
+    ('decision_signals', 'created_at'),
 ]
 
 HISTORICAL_TABLES = [
@@ -90,7 +90,7 @@ def _collect_main_db_metrics(config, db: DatabaseManager, retention_days: int) -
     cutoff_date = date.today() - timedelta(days=retention_days)
 
     with db.session_scope() as session:
-        for tbl in TABLES_TO_PROBE:
+        for tbl, ts_col in MAIN_TABLES_TO_PROBE:
             entry: Dict[str, Any] = {}
             try:
                 # Row count
@@ -107,7 +107,7 @@ def _collect_main_db_metrics(config, db: DatabaseManager, retention_days: int) -
                 row = session.execute(
                     sa_text(
                         f"SELECT COUNT(*) FROM {tbl} "
-                        f"WHERE created_at < :cutoff"
+                        f"WHERE {ts_col} < :cutoff"
                     ),
                     {"cutoff": cutoff_date.isoformat()},
                 ).fetchone()
@@ -277,7 +277,7 @@ def generate_diagnostics(
     # Check for large payloads
     largest_payloads = main_db.get('largest_payloads')
     if largest_payloads and isinstance(largest_payloads, list) and largest_payloads:
-        if any(p.get('payload_size', 0) or 0 > 500_000 for p in largest_payloads):
+        if any((p.get("payload_size") or 0) > 500_000 for p in largest_payloads):
             warnings.append("Large payload records detected (>500KB)")
 
     # Check main DB size

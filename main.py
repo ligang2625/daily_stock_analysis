@@ -841,6 +841,124 @@ def _build_schedule_time_provider(default_schedule_time: str):
     return _provider
 
 
+def build_maintenance_background_tasks(config, config_provider) -> list:
+    """Build the list of Phase 4 maintenance background task dicts.
+
+    Returns a list of dicts compatible with Scheduler.add_background_task().
+    This function is the canonical production task-registration path and is
+    covered by unit tests so that future config additions can be validated
+    without running a full scheduler loop.
+
+    Tasks registered (when enabled):
+      - archive_maintenance: validate preflight -> actual archive
+        (optionally preceded by historical backup when
+         historical_backup_run_before_archive=True)
+      - db_diagnostics: periodic database diagnostics report
+    """
+    background_tasks = []
+
+    archive_enabled = getattr(config, 'archive_enabled', False)
+    backup_enabled = getattr(config, 'historical_backup_enabled', False)
+    backup_before_archive = getattr(config, 'historical_backup_run_before_archive', True)
+
+    # ---- Archive maintenance ----
+    if archive_enabled:
+        archive_interval_hours = max(1, getattr(config, 'archive_interval_hours', 24))
+        archive_run_on_start = getattr(config, 'archive_run_on_start', False)
+        run_backup_first = backup_enabled and backup_before_archive
+
+        def _archive_maintenance_job():
+            from src.maintenance.archive import run_archive
+            cfg = config_provider()
+
+            # 1. Pre-archive backup (best-effort, does not block archive)
+            if run_backup_first:
+                from src.maintenance.backup import run_backup as do_backup
+                try:
+                    do_backup(
+                        historical_only=True,
+                        main_only=False,
+                        backup_all=False,
+                        output_dir=getattr(cfg, 'historical_backup_dir', './data/backups'),
+                        retention_days=getattr(cfg, 'historical_backup_retention_days', 14),
+                        cleanup_old=True,
+                    )
+                except Exception as exc:
+                    logger.exception("[Backup] Pre-archive backup failed: %s", exc)
+
+            # 2. Validation preflight (if configured)
+            if getattr(cfg, 'archive_validate_before_cleanup', True):
+                logger.info("[Archive] Running validation preflight ...")
+                validate_rc = run_archive(
+                    days=cfg.archive_retention_days,
+                    dry_run=False,
+                    skip_vacuum=True,
+                    validate_only=True,
+                )
+                if validate_rc != 0:
+                    logger.error(
+                        "[Archive] Validation failed (rc=%d), skipping cleanup",
+                        validate_rc,
+                    )
+                    return
+
+            # 3. Actual archive
+            logger.info("[Archive] Running actual archive ...")
+            run_archive(
+                days=cfg.archive_retention_days,
+                dry_run=False,
+                skip_vacuum=cfg.archive_skip_vacuum,
+                validate_only=False,
+            )
+
+        background_tasks.append({
+            "task": _archive_maintenance_job,
+            "interval_seconds": archive_interval_hours * 3600,
+            "run_immediately": archive_run_on_start,
+            "name": "archive_maintenance",
+        })
+
+    # ---- Database diagnostics ----
+    if getattr(config, 'db_diagnostics_enabled', False):
+        diagnostics_interval_hours = max(
+            1, getattr(config, 'db_diagnostics_interval_hours', 24),
+        )
+
+        def _diagnostics_job():
+            import os as _os
+            import json as _json
+            from datetime import datetime
+            from src.maintenance.db_diagnostics import generate_diagnostics
+            cfg = config_provider()
+            try:
+                report = generate_diagnostics(
+                    retention_days=cfg.archive_retention_days,
+                )
+                diag_dir = _os.path.join(
+                    getattr(cfg, 'db_diagnostics_output_dir', './logs/db_diagnostics'),
+                )
+                _os.makedirs(diag_dir, exist_ok=True)
+                ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                out_path = _os.path.join(diag_dir, f"diagnostics_{ts}.json")
+                with open(out_path, 'w', encoding='utf-8') as f:
+                    _json.dump(report, f, ensure_ascii=False, indent=2, default=str)
+                logger.info(
+                    "[Diagnostics] Report written: %s (status=%s)",
+                    out_path, report.get('status', '?'),
+                )
+            except Exception as exc:
+                logger.exception("[Diagnostics] Failed: %s", exc)
+
+        background_tasks.append({
+            "task": _diagnostics_job,
+            "interval_seconds": diagnostics_interval_hours * 3600,
+            "run_immediately": False,
+            "name": "db_diagnostics",
+        })
+
+    return background_tasks
+
+
 def main() -> int:
     """
     主入口函数
@@ -1141,90 +1259,12 @@ def main() -> int:
                     "name": "agent_event_monitor",
                 })
 
-            # Phase 4: Register archive maintenance background task
-            if getattr(config, 'archive_enabled', False):
-                archive_interval_hours = max(1, getattr(config, 'archive_interval_hours', 24))
-                archive_run_on_start = getattr(config, 'archive_run_on_start', False)
-
-                def _run_archive_maintenance_job():
-                    from src.maintenance.archive import run_archive
-                    cfg = _reload_runtime_config()
-                    run_archive(
-                        days=cfg.archive_retention_days,
-                        dry_run=False,
-                        skip_vacuum=cfg.archive_skip_vacuum,
-                        technical_only=False,
-                        skip_technical_archive=False,
-                        validate_only=cfg.archive_validate_before_cleanup,
-                    )
-
-                background_tasks.append({
-                    "task": _run_archive_maintenance_job,
-                    "interval_seconds": archive_interval_hours * 3600,
-                    "run_immediately": archive_run_on_start,
-                    "name": "archive_maintenance",
-                })
-
-            # Phase 4: Register database diagnostics background task
-            if getattr(config, 'db_diagnostics_enabled', False):
-                diagnostics_interval_hours = max(1, getattr(config, 'db_diagnostics_interval_hours', 24))
-                diagnostics_output_dir = getattr(config, 'db_diagnostics_output_dir', './logs/db_diagnostics')
-
-                def _run_diagnostics_maintenance_job():
-                    import os as _os
-                    import json as _json
-                    from datetime import datetime
-                    from src.maintenance.db_diagnostics import generate_diagnostics
-
-                    cfg = _reload_runtime_config()
-                    try:
-                        report = generate_diagnostics(retention_days=cfg.archive_retention_days)
-                        diag_dir = _os.path.join(
-                            getattr(cfg, 'db_diagnostics_output_dir', './logs/db_diagnostics'),
-                        )
-                        _os.makedirs(diag_dir, exist_ok=True)
-                        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-                        out_path = _os.path.join(diag_dir, f"diagnostics_{ts}.json")
-                        with open(out_path, 'w', encoding='utf-8') as f:
-                            _json.dump(report, f, ensure_ascii=False, indent=2, default=str)
-                        logger.info("[Diagnostics] Report written: %s (status=%s)", out_path, report.get('status', '?'))
-                    except Exception as e:
-                        logger.exception("[Diagnostics] Failed: %s", e)
-
-                background_tasks.append({
-                    "task": _run_diagnostics_maintenance_job,
-                    "interval_seconds": diagnostics_interval_hours * 3600,
-                    "run_immediately": False,
-                    "name": "db_diagnostics",
-                })
-
-                # Backup before archive if configured
-                if getattr(config, 'historical_backup_enabled', False) and \
-                   getattr(config, 'historical_backup_run_before_archive', True) and \
-                   getattr(config, 'archive_enabled', False):
-                    backup_dir = getattr(config, 'historical_backup_dir', './data/backups')
-
-                    def _run_backup_maintenance_job():
-                        from src.maintenance.backup import run_backup as do_backup
-                        cfg = _reload_runtime_config()
-                        try:
-                            do_backup(
-                                historical_only=True,
-                                main_only=False,
-                                backup_all=False,
-                                output_dir=getattr(cfg, 'historical_backup_dir', './data/backups'),
-                                retention_days=getattr(cfg, 'historical_backup_retention_days', 14),
-                                cleanup_old=True,
-                            )
-                        except Exception as e:
-                            logger.exception("[Backup] Failed: %s", e)
-
-                    background_tasks.append({
-                        "task": _run_backup_maintenance_job,
-                        "interval_seconds": archive_interval_hours * 3600 - 3600,
-                        "run_immediately": archive_run_on_start,
-                        "name": "historical_backup",
-                    })
+            # Phase 4: Register maintenance background tasks
+            maintenance_tasks = build_maintenance_background_tasks(
+                config, _reload_runtime_config,
+            )
+            for entry in maintenance_tasks:
+                background_tasks.append(entry)
 
             for entry in background_tasks:
                 scheduler.add_background_task(

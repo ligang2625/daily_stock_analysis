@@ -21,11 +21,12 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import sys
 from datetime import date, datetime, timedelta
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from sqlalchemy import text as sa_text, func, select as sa_select
 
@@ -205,6 +206,18 @@ def _run_phase2_technical_archive(
     )
 
 
+def _resolve_archive_mode(
+    dry_run: bool, validate_only: bool, technical_only: bool,
+) -> str:
+    if dry_run:
+        return "dry_run"
+    if validate_only:
+        return "validate_only"
+    if technical_only:
+        return "technical_only"
+    return "archive"
+
+
 def run_archive(
     *,
     days: int = 5,
@@ -214,6 +227,7 @@ def run_archive(
     technical_only: bool = False,
     skip_technical_archive: bool = False,
     validate_only: bool = False,
+    _result_out: Optional[List[Dict[str, Any]]] = None,
 ) -> int:
     """
     Execute archive maintenance.
@@ -239,6 +253,9 @@ def run_archive(
 
     cutoff_str = cutoff_date.isoformat()
     days_val = (date.today() - cutoff_date).days
+    mode = _resolve_archive_mode(dry_run, validate_only, technical_only)
+    result_warnings: List[str] = []
+    result_errors: List[str] = []
 
     logger.info(
         "Archive maintenance starting: cutoff=%s days_back=%s dry_run=%s "
@@ -260,6 +277,7 @@ def run_archive(
     )
 
     counts: Dict[str, int] = {}
+    phase2_stats: Dict[str, Any] = {}
     total_deleted = 0
     total_read = 0
     total_written = 0
@@ -296,14 +314,29 @@ def run_archive(
                 )
             except Exception as exc:
                 logger.error("Phase 2 technical archive failed: %s", exc)
+                error_msg = f"Phase2 extraction failed: {str(exc)[:1900]}"
                 historical_db.finish_archive_run(
                     run_id=run_id,
                     success=False,
                     rows_read=total_read,
                     rows_written=total_written,
                     rows_deleted=0,
-                    error_message=f"Phase2 extraction failed: {str(exc)[:1900]}",
+                    error_message=error_msg,
                 )
+                result_errors.append(error_msg)
+                if _result_out is not None:
+                    _result_out.append({
+                        "status": "failed",
+                        "mode": mode,
+                        "cutoff_date": cutoff_str,
+                        "archive_run_id": run_id,
+                        "rows_read": total_read,
+                        "rows_written": total_written,
+                        "rows_deleted": 0,
+                        "phase2_stats": {},
+                        "warnings": result_warnings,
+                        "errors": result_errors,
+                    })
                 return 1
 
         # --- validate-only: stop after technical extraction ---
@@ -316,6 +349,22 @@ def run_archive(
                 rows_written=total_written,
                 rows_deleted=0,
             )
+            if _result_out is not None:
+                _result_out.append({
+                    "status": "success",
+                    "mode": mode,
+                    "cutoff_date": cutoff_str,
+                    "archive_run_id": run_id,
+                    "rows_read": total_read,
+                    "rows_written": total_written,
+                    "rows_deleted": 0,
+                    "phase2_stats": {
+                        k: {"read": v.get("read", 0), "written": v.get("written", 0)}
+                        for k, v in phase2_stats.items() if isinstance(v, dict)
+                    },
+                    "warnings": result_warnings,
+                    "errors": result_errors,
+                })
             return 0
 
         # --- technical-only: stop after technical extraction, no main DB cleanup ---
@@ -328,6 +377,22 @@ def run_archive(
                 rows_written=total_written,
                 rows_deleted=0,
             )
+            if _result_out is not None:
+                _result_out.append({
+                    "status": "success",
+                    "mode": mode,
+                    "cutoff_date": cutoff_str,
+                    "archive_run_id": run_id,
+                    "rows_read": total_read,
+                    "rows_written": total_written,
+                    "rows_deleted": 0,
+                    "phase2_stats": {
+                        k: {"read": v.get("read", 0), "written": v.get("written", 0)}
+                        for k, v in phase2_stats.items() if isinstance(v, dict)
+                    },
+                    "warnings": result_warnings,
+                    "errors": result_errors,
+                })
             return 0
 
         # ------------------------------------------------------------------
@@ -360,6 +425,26 @@ def run_archive(
                 rows_written=total_written,
                 rows_deleted=0,
             )
+            if _result_out is not None:
+                _result_out.append({
+                    "status": "success",
+                    "mode": mode,
+                    "cutoff_date": cutoff_str,
+                    "archive_run_id": run_id,
+                    "rows_read": total_read,
+                    "rows_written": total_written,
+                    "rows_deleted": 0,
+                    "phase2_stats": {
+                        k: {"read": v.get("read", 0), "written": v.get("written", 0)}
+                        for k, v in phase2_stats.items() if isinstance(v, dict)
+                    },
+                    "cleanup_counts": {
+                        k: v for k, v in counts.items()
+                        if not isinstance(v, dict)
+                    },
+                    "warnings": result_warnings,
+                    "errors": result_errors,
+                })
             return 0
 
         # --- Actual cleanup (non-dry-run) ---
@@ -452,19 +537,84 @@ def run_archive(
             rows_written=total_written,
             rows_deleted=total_deleted,
         )
+        if _result_out is not None:
+            _result_out.append({
+                "status": "success",
+                "mode": mode,
+                "cutoff_date": cutoff_str,
+                "archive_run_id": run_id,
+                "rows_read": total_read,
+                "rows_written": total_written,
+                "rows_deleted": total_deleted,
+                "phase2_stats": {
+                    k: {"read": v.get("read", 0), "written": v.get("written", 0)}
+                    for k, v in phase2_stats.items() if isinstance(v, dict)
+                },
+                "cleanup_counts": {
+                    k: v for k, v in counts.items()
+                    if not isinstance(v, dict)
+                },
+                "warnings": result_warnings,
+                "errors": result_errors,
+            })
         return 0
 
     except Exception as exc:
         logger.error("Archive failed: %s", exc)
+        error_msg = str(exc)[:2000]
+        result_errors.append(error_msg)
         historical_db.finish_archive_run(
             run_id=run_id,
             success=False,
             rows_read=total_read,
             rows_written=total_written,
             rows_deleted=0,
-            error_message=str(exc)[:2000],
+            error_message=error_msg,
         )
+        if _result_out is not None:
+            _result_out.append({
+                "status": "failed",
+                "mode": mode,
+                "cutoff_date": cutoff_str,
+                "archive_run_id": run_id,
+                "rows_read": total_read,
+                "rows_written": total_written,
+                "rows_deleted": 0,
+                "phase2_stats": {
+                    k: {"read": v.get("read", 0), "written": v.get("written", 0)}
+                    for k, v in phase2_stats.items() if isinstance(v, dict)
+                },
+                "warnings": result_warnings,
+                "errors": result_errors,
+            })
         return 1
+
+
+def run_archive_structured(**kwargs: Any) -> Tuple[int, Dict[str, Any]]:
+    """Execute archive and return (exit_code, structured_result_dict).
+
+    Accepts the same keyword arguments as run_archive().
+    Returns a tuple of (exit_code, result_dict) suitable for JSON output.
+    """
+    result_container: List[Dict[str, Any]] = []
+    rc = run_archive(**kwargs, _result_out=result_container)
+    result = result_container[0] if result_container else {
+        "status": "failed",
+        "mode": _resolve_archive_mode(
+            kwargs.get("dry_run", False),
+            kwargs.get("validate_only", False),
+            kwargs.get("technical_only", False),
+        ),
+        "cutoff_date": None,
+        "archive_run_id": None,
+        "rows_read": 0,
+        "rows_written": 0,
+        "rows_deleted": 0,
+        "phase2_stats": {},
+        "warnings": ["_result_out was not populated"],
+        "errors": [],
+    }
+    return rc, result
 
 
 def main(argv: Optional[List[str]] = None) -> int:
@@ -490,15 +640,23 @@ def main(argv: Optional[List[str]] = None) -> int:
     )
     parser.add_argument(
         '--technical-only', action='store_true',
-        help='Only extract Phase 2 technical history; skip main DB cleanup',
+        help='Only extract Phase 2/3 technical history; skip main DB cleanup',
     )
     parser.add_argument(
         '--skip-technical-archive', action='store_true',
-        help='Skip Phase 2 technical extraction entirely',
+        help='Skip Phase 2/3 technical extraction entirely',
     )
     parser.add_argument(
         '--validate-only', action='store_true',
-        help='Run Phase 2 extraction in dry-run mode and stop (no writes, no cleanup)',
+        help='Run Phase 2/3 extraction in dry-run mode and stop (no writes, no cleanup)',
+    )
+    parser.add_argument(
+        '--format', type=str, default='text', choices=('text', 'json'),
+        help='Output format (default: text)',
+    )
+    parser.add_argument(
+        '--output', type=str, default=None,
+        help='Write output to file path (prints to stdout if omitted)',
     )
 
     args = parser.parse_args(argv)
@@ -515,6 +673,25 @@ def main(argv: Optional[List[str]] = None) -> int:
         except ValueError:
             logger.error("Invalid cutoff date: %s (expected YYYY-MM-DD)", args.cutoff_date)
             return 1
+
+    if args.format == 'json':
+        rc, result = run_archive_structured(
+            days=args.days,
+            dry_run=args.dry_run,
+            cutoff_date=cutoff_date,
+            skip_vacuum=args.skip_vacuum,
+            technical_only=args.technical_only,
+            skip_technical_archive=args.skip_technical_archive,
+            validate_only=args.validate_only,
+        )
+        json_str = json.dumps(result, ensure_ascii=False, indent=2, default=str)
+        if args.output:
+            Path(args.output).parent.mkdir(parents=True, exist_ok=True)
+            Path(args.output).write_text(json_str, encoding='utf-8')
+            logger.info("Archive result written to %s", args.output)
+        else:
+            print(json_str)
+        return rc
 
     return run_archive(
         days=args.days,

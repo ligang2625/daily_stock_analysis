@@ -27,7 +27,9 @@ class TestHistoricalBackup:
 
         from src.storage import DatabaseManager
         from src.storage_historical import HistoricalDatabaseManager
+        from src.config import Config
 
+        Config.reset_instance()
         DatabaseManager.reset_instance()
 
         # Create the databases
@@ -41,6 +43,7 @@ class TestHistoricalBackup:
             'tmp_path': tmp_path,
         }
 
+        Config.reset_instance()
         DatabaseManager.reset_instance()
 
     def test_historical_only_backup(self, backup_env):
@@ -141,25 +144,40 @@ class TestHistoricalBackup:
         ]
         assert len(files) >= 1
 
-    def test_backup_missing_source(self, backup_env):
-        """Backup of non-existent historical DB warns but exits cleanly."""
+    def test_backup_missing_source_no_flag_fails(self, backup_env, monkeypatch):
+        """Backup of non-existent DB returns 1 when --allow-missing is not set."""
         from src.maintenance.backup import run_backup
-        import src.config
+        from src.config import Config
 
-        # Point to non-existent path
-        import src.config as config_module
-        original = config_module.get_config().historical_database_path
-        try:
-            exit_code = run_backup(
-                historical_only=True,
-                output_dir=backup_env['backup_dir'],
-                use_sqlite_api=True,
-                # use the real path which exists but test that non-existent is handled
-            )
-            # Should still be 0 because we backed up the actual file
-            assert exit_code == 0
-        finally:
-            pass
+        # Point historical DB path to a directory that definitely doesn't exist
+        nonexistent = str(backup_env['tmp_path'] / "nonexistent" / "hist.db")
+        monkeypatch.setenv('HISTORICAL_DATABASE_PATH', nonexistent)
+        Config.reset_instance()
+
+        exit_code = run_backup(
+            historical_only=True,
+            output_dir=backup_env['backup_dir'],
+            use_sqlite_api=True,
+            allow_missing=False,
+        )
+        assert exit_code == 1
+
+    def test_backup_missing_source_with_flag_ok(self, backup_env, monkeypatch):
+        """Backup of non-existent DB returns 0 when --allow-missing is set."""
+        from src.maintenance.backup import run_backup
+        from src.config import Config
+
+        nonexistent = str(backup_env['tmp_path'] / "nonexistent" / "hist.db")
+        monkeypatch.setenv('HISTORICAL_DATABASE_PATH', nonexistent)
+        Config.reset_instance()
+
+        exit_code = run_backup(
+            historical_only=True,
+            output_dir=backup_env['backup_dir'],
+            use_sqlite_api=True,
+            allow_missing=True,
+        )
+        assert exit_code == 0
 
     def test_cli_all_default(self, backup_env, capsys, monkeypatch):
         """CLI defaults to --all when no target specified."""

@@ -493,3 +493,32 @@ CREATE TABLE intraday_market_snapshots (
 ### 测试
 
 **33 Phase 4 + 32 Phase 3 = 65 passed, 0 regressions**
+
+## Session 13: Phase 4 Refinement — scheduled archive preflight, backup ordering, structured output, diagnostics fix (2026-06-22)
+
+### 修复项
+
+| # | Severity | Fix | Key Change |
+|---|----------|-----|------------|
+| 1 | Critical | 定时归档默认只跑 validate，不清理数据 | `run_archive_maintenance_job()` 先跑 validate preflight，成功后再跑真正 archive；validation failure 阻断 cleanup |
+| 2 | Major | backup-before-archive 可能并发 | backup 移入 archive job 内顺序执行，不再独立 bg task；无并发 race |
+| 3 | Major | scheduler 注册逻辑内联不可测试 | `build_maintenance_background_tasks()` 可测试 helper + `main()` 薄调用；17 新测试覆盖真实注册路径 |
+| 4 | Major | diagnostics 候选行时间字段不准确 | `MAIN_TABLES_TO_PROBE` 改用 `(表, 时间列)` 元组：`news_intel.fetched_at`、`llm_usage.called_at`、`alert_triggers.triggered_at` 等与 archive.py 对齐 |
+| 5 | Major | archive CLI 缺少结构化 JSON 输出 | `--format text|json` + `--output`；`run_archive_structured()` 返回 status/mode/cutoff/counts/phase2_stats/cleanup_counts/warnings/errors |
+| 6 | Major | backup 缺失源 DB 行为模糊 | `--allow-missing` 标记；默认缺失返回 1，`--allow-missing` 返回 0 + warning |
+| 7 | Minor | diagnostics large-payload 警告表达式错误 | `(p.get("payload_size") or 0) > 500_000` 修复优先级 |
+
+### 修改文件
+
+| 文件 | 改动 |
+|------|------|
+| `main.py` | `build_maintenance_background_tasks()` + `run_archive_maintenance_job()` + sequential backup ordering |
+| `src/maintenance/archive.py` | `--format text|json` + `--output` + `run_archive_structured()` wrapper |
+| `src/maintenance/backup.py` | `--allow-missing` CLI flag + `allow_missing` parameter |
+| `src/maintenance/db_diagnostics.py` | `MAIN_TABLES_TO_PROBE` 改用 (table, col) 元组 + 修复 payload warning 优先级 |
+| `tests/test_historical_backup.py` | 缺失源测试指向真实不存在的路径 |
+| `tests/test_maintenance_scheduler.py` | 17 新测试：task 构造/validation preflight/backup ordering/边界值 |
+
+### 测试
+
+**54 Phase 4 (21 new + 33 existing) + 32 Phase 3 = 86 passed, 0 regressions**

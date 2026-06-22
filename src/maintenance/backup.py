@@ -166,6 +166,7 @@ def run_backup(
     cleanup_old: bool = False,
     use_sqlite_api: bool = True,
     compress: bool = False,
+    allow_missing: bool = False,
 ) -> int:
     """Execute backup operations.
 
@@ -193,7 +194,13 @@ def run_backup(
             compress=compress,
         )
         if result is None:
-            errors += 1
+            if allow_missing:
+                logger.warning(
+                    "Historical database not found at %s, skipping backup (--allow-missing)",
+                    config.historical_database_path,
+                )
+            else:
+                errors += 1
 
     if main_only or backup_all:
         result = _backup_one(
@@ -204,7 +211,13 @@ def run_backup(
             compress=compress,
         )
         if result is None:
-            errors += 1
+            if allow_missing:
+                logger.warning(
+                    "Main database not found at %s, skipping backup (--allow-missing)",
+                    config.database_path,
+                )
+            else:
+                errors += 1
 
     if cleanup_old:
         removed = _cleanup_old_backups(output_dir, retention_days)
@@ -255,6 +268,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         '--compress', action='store_true',
         help='Compress backup with gzip',
     )
+    parser.add_argument(
+        '--allow-missing', action='store_true',
+        help='Return success when source database does not exist (CI-friendly)',
+    )
 
     # Default to --all if no target specified
     argv_list = argv if argv is not None else sys.argv[1:]
@@ -280,6 +297,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         cleanup_old=args.cleanup_old,
         use_sqlite_api=use_api,
         compress=args.compress,
+        allow_missing=args.allow_missing,
     )
 
 
