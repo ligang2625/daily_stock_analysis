@@ -1850,6 +1850,27 @@ class IntradayMonitor:
                     integrity.sentinel_ok, integrity.reason,
                 )
 
+                # Auto-append sentinel when all codes covered but sentinel missing/invalid
+                if (
+                    not integrity.ok
+                    and not integrity.missing_codes
+                    and integrity.covered_codes == integrity.expected_codes
+                    and not integrity.truncated_suspected
+                ):
+                    logger.info(
+                        "All %d expected codes covered but sentinel missing/invalid. "
+                        "Auto-appending decision-complete sentinel.",
+                        len(integrity.expected_codes),
+                    )
+                    content = self._append_decision_complete_sentinel(content, integrity)
+                    integrity = self._validate_official_decision_completeness(
+                        content, expected_decision_codes,
+                    )
+                    logger.info(
+                        "After sentinel auto-append: integrity ok=%s sentinel_ok=%s",
+                        integrity.ok, integrity.sentinel_ok,
+                    )
+
                 # Attempt completion if integrity fails
                 if not integrity.ok and integrity.missing_codes:
                     logger.warning(
@@ -2641,6 +2662,26 @@ class IntradayMonitor:
             truncated_suspected=truncated_suspected,
             reason="; ".join(reason_parts) if reason_parts else "passed",
         )
+
+    def _append_decision_complete_sentinel(
+        self,
+        content: str,
+        integrity: DecisionContentIntegrity,
+    ) -> str:
+        """Append a valid sentinel line when all expected codes are covered
+        but the sentinel is missing or invalid.
+
+        This handles the case where the LLM covered every stock but failed to
+        emit the INTRADAY_DECISION_COMPLETE sentinel comment (or emitted one
+        with incorrect counts).  Rather than blocking the decision in strict
+        mode, we programmatically append the correct sentinel.
+        """
+        sentinel = (
+            f"<!-- INTRADAY_DECISION_COMPLETE "
+            f"expected={len(integrity.expected_codes)} "
+            f"covered={len(integrity.covered_codes)} -->"
+        )
+        return content.rstrip() + "\n\n" + sentinel + "\n"
 
     def _complete_missing_decision_sections(
         self,

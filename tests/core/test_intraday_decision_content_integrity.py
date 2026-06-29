@@ -209,6 +209,89 @@ class TestValidateDecisionCompleteness:
         assert integrity.reason == "passed"
 
 
+class TestAppendDecisionCompleteSentinel:
+    """Tests for _append_decision_complete_sentinel()."""
+
+    @staticmethod
+    def _validate(content, expected_codes):
+        """Helper: call _validate_official_decision_completeness with a dummy self."""
+        monitor = MagicMock()
+        return IntradayMonitor._validate_official_decision_completeness(
+            monitor, content, expected_codes,
+        )
+
+    def test_append_sentinel_when_no_missing_codes(self):
+        """All codes covered, no sentinel -> append sentinel -> re-validate passes."""
+        content = (
+            "## 决策分析过程\n"
+            "- **贵州茅台(600519)**：建议买入。\n"
+            "- **五粮液(000858)**：建议观望。\n"
+        )
+        expected = {"600519", "000858"}
+
+        # First validation: codes covered but no sentinel -> not ok
+        integrity = self._validate(content, expected)
+        assert len(integrity.missing_codes) == 0
+        assert integrity.sentinel_ok is False
+        assert integrity.ok is False
+
+        # Append sentinel
+        monitor = MagicMock()
+        content_with_sentinel = IntradayMonitor._append_decision_complete_sentinel(
+            monitor, content, integrity,
+        )
+
+        # Verify sentinel is in the content
+        assert "INTRADAY_DECISION_COMPLETE" in content_with_sentinel
+        assert "expected=2" in content_with_sentinel
+        assert "covered=2" in content_with_sentinel
+
+        # Re-validate after appending sentinel
+        integrity2 = self._validate(content_with_sentinel, expected)
+        assert integrity2.ok is True
+        assert integrity2.sentinel_ok is True
+        assert len(integrity2.missing_codes) == 0
+        assert integrity2.reason == "passed"
+
+    def test_no_sentinel_but_all_codes_covered_does_not_block(self):
+        """Simulate full cycle: validate, auto-append sentinel, re-validate, decision proceeds."""
+        content = (
+            "## 决策分析过程\n"
+            "- **600519**：建议买入。\n"
+            "- **000858**：建议买入。\n"
+            "- **002594**：建议买入。\n"
+            "- **300750**：建议买入。\n"
+            "- **601318**：建议买入。\n"
+        )
+        expected = {"600519", "000858", "002594", "300750", "601318"}
+
+        # Simulate the decision flow logic
+        integrity = self._validate(content, expected)
+        # Precondition: all codes covered, no sentinel -> not ok
+        assert len(integrity.missing_codes) == 0
+        assert not integrity.ok
+        assert not integrity.sentinel_ok
+
+        # Sentinel auto-append branch (same conditions as in intraday_monitor.py)
+        if (
+            not integrity.ok
+            and not integrity.missing_codes
+            and integrity.covered_codes == integrity.expected_codes
+            and not integrity.truncated_suspected
+        ):
+            monitor = MagicMock()
+            content = IntradayMonitor._append_decision_complete_sentinel(
+                monitor, content, integrity,
+            )
+            integrity = self._validate(content, expected)
+
+        # After sentinel auto-append, decision should proceed
+        assert integrity.ok is True
+        assert integrity.sentinel_ok is True
+        assert len(integrity.missing_codes) == 0
+        assert integrity.reason == "passed"
+
+
 class TestBuildDecisionBodySummary:
     """Tests for _build_decision_body_summary()."""
 

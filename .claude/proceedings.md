@@ -198,6 +198,12 @@ concurrency: 盘中 `intraday-monitor`，盘后 `stock-analysis`，互不阻塞�
 - 配置扩展: `INTRADAY_DECISION_STRICT_COMPLETENESS`; workflow 9 项变量透传
 - 5 项新测试: sentinel 值不匹配、无 sentinel not ok、分组统计、无 mid-Markdown 截断
 
+### Phase 6: 决策完整性最后一公里 (Session 23, 2026-06-29)
+- `_append_decision_complete_sentinel()`: 所有代码覆盖但 sentinel 缺失时程序追加 sentinel
+- Workflow 默认值变更: `STRICT_COMPLETENESS` → `true`, `EMAIL_BODY_MODE` → `summary_with_attachment`
+- `.env.example` 更新: 推荐生产 `STRICT_COMPLETENESS=true`, 新增 `EMAIL_BODY_MODE`/`EMAIL_ATTACH_FULL_REPORT` 示例
+- 2 项新测试: sentinel 自动追加、完整循环验证
+
 ---
 
 ## 六、Known Issues (2 pre-existing)
