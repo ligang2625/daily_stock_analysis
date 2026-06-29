@@ -970,6 +970,8 @@ class Config:
     intraday_decision_expected_scope: str = "events"
     # 盘中决策完整性校验: 是否启用股票覆盖率检查
     intraday_decision_completeness_enabled: bool = True
+    # 盘中决策完整性严格模式: even 缺失也会阻断 official decision 发送（默认 false，先观察）
+    intraday_decision_strict_completeness: bool = False
     # 是否在盘中快照中同步抓取大盘指数行情
     intraday_market_snapshot_enabled: bool = True
     # A股大盘指数代码（逗号分隔），默认：上证指数、深证成指、创业板指
@@ -1871,6 +1873,7 @@ class Config:
             intraday_llm_fallback_retry_on=os.getenv('INTRADAY_LLM_FALLBACK_RETRY_ON', 'config_error,rate_limited,network_error,empty_response'),
             intraday_decision_expected_scope=os.getenv('INTRADAY_DECISION_EXPECTED_SCOPE', 'events').strip(),
             intraday_decision_completeness_enabled=os.getenv('INTRADAY_DECISION_COMPLETENESS_ENABLED', 'true').lower() == 'true',
+            intraday_decision_strict_completeness=os.getenv('INTRADAY_DECISION_STRICT_COMPLETENESS', 'false').lower() == 'true',
             intraday_decision_completion_retry=parse_env_int(os.getenv('INTRADAY_DECISION_COMPLETION_RETRY'), 1, field_name='INTRADAY_DECISION_COMPLETION_RETRY', minimum=0, maximum=5),
             intraday_decision_completion_use_fallback=os.getenv('INTRADAY_DECISION_COMPLETION_USE_FALLBACK', 'true').lower() == 'true',
             intraday_decision_append_raw_for_missing=os.getenv('INTRADAY_DECISION_APPEND_RAW_FOR_MISSING', 'true').lower() == 'true',

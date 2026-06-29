@@ -148,6 +148,7 @@ class EmailReportType(Enum):
     LLM_FAILURE_ALERT = "llm_failure_alert"
     NO_BASELINE_ALERT = "no_baseline_alert"
     SNAPSHOT_INCOMPLETE_ALERT = "snapshot_incomplete_alert"
+    CONTENT_INCOMPLETE_ALERT = "content_incomplete_alert"
 
 
 @dataclass
@@ -1814,75 +1815,111 @@ class IntradayMonitor:
         result = self._call_llm_with_fallback(prompt)
 
         if result.status == "success":
-            # Check for truncation: if response truncated, degrade to alert
-            if result.truncated_suspected:
-                logger.warning(
-                    "LLM response truncated (finish_reason=%s chars=%d). Degrading to LLM_FAILURE_ALERT.",
-                    result.finish_reason, result.response_chars,
+            raw_content = result.content or ""
+            content = self._normalize_official_decision_content(raw_content)
+            # Prepend fallback indicator if applicable
+            if result.provider == "fallback":
+                fallback_lines = [
+                    f"> LLM来源: fallback",
+                    f"> 主LLM状态: {result.primary_error_message or 'unknown'}",
+                    f"> 备用模型: {result.model or 'unknown'}",
+                    "",
+                ]
+                content = "\n".join(fallback_lines) + content
+
+            # Build expected decision codes and validate completeness
+            completeness_enabled = getattr(self._config, 'intraday_decision_completeness_enabled', True)
+            integrity: Optional[DecisionContentIntegrity] = None
+            if completeness_enabled:
+                expected_scope = getattr(self._config, 'intraday_decision_expected_scope', 'events')
+                if expected_scope == 'valid_quotes':
+                    expected_decision_codes = set(snapshot.get("valid_quote_codes", []))
+                else:
+                    # Default: events
+                    expected_decision_codes = set(
+                        e.stock_code for e in all_events
+                    )
+                integrity = self._validate_official_decision_completeness(
+                    content, expected_decision_codes,
                 )
-                trunc_content = (
-                    f"## LLM 响应截断告警\n\n"
-                    f"主LLM和备用LLM的输出均被截断，无法生成完整的盘中决策。\n\n"
-                    f"- 主LLM finish_reason: {result.finish_reason or 'unknown'}\n"
-                    f"- 响应字符数: {result.response_chars}\n"
-                    f"- 建议: 增大 INTRADAY_LLM_MAX_TOKENS（当前 {self._config.intraday_llm_max_tokens}），或减少监控股票数量\n"
+                # Log integrity result
+                logger.info(
+                    "Decision content integrity: ok=%s expected=%d covered=%d missing=%d sentinel_ok=%s reason=%s",
+                    integrity.ok, len(integrity.expected_codes),
+                    len(integrity.covered_codes), len(integrity.missing_codes),
+                    integrity.sentinel_ok, integrity.reason,
+                )
+
+                # Attempt completion if integrity fails
+                if not integrity.ok and integrity.missing_codes:
+                    logger.warning(
+                        "Decision integrity failed. Attempting completion for %d missing codes.",
+                        len(integrity.missing_codes),
+                    )
+                    completed = self._complete_missing_decision_sections(
+                        {}, content, integrity.missing_codes,
+                    )
+                    if completed:
+                        content = self._normalize_official_decision_content(completed)
+                        # Re-validate after completion
+                        integrity = self._validate_official_decision_completeness(
+                            content, expected_decision_codes,
+                        )
+                        logger.info(
+                            "After completion: integrity ok=%s missing=%d reason=%s",
+                            integrity.ok, len(integrity.missing_codes), integrity.reason,
+                        )
+                    else:
+                        logger.warning("Decision completion failed; content remains incomplete.")
+
+                # Add coverage display to email header
+                coverage_lines = [
+                    f"> 决策覆盖: {len(integrity.covered_codes)}/{len(integrity.expected_codes)}",
+                    f"> 内容完整性: {'passed' if integrity.ok else integrity.reason}",
+                ]
+                if result.finish_reason:
+                    coverage_lines.append(
+                        f"> LLM finish_reason: {result.finish_reason} (chars={result.response_chars})"
+                    )
+                scope_label = {'events': '事件股票', 'valid_quotes': '有效行情股票'}.get(expected_scope, expected_scope)
+                coverage_lines.append(f"> 完整性范围: {scope_label}")
+                coverage_lines.append("")
+                content = "\n".join(coverage_lines) + "\n" + content
+
+            # Save decision artifacts for GitHub Actions tracing
+            self._save_decision_artifacts(
+                raw_content=raw_content,
+                normalized_content=content,
+                integrity=integrity,
+                llm_result=result,
+                snapshot_id=snapshot_id,
+            )
+
+            # Determine email report type based on final integrity
+            strict_mode = getattr(self._config, 'intraday_decision_strict_completeness', False)
+            if integrity and not integrity.ok and strict_mode:
+                # Strict mode: block OFFICIAL_DECISION, send incomplete alert instead
+                report_type = EmailReportType.CONTENT_INCOMPLETE_ALERT
+                llm_email_status = "truncated" if result.truncated_suspected else "incomplete"
+                logger.warning(
+                    "Strict completeness mode: blocking OFFICIAL_DECISION due to integrity failure. "
+                    "Sending CONTENT_INCOMPLETE_ALERT instead."
                 )
                 self._send_decision_email(
-                    content=trunc_content,
-                    report_type=EmailReportType.LLM_FAILURE_ALERT,
+                    content=content,
+                    report_type=report_type,
                     snapshot_id=snapshot_id,
                     coverage_ratio=coverage_ratio,
                     valid_count=valid_count,
                     expected_count=expected_count,
-                    llm_status="truncated",
+                    failed_codes=failed_codes,
+                    llm_status=llm_email_status,
                     baseline_status=baseline_status,
                     market_dates=snapshot_market_dates,
+                    market_index_coverage=mkt_coverage_info,
                 )
             else:
-                content = self._normalize_official_decision_content(result.content or "")
-                # Prepend fallback indicator if applicable
-                if result.provider == "fallback":
-                    fallback_lines = [
-                        f"> LLM来源: fallback",
-                        f"> 主LLM状态: {result.primary_error_message or 'unknown'}",
-                        f"> 备用模型: {result.model or 'unknown'}",
-                        "",
-                    ]
-                    content = "\n".join(fallback_lines) + content
-
-                # Build expected decision codes and validate completeness
-                completeness_enabled = getattr(self._config, 'intraday_decision_completeness_enabled', True)
-                if completeness_enabled:
-                    expected_scope = getattr(self._config, 'intraday_decision_expected_scope', 'events')
-                    if expected_scope == 'valid_quotes':
-                        expected_decision_codes = set(snapshot.get("valid_quote_codes", []))
-                    else:
-                        # Default: events
-                        expected_decision_codes = set(
-                            e.stock_code for e in all_events
-                        )
-                    integrity = self._validate_official_decision_completeness(
-                        content, expected_decision_codes,
-                    )
-                    # Log integrity result
-                    logger.info(
-                        "Decision content integrity: ok=%s expected=%d covered=%d missing=%d sentinel_ok=%s reason=%s",
-                        integrity.ok, len(integrity.expected_codes),
-                        len(integrity.covered_codes), len(integrity.missing_codes),
-                        integrity.sentinel_ok, integrity.reason,
-                    )
-                    # Add coverage display to email header
-                    coverage_lines = [
-                        f"> 决策覆盖: {len(integrity.covered_codes)}/{len(integrity.expected_codes)}",
-                        f"> 内容完整性: {'passed' if integrity.ok else integrity.reason}",
-                    ]
-                    if result.finish_reason:
-                        coverage_lines.append(
-                            f"> LLM finish_reason: {result.finish_reason} (chars={result.response_chars})"
-                        )
-                    coverage_lines.append("")
-                    content = "\n".join(coverage_lines) + "\n" + content
-
+                # Normal path or non-strict: send OFFICIAL_DECISION with integrity info in header
                 self._send_decision_email(
                     content=content,
                     report_type=EmailReportType.OFFICIAL_DECISION,
@@ -2260,6 +2297,23 @@ class IntradayMonitor:
                 timeout=fallback_timeout,
             )
             text = response.choices[0].message.content if response.choices else None
+            # Extract finish_reason and usage for truncation detection
+            finish_reason = None
+            completion_tokens = 0
+            usage = None
+            try:
+                finish_reason = getattr(response.choices[0], 'finish_reason', None)
+                if hasattr(response, 'usage') and response.usage:
+                    usage = response.usage
+                    completion_tokens = getattr(usage, 'completion_tokens', 0)
+                elif hasattr(response, 'model_extra') and response.model_extra:
+                    extra = response.model_extra
+                    usage = extra.get('usage')
+                    if usage:
+                        completion_tokens = usage.get('completion_tokens', 0) if isinstance(usage, dict) else getattr(usage, 'completion_tokens', 0)
+            except Exception:
+                pass
+
             if not text or not text.strip():
                 logger.warning("Fallback LLM returned empty response")
                 return LLMResult(
@@ -2269,13 +2323,26 @@ class IntradayMonitor:
                     base_url_host=base_url_host,
                     provider="fallback",
                 )
-            logger.info("Fallback LLM call succeeded: model=%s", fallback_model)
+
+            # Detect truncation
+            truncated = finish_reason in ("length", "max_tokens")
+            if truncated:
+                logger.warning(
+                    "Fallback LLM response truncated: finish_reason=%s chars=%d tokens=%d",
+                    finish_reason, len(str(text)), completion_tokens,
+                )
+
+            logger.info("Fallback LLM call succeeded: model=%s finish_reason=%s", fallback_model, finish_reason)
             return LLMResult(
                 status="success",
                 content=str(text),
                 model=fallback_model,
                 base_url_host=base_url_host,
                 provider="fallback",
+                finish_reason=str(finish_reason) if finish_reason else None,
+                response_chars=len(str(text)),
+                completion_tokens=completion_tokens,
+                truncated_suspected=truncated,
             )
         except Exception as exc:
             error_str = str(exc)
@@ -2500,8 +2567,10 @@ class IntradayMonitor:
 
         Checks:
         1. Sentinel line: <!-- INTRADAY_DECISION_COMPLETE expected={N} covered={N} -->
-        2. Stock code coverage in content
-        3. Truncation suspicion based on sentinel absence
+        2. Stock code coverage in content (extracted codes vs expected_codes)
+        3. Sentinel cross-validation: sentinel's expected/covered must match
+           programmatic counts
+        4. Truncation suspicion based on sentinel absence or mismatch
 
         Returns a DecisionContentIntegrity dataclass.
         """
@@ -2511,6 +2580,17 @@ class IntradayMonitor:
         )
         sentinel_match = sentinel_pattern.search(content)
         sentinel_ok = sentinel_match is not None
+        sentinel_expected = None
+        sentinel_covered = None
+        sentinel_values_match = False
+
+        if sentinel_match:
+            try:
+                sentinel_expected = int(sentinel_match.group(1))
+                sentinel_covered = int(sentinel_match.group(2))
+            except (ValueError, IndexError):
+                sentinel_expected = None
+                sentinel_covered = None
 
         # Extract covered codes from content
         covered_codes = IntradayMonitor._extract_stock_codes_from_decision_content(content)
@@ -2520,17 +2600,33 @@ class IntradayMonitor:
         covered_normalized = {c.upper().strip() for c in covered_codes}
         missing_codes = expected_normalized - covered_normalized
 
-        # Truncation suspicion: no sentinel and significant coverage gap
+        # Cross-validate sentinel values against programmatic counts
+        if sentinel_match and sentinel_expected is not None:
+            sentinel_values_match = (
+                sentinel_expected == len(expected_normalized)
+                and sentinel_covered == len(covered_normalized)
+            )
+
+        # Sentinel is only valid if values match programmatic counts
+        effective_sentinel_ok = sentinel_ok and sentinel_values_match
+
+        # Truncation suspicion: either no sentinel, sentinel values mismatch,
+        # or significant coverage gap
         truncated_suspected = (
-            not sentinel_ok
+            not effective_sentinel_ok
             and len(missing_codes) > max(len(expected_normalized) * 0.2, 1)
         )
 
-        ok = len(missing_codes) == 0 and sentinel_ok
+        ok = len(missing_codes) == 0 and effective_sentinel_ok
 
         reason_parts: list = []
         if not sentinel_ok:
             reason_parts.append("缺少完整性标记")
+        elif not sentinel_values_match:
+            reason_parts.append(
+                f"sentinel值不匹配: expected={sentinel_expected} covered={sentinel_covered} "
+                f"(实际 expected={len(expected_normalized)} covered={len(covered_normalized)})"
+            )
         if missing_codes:
             reason_parts.append(f"缺失股票: {sorted(missing_codes)}")
         if truncated_suspected:
@@ -2541,7 +2637,7 @@ class IntradayMonitor:
             expected_codes=expected_normalized,
             covered_codes=covered_normalized,
             missing_codes=missing_codes,
-            sentinel_ok=sentinel_ok,
+            sentinel_ok=effective_sentinel_ok,
             truncated_suspected=truncated_suspected,
             reason="; ".join(reason_parts) if reason_parts else "passed",
         )
@@ -2620,6 +2716,199 @@ class IntradayMonitor:
 
         return None
 
+    def _save_decision_artifacts(
+        self,
+        *,
+        raw_content: str,
+        normalized_content: str,
+        integrity: Optional[DecisionContentIntegrity],
+        llm_result: LLMResult,
+        snapshot_id: Optional[str],
+    ) -> None:
+        """Save decision artifacts to logs/ for GitHub Actions artifact capture.
+
+        Writes:
+        - logs/intraday_decision_raw_{snapshot_id}.md
+        - logs/intraday_decision_normalized_{snapshot_id}.md
+        - logs/intraday_decision_integrity_{snapshot_id}.json
+        - logs/intraday_decision_{snapshot_id}.html
+
+        These artifacts allow tracing whether truncation/corruption happened at
+        the LLM, normalizer, HTML converter, SMTP, or email client level.
+        """
+        import os as _os
+        import json as _json
+
+        log_dir = getattr(self._config, 'log_dir', './logs')
+        try:
+            _os.makedirs(log_dir, exist_ok=True)
+        except OSError:
+            logger.debug("Cannot create log_dir=%s for decision artifacts", log_dir)
+            return
+
+        sid = snapshot_id or 'latest'
+
+        # Raw LLM response
+        try:
+            raw_path = _os.path.join(log_dir, f"intraday_decision_raw_{sid}.md")
+            with open(raw_path, 'w', encoding='utf-8') as f:
+                f.write(raw_content)
+            logger.info("Decision raw artifact saved: %s (%d chars)", raw_path, len(raw_content))
+        except Exception as exc:
+            logger.debug("Failed to save raw artifact: %s", exc)
+
+        # Normalized decision content
+        try:
+            norm_path = _os.path.join(log_dir, f"intraday_decision_normalized_{sid}.md")
+            with open(norm_path, 'w', encoding='utf-8') as f:
+                f.write(normalized_content)
+            logger.info("Decision normalized artifact saved: %s (%d chars)", norm_path, len(normalized_content))
+        except Exception as exc:
+            logger.debug("Failed to save normalized artifact: %s", exc)
+
+        # Integrity JSON
+        if integrity is not None:
+            try:
+                integrity_path = _os.path.join(log_dir, f"intraday_decision_integrity_{sid}.json")
+                integrity_data = {
+                    "ok": integrity.ok,
+                    "expected_codes": sorted(integrity.expected_codes),
+                    "covered_codes": sorted(integrity.covered_codes),
+                    "missing_codes": sorted(integrity.missing_codes),
+                    "sentinel_ok": integrity.sentinel_ok,
+                    "truncated_suspected": integrity.truncated_suspected,
+                    "reason": integrity.reason,
+                    "llm_finish_reason": llm_result.finish_reason,
+                    "llm_response_chars": llm_result.response_chars,
+                    "llm_completion_tokens": llm_result.completion_tokens,
+                    "llm_provider": llm_result.provider,
+                    "raw_chars": len(raw_content),
+                    "normalized_chars": len(normalized_content),
+                    "snapshot_id": sid,
+                }
+                with open(integrity_path, 'w', encoding='utf-8') as f:
+                    _json.dump(integrity_data, f, ensure_ascii=False, indent=2)
+                logger.info("Decision integrity artifact saved: %s", integrity_path)
+            except Exception as exc:
+                logger.debug("Failed to save integrity artifact: %s", exc)
+
+        # Rendered HTML
+        try:
+            from src.formatters import markdown_to_html_document
+            html_content = markdown_to_html_document(normalized_content)
+            html_path = _os.path.join(log_dir, f"intraday_decision_{sid}.html")
+            with open(html_path, 'w', encoding='utf-8') as f:
+                f.write(html_content)
+            logger.info("Decision HTML artifact saved: %s (%d chars)", html_path, len(html_content))
+        except Exception as exc:
+            logger.debug("Failed to save HTML artifact: %s", exc)
+
+    @staticmethod
+    def _build_decision_body_summary(content: str, max_chars: int) -> str:
+        """Build a safe summary of decision content without mid-Markdown truncation.
+
+        Strategy:
+        1. Extract group stats (counts per category)
+        2. Preserve the header block (coverage lines, blockquote metadata) in full
+        3. Include the first N group sections up to max_chars, cutting only at
+           section boundaries
+        4. Append a note about the full attachment
+
+        This avoids the jarring "mid-sentence cutoff" look of hard slicing.
+        """
+        if len(content) <= max_chars:
+            return content
+
+        lines = content.split("\n")
+
+        # Extract header block (blockquote lines starting with "> ")
+        header_lines: list = []
+        body_start = 0
+        for i, line in enumerate(lines):
+            if line.startswith("> ") or line.strip() == ">" or line.strip() == "":
+                header_lines.append(line)
+                body_start = i + 1
+            elif line.startswith("#") or line.startswith("##"):
+                break
+            else:
+                body_start = i
+                break
+
+        header_text = "\n".join(header_lines).rstrip()
+
+        # Count stocks per group in the full content
+        buy_count = 0
+        tp_count = 0
+        sl_count = 0
+        watch_count = 0
+        buy_re = re.compile(r'^\s*[-*]\s+\*{0,2}[^：:]+[：:].*买入')
+        tp_re = re.compile(r'^\s*[-*]\s+\*{0,2}[^：:]+[：:].*(止盈|收盈)')
+        sl_re = re.compile(r'^\s*[-*]\s+\*{0,2}[^：:]+[：:].*止损')
+        for line in lines:
+            if buy_re.search(line):
+                buy_count += 1
+            elif tp_re.search(line):
+                tp_count += 1
+            elif sl_re.search(line):
+                sl_count += 1
+
+        # Watch = items in watch section that aren't already counted
+        in_watch = False
+        for line in lines:
+            if "观望" in line and ("###" in line or "##" in line):
+                in_watch = True
+                continue
+            if in_watch and line.strip().startswith("#"):
+                in_watch = False
+                continue
+            if in_watch and (line.strip().startswith("- **") or line.strip().startswith("* **")):
+                if not buy_re.search(line) and not tp_re.search(line) and not sl_re.search(line):
+                    watch_count += 1
+
+        # Build summary block
+        summary_parts = [
+            header_text,
+            "",
+            "## 分组统计",
+            f"- 买入: {buy_count}",
+            f"- 止盈: {tp_count}",
+            f"- 止损: {sl_count}",
+            f"- 观望: {watch_count}",
+            "",
+            "---",
+            "",
+        ]
+        summary_header = "\n".join(summary_parts)
+
+        # Now append body up to remaining chars, cutting only at section boundaries
+        remaining = max_chars - len(summary_header) - 200  # 200 for closing note
+        body_lines = lines[body_start:]
+
+        # Find safe cut point: last complete section before remaining limit
+        accumulated = 0
+        cut_idx = 0
+        section_start = 0
+        for i, line in enumerate(body_lines):
+            accumulated += len(line) + 1  # +1 for newline
+            if accumulated <= remaining:
+                cut_idx = i + 1
+            # Track section boundaries
+            if line.startswith("### ") or line.startswith("## "):
+                if accumulated <= remaining:
+                    section_start = i
+                else:
+                    break
+
+        safe_body = "\n".join(body_lines[:section_start]) if section_start > 0 else "\n".join(body_lines[:cut_idx])
+
+        closing = (
+            "\n\n---\n"
+            "> 正文较长，完整报告见附件 intraday_decision.md 和 intraday_decision.html。\n"
+            "> 完整内容也可从 GitHub Actions artifact 获取。\n"
+        )
+
+        return summary_header + safe_body + closing
+
     def _send_decision_email(
         self,
         content: str,
@@ -2647,6 +2936,7 @@ class IntradayMonitor:
             EmailReportType.LLM_FAILURE_ALERT: "[LLM故障告警] 盘中监控",
             EmailReportType.NO_BASELINE_ALERT: "[无基线告警] 盘中监控",
             EmailReportType.SNAPSHOT_INCOMPLETE_ALERT: "[快照未完成告警] 盘中监控",
+            EmailReportType.CONTENT_INCOMPLETE_ALERT: "[内容不完整] 盘中监控",
         }
         prefix = prefix_map.get(report_type, "盘中监控通知")
         subject = prefix
@@ -2688,12 +2978,11 @@ class IntradayMonitor:
             attach_full = getattr(self._config, 'intraday_email_attach_full_report', True)
 
             if body_mode == 'summary_with_attachment' or len(content) > body_max_chars:
-                # Send summary body + full report as attachment
-                summary_len = min(len(content), body_max_chars)
+                # Build a safe summary (never hard-truncate mid-Markdown)
                 summary_content = (
-                    content[:summary_len]
-                    + "\n\n---\n> 正文过长，完整报告见附件。"
-                ) if len(content) > body_max_chars else content
+                    self._build_decision_body_summary(content, body_max_chars)
+                    if len(content) > body_max_chars else content
+                )
 
                 attachments = []
                 if attach_full:
