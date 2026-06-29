@@ -223,6 +223,107 @@ class EmailSender:
         finally:
             self._close_server(server)
 
+    def send_to_email_with_attachments(
+        self,
+        content: str,
+        subject: Optional[str] = None,
+        receivers: Optional[List[str]] = None,
+        *,
+        attachments: Optional[List[tuple]] = None,
+        timeout_seconds: Optional[float] = None,
+    ) -> bool:
+        """Send email with file attachments.
+
+        Args:
+            content: Email body (Markdown, converted to HTML).
+            subject: Email subject.
+            receivers: Recipient list.
+            attachments: List of (filename, bytes_data, mime_type) tuples.
+            timeout_seconds: SMTP timeout override.
+
+        Returns:
+            Whether sending succeeded.
+        """
+        if not self._is_email_configured():
+            logger.warning("邮件配置不完整，跳过推送")
+            return False
+
+        sender = self._email_config['sender']
+        password = self._email_config['password']
+        receivers = receivers or self._email_config['receivers']
+        server: Optional[smtplib.SMTP] = None
+
+        try:
+            if subject is None:
+                date_str = datetime.now().strftime('%Y-%m-%d')
+                subject = f"📈 股票智能分析报告 - {date_str}"
+
+            html_content = markdown_to_html_document(content)
+
+            msg = MIMEMultipart('mixed')
+            msg['Subject'] = Header(subject, 'utf-8')
+            msg['From'] = self._format_sender_address(sender)
+            msg['To'] = ', '.join(receivers)
+
+            # Body part (plain + HTML alternative)
+            alt_part = MIMEMultipart('alternative')
+            alt_part.attach(MIMEText(content, 'plain', 'utf-8'))
+            alt_part.attach(MIMEText(html_content, 'html', 'utf-8'))
+            msg.attach(alt_part)
+
+            # Attachments
+            if attachments:
+                for att_filename, att_data, att_mime in attachments:
+                    from email.mime.base import MIMEBase
+                    from email import encoders
+                    main_type, sub_type = att_mime.split('/', 1) if '/' in att_mime else ('application', 'octet-stream')
+                    part = MIMEBase(main_type, sub_type)
+                    part.set_payload(att_data)
+                    encoders.encode_base64(part)
+                    part.add_header(
+                        'Content-Disposition',
+                        'attachment',
+                        filename=Header(att_filename, 'utf-8').encode(),
+                    )
+                    msg.attach(part)
+
+            # SMTP connect and send
+            domain = sender.split('@')[-1].lower()
+            smtp_config = SMTP_CONFIGS.get(domain)
+            if smtp_config:
+                smtp_server, smtp_port = smtp_config['server'], smtp_config['port']
+                use_ssl = smtp_config['ssl']
+            else:
+                smtp_server, smtp_port = f"smtp.{domain}", 465
+                use_ssl = True
+
+            if use_ssl:
+                server = smtplib.SMTP_SSL(smtp_server, smtp_port, timeout=timeout_seconds or 30)
+            else:
+                server = smtplib.SMTP(smtp_server, smtp_port, timeout=timeout_seconds or 30)
+                server.starttls()
+
+            server.login(sender, password)
+            server.send_message(msg)
+
+            logger.info(
+                "邮件（含 %d 个附件）发送成功，收件人: %s",
+                len(attachments) if attachments else 0, receivers,
+            )
+            return True
+
+        except smtplib.SMTPAuthenticationError:
+            logger.error("邮件发送失败：认证错误，请检查邮箱和授权码是否正确")
+            return False
+        except smtplib.SMTPConnectError as e:
+            logger.error(f"邮件发送失败：无法连接 SMTP 服务器 - {e}")
+            return False
+        except Exception as e:
+            logger.error(f"发送邮件失败: {e}")
+            return False
+        finally:
+            self._close_server(server)
+
     def _send_email_with_inline_image(
         self, image_bytes: bytes, receivers: Optional[List[str]] = None
     ) -> bool:

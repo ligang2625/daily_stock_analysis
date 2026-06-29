@@ -174,6 +174,7 @@ def build_intraday_prompt(
     market_timeline_stats: Optional[Dict[str, Any]] = None,
     historical_snapshot_count: int = 0,
     relative_strength_summary: Optional[str] = None,
+    expected_codes: Optional[List[str]] = None,
 ) -> str:
     """
     Build the LLM prompt for 14:20 intraday decision.
@@ -184,7 +185,8 @@ def build_intraday_prompt(
         snapshot_times: List of HH:MM snapshot times executed today.
         markets: Set of market codes (e.g. {'cn', 'hk'}) for context-aware prompt.
         stock_timelines: {stock_code: {stock_name, market, points: [{price, change_pct, volume_ratio, ts, ...}]}}
-        market_timelines: {market: [{index_code, index_name, points: [{price, change_pct, ts}], open_price, ...}]}
+        market_timelines: {market: [{index_code, index_name, points: [{price, change_pct, ts}], open_price, ...}]}}
+        expected_codes: Optional list of stock codes that must be covered in the decision.
 
     Returns:
         Prompt string ready for litellm.completion().
@@ -234,6 +236,7 @@ def build_intraday_prompt(
         "12. 每条建议必须说明：当前价、触发阈值/区间、量比、大盘环境、相对强弱、数据质量。",
         '13. 如果没有某类股票，该分组写"（无）"。',
         '14. 每行必须引用至少一个指数状态，或说明"指数数据缺失"。',
+        "15. 每只监控股票必须出现在输出中（买入/卖出/观望 四组之一），不得遗漏；缺失视为输出不完整。",
         "",
         "## 输出格式",
         "",
@@ -388,6 +391,24 @@ def build_intraday_prompt(
     lines.append('对比开盘价与昨日收盘价：若跳空幅度超过3%，标注"阈值可能已失效（跳空>3%）"，')
     lines.append("此时昨日盘后分析得出的买入/止损/止盈阈值可能不再适用。")
     lines.append("")
+
+    # --- Completeness protocol ---
+    if expected_codes:
+        lines.append("## 输出完整性协议")
+        lines.append("")
+        lines.append(f"监控股票总数: {len(expected_codes)}")
+        lines.append(f"必须覆盖的股票: {', '.join(sorted(expected_codes))}")
+        lines.append("")
+        lines.append("每只股票必须出现在上述四个分组之一中。如果某只股票无明确的买卖信号，")
+        lines.append("必须将其放入「观望/无法判断」分组并附简要理由。")
+        lines.append("")
+        lines.append("**输出末尾必须包含以下完整性标记行**：")
+        lines.append("```")
+        lines.append(f"<!-- INTRADAY_DECISION_COMPLETE expected={len(expected_codes)} covered=N -->")
+        lines.append("```")
+        lines.append("将 N 替换为你实际覆盖的股票数量（不得超过 expected）。")
+        lines.append("缺少此标记的输出将被视为不完整/截断。")
+        lines.append("")
 
     # --- Risk disclaimer ---
     lines.append("## 风险提示")

@@ -15,7 +15,7 @@ import logging
 import math
 import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional, Dict, Any, List, Tuple, Callable
 
 import litellm
@@ -60,6 +60,17 @@ from src.market_context import get_market_role, get_market_guidelines
 from src.market_phase_prompt import format_market_phase_prompt_section
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class GenerateTextResult:
+    """Rich result from generate_text_with_metadata()."""
+    text: str
+    model: str
+    usage: Dict[str, Any] = field(default_factory=dict)
+    finish_reason: Optional[str] = None
+    response_chars: int = 0
+    completion_tokens: int = 0
 
 
 def _normalize_risk_warning_values(value: Any) -> List[str]:
@@ -2636,6 +2647,12 @@ class GeminiAnalyzer:
                 content = self._extract_completion_text(response)
                 if content:
                     usage = self._normalize_usage(self._get_response_field(response, "usage"))
+                    # Extract finish_reason for truncation detection
+                    choices = self._get_response_field(response, "choices")
+                    if choices:
+                        fr = self._get_response_field(choices[0], "finish_reason")
+                        if fr is not None:
+                            usage["finish_reason"] = str(fr)
                     last_response_text = content
                     last_model = model
                     last_usage = usage
@@ -2700,8 +2717,51 @@ class GeminiAnalyzer:
                 raise
             return None
 
+    def generate_text_with_metadata(
+        self,
+        prompt: str,
+        max_tokens: int = 2048,
+        temperature: float = 0.7,
+        system_prompt: Optional[str] = None,
+        call_type: str = "market_review",
+        raise_on_error: bool = False,
+    ) -> Optional[GenerateTextResult]:
+        """Like generate_text() but returns a GenerateTextResult with metadata.
+
+        Includes finish_reason, response_chars, and completion_tokens for
+        truncation detection and integrity checking.
+
+        Returns:
+            GenerateTextResult on success, or None if the LLM call fails
+            (error is logged unless raise_on_error is True).
+        """
+        try:
+            result = self._call_litellm(
+                prompt,
+                generation_config={"max_tokens": max_tokens, "temperature": temperature},
+                system_prompt=system_prompt,
+            )
+            if isinstance(result, tuple):
+                text, model_used, usage = result
+                persist_llm_usage(usage, model_used, call_type=call_type)
+                finish_reason = usage.pop("finish_reason", None) if isinstance(usage, dict) else None
+                return GenerateTextResult(
+                    text=text,
+                    model=model_used,
+                    usage=usage,
+                    finish_reason=str(finish_reason) if finish_reason else None,
+                    response_chars=len(text),
+                    completion_tokens=usage.get("completion_tokens", 0) if isinstance(usage, dict) else 0,
+                )
+            return None
+        except Exception as exc:
+            logger.error("[generate_text_with_metadata] LLM call failed: %s", exc)
+            if raise_on_error:
+                raise
+            return None
+
     def analyze(
-        self, 
+        self,
         context: Dict[str, Any],
         news_context: Optional[str] = None,
         progress_callback: Optional[Callable[[int, str], None]] = None,
