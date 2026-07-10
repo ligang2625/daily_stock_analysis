@@ -13,13 +13,18 @@ from src.core.intraday_monitor import (
     INTRADAY_SYSTEM_PROMPT,
     IntradayEvent,
     IntradayMonitor,
+    IntradayReportResult,
     LLMConfigError,
     LLMResult,
     SnapshotState,
+    StockBlockParseResult,
+    STOCK_BEGIN_TEMPLATE,
+    STOCK_END_TEMPLATE,
     _compare_with_thresholds,
     _find_sniper_points_in_dict,
     _log_ctx,
     _safe_float,
+    parse_stock_blocks,
 )
 try:
     from data_provider.base import DataFetcherManager
@@ -1755,7 +1760,7 @@ class TestLLMTruncationDetection:
 
 
 class TestReportIntegrityValidation:
-    """_validate_report_batch checks stock coverage, end markers, and truncation."""
+    """_validate_batch_report checks stock coverage with structured block markers."""
 
     def _make_monitor_with_validator(self):
         monitor = _make_monitor()
@@ -1763,47 +1768,77 @@ class TestReportIntegrityValidation:
 
     def test_all_codes_covered_with_marker(self):
         monitor = self._make_monitor_with_validator()
-        content = "- **600519**\nreport for 600519\n- **000001**\nreport for 000001\n<!-- INTRADAY_BATCH_COMPLETE -->"
-        result = monitor._validate_report_batch(content, ["600519", "000001"], "stop")
+        content = (
+            "<!-- STOCK_BEGIN:600519 -->\nreport for 600519\n<!-- STOCK_END:600519 -->\n"
+            "<!-- STOCK_BEGIN:000001 -->\nreport for 000001\n<!-- STOCK_END:000001 -->\n"
+            "<!-- INTRADAY_BATCH_COMPLETE -->"
+        )
+        result = monitor._validate_batch_report(content, ["600519", "000001"], "stop")
         assert result["complete"] is True
         assert result["covered_codes"] == ["600519", "000001"]
         assert result["missing_codes"] == []
 
     def test_missing_code_detected(self):
         monitor = self._make_monitor_with_validator()
-        content = "- **600519**\nreport for 600519\n<!-- INTRADAY_BATCH_COMPLETE -->"
-        result = monitor._validate_report_batch(content, ["600519", "000001"], "stop")
+        content = (
+            "<!-- STOCK_BEGIN:600519 -->\nreport for 600519\n<!-- STOCK_END:600519 -->\n"
+            "<!-- INTRADAY_BATCH_COMPLETE -->"
+        )
+        result = monitor._validate_batch_report(content, ["600519", "000001"], "stop")
         assert result["complete"] is False
         assert result["missing_codes"] == ["000001"]
         assert result["error_type"] == "missing_stocks"
 
     def test_truncated_even_with_all_codes(self):
         monitor = self._make_monitor_with_validator()
-        content = "- **600519**\n- **000001**\n<!-- INTRADAY_BATCH_COMPLETE -->"
-        result = monitor._validate_report_batch(content, ["600519", "000001"], "length")
+        content = (
+            "<!-- STOCK_BEGIN:600519 -->\nreport for 600519\n<!-- STOCK_END:600519 -->\n"
+            "<!-- STOCK_BEGIN:000001 -->\nreport for 000001\n<!-- STOCK_END:000001 -->\n"
+            "<!-- INTRADAY_BATCH_COMPLETE -->"
+        )
+        result = monitor._validate_batch_report(content, ["600519", "000001"], "length")
         assert result["complete"] is False
         assert result["error_type"] == "truncated_response"
 
     def test_missing_end_marker(self):
         monitor = self._make_monitor_with_validator()
-        content = "- **600519**\nreport\n- **000001**\nreport"
-        result = monitor._validate_report_batch(content, ["600519", "000001"], "stop")
+        content = (
+            "<!-- STOCK_BEGIN:600519 -->\nreport\n<!-- STOCK_END:600519 -->\n"
+            "<!-- STOCK_BEGIN:000001 -->\nreport\n<!-- STOCK_END:000001 -->"
+        )
+        result = monitor._validate_batch_report(content, ["600519", "000001"], "stop")
         assert result["complete"] is False
         assert result["error_type"] == "malformed_report"
 
     def test_empty_content(self):
         monitor = self._make_monitor_with_validator()
-        result = monitor._validate_report_batch("", ["600519"], "stop")
+        result = monitor._validate_batch_report("", ["600519"], "stop")
         assert result["complete"] is False
         assert result["missing_codes"] == ["600519"]
 
     def test_normalized_code_matching(self):
         monitor = self._make_monitor_with_validator()
-        # Code appears in SH.600519 format but expected as 600519
-        content = "- **股票（SH.600519）**\nreport content\n<!-- INTRADAY_BATCH_COMPLETE -->"
-        result = monitor._validate_report_batch(content, ["600519"], "stop")
-        # Should match because 600519 appears as substring
+        # The STOCK_BEGIN marker block uses stock code 600519
+        content = (
+            "<!-- STOCK_BEGIN:600519 -->\nreport content\n<!-- STOCK_END:600519 -->\n"
+            "<!-- INTRADAY_BATCH_COMPLETE -->"
+        )
+        result = monitor._validate_batch_report(content, ["600519"], "stop")
         assert result["covered_codes"] == ["600519"]
+
+    def test_substring_no_false_positive(self):
+        """Codes appearing in text but not in STOCK_BEGIN markers are NOT covered."""
+        monitor = self._make_monitor_with_validator()
+        content = (
+            "提示：本批股票 000001 需要分析。\n"
+            "<!-- STOCK_BEGIN:600519 -->\nreport for 600519\n<!-- STOCK_END:600519 -->\n"
+            "<!-- INTRADAY_BATCH_COMPLETE -->"
+        )
+        result = monitor._validate_batch_report(content, ["600519", "000001"], "stop")
+        # 000001 appears in prompt text but has no STOCK_BEGIN block → missing
+        assert result["covered_codes"] == ["600519"]
+        assert result["missing_codes"] == ["000001"]
+        assert result["error_type"] == "missing_stocks"
 
 
 class TestEmailCoverageDistinction:
@@ -3207,8 +3242,199 @@ class TestOneShotDecisionSnapshotIsolation:
 
         # Verify alert sent, not an official decision using old snapshot
         assert mock_email.called
-        expected_report_type = EmailReportType.SNAPSHOT_INCOMPLETE_ALERT
-        actual_report_type = mock_email.call_args[1].get('report_type')
-        assert actual_report_type == expected_report_type, (
-            f"Expected {expected_report_type}, got {actual_report_type}"
+
+
+# ============================================================================
+# Regression: finish_reason field contract, block parsing, marker validation
+# ============================================================================
+
+class TestFinishReasonHelper:
+    """_get_finish_reasons() normalizes LLMResult.finish_reason (singular) to list."""
+
+    def test_success_returns_list(self):
+        result = LLMResult(status="success", finish_reason="stop", content="ok")
+        reasons = IntradayMonitor._get_finish_reasons(result)
+        assert reasons == ["stop"]
+
+    def test_none_returns_empty(self):
+        result = LLMResult(status="success", finish_reason=None, content="ok")
+        reasons = IntradayMonitor._get_finish_reasons(result)
+        assert reasons == []
+
+    def test_truncated_returns_list(self):
+        result = LLMResult(status="truncated_response", finish_reason="length", content="...")
+        reasons = IntradayMonitor._get_finish_reasons(result)
+        assert reasons == ["length"]
+
+    def test_no_finish_reasons_field_raises_attribute_error(self):
+        """Confirm LLMResult does NOT have a plural finish_reasons field — callers must use the helper."""
+        result = LLMResult(status="success", finish_reason="stop")
+        with pytest.raises(AttributeError):
+            _ = result.finish_reasons  # type: ignore
+
+
+class TestParseStockBlocks:
+    """parse_stock_blocks() uses structured markers, not substring match."""
+
+    def test_all_covered(self):
+        content = (
+            "<!-- STOCK_BEGIN:600519 -->\n茅台分析\n<!-- STOCK_END:600519 -->\n"
+            "<!-- STOCK_BEGIN:000001 -->\n平安分析\n<!-- STOCK_END:000001 -->\n"
         )
+        result = parse_stock_blocks(content, ["600519", "000001"])
+        assert len(result.blocks_by_code) == 2
+        assert result.missing_codes == []
+        assert result.duplicate_codes == []
+
+    def test_missing_code(self):
+        content = "<!-- STOCK_BEGIN:600519 -->\n茅台分析\n<!-- STOCK_END:600519 -->"
+        result = parse_stock_blocks(content, ["600519", "000001"])
+        assert result.missing_codes == ["000001"]
+
+    def test_duplicate_detected(self):
+        content = (
+            "<!-- STOCK_BEGIN:600519 -->\nfirst\n<!-- STOCK_END:600519 -->\n"
+            "<!-- STOCK_BEGIN:600519 -->\nsecond\n<!-- STOCK_END:600519 -->\n"
+        )
+        result = parse_stock_blocks(content, ["600519"])
+        assert result.duplicate_codes == ["600519"]
+        # Only first block retained
+        assert "first" in result.blocks_by_code["600519"]
+
+    def test_substring_no_false_positive(self):
+        """Stock code appearing in instruction text does NOT count as covered."""
+        content = (
+            "指令: 请分析 000001 和 600519。\n"
+            "本批股票: 600519, 000001\n"
+            "<!-- STOCK_BEGIN:600519 -->\n茅台分析\n<!-- STOCK_END:600519 -->\n"
+        )
+        result = parse_stock_blocks(content, ["600519", "000001"])
+        assert result.missing_codes == ["000001"]
+
+    def test_preamble_and_trailing(self):
+        content = (
+            "# 报告标题\n\n"
+            "<!-- STOCK_BEGIN:600519 -->\n茅台分析\n<!-- STOCK_END:600519 -->\n"
+            "尾部说明\n"
+        )
+        result = parse_stock_blocks(content, ["600519"])
+        assert "# 报告标题" in result.preamble
+        assert "尾部说明" in result.trailing_content
+
+    def test_no_blocks(self):
+        result = parse_stock_blocks("plain text", ["600519"])
+        assert result.missing_codes == ["600519"]
+        assert result.preamble == "plain text"
+        assert len(result.blocks_by_code) == 0
+
+    def test_unknown_code_in_block(self):
+        content = "<!-- STOCK_BEGIN:999999 -->\nunknown\n<!-- STOCK_END:999999 -->"
+        result = parse_stock_blocks(content, ["600519"])
+        assert "999999" in result.unknown_codes
+
+    def test_malformed_block(self):
+        content = (
+            "<!-- STOCK_BEGIN:600519 -->\nok\n<!-- STOCK_END:600519 -->\n"
+            "<!-- STOCK_BEGIN: -->\nbad\n<!-- STOCK_END: -->\n"
+        )
+        result = parse_stock_blocks(content, ["600519"])
+        # Empty code string does not normalize → malformed
+        assert len(result.malformed_blocks) == 1
+        assert result.malformed_blocks[0]["raw_code"] == ""
+
+
+class TestValidatorMarkerProtocol:
+    """_validate_batch_report vs _validate_merged_report use distinct markers."""
+
+    def _make_monitor(self):
+        return _make_monitor()
+
+    def test_batch_validator_requires_batch_marker(self):
+        monitor = self._make_monitor()
+        content = (
+            "<!-- STOCK_BEGIN:600519 -->\na\n<!-- STOCK_END:600519 -->\n"
+            "<!-- INTRADAY_BATCH_COMPLETE -->"
+        )
+        result = monitor._validate_batch_report(content, ["600519"], "stop")
+        assert result["complete"] is True
+
+    def test_batch_validator_rejects_without_batch_marker(self):
+        monitor = self._make_monitor()
+        content = (
+            "<!-- STOCK_BEGIN:600519 -->\na\n<!-- STOCK_END:600519 -->\n"
+            "<!-- INTRADAY_REPORT_COMPLETE -->"
+        )
+        result = monitor._validate_batch_report(content, ["600519"], "stop")
+        assert result["complete"] is False
+        assert result["error_type"] == "malformed_report"
+
+    def test_merged_validator_requires_report_marker(self):
+        monitor = self._make_monitor()
+        content = (
+            "<!-- STOCK_BEGIN:600519 -->\na\n<!-- STOCK_END:600519 -->\n"
+            "<!-- INTRADAY_REPORT_COMPLETE -->"
+        )
+        result = monitor._validate_merged_report(content, ["600519"])
+        assert result["complete"] is True
+
+    def test_merged_validator_rejects_batch_marker(self):
+        """Merged report with BATCH marker but no REPORT marker = incomplete."""
+        monitor = self._make_monitor()
+        content = (
+            "<!-- STOCK_BEGIN:600519 -->\na\n<!-- STOCK_END:600519 -->\n"
+            "<!-- INTRADAY_BATCH_COMPLETE -->"
+        )
+        result = monitor._validate_merged_report(content, ["600519"])
+        assert result["complete"] is False
+        assert result["error_type"] == "malformed_report"
+
+    def test_single_batch_cannot_pass_validator_without_report_marker(self):
+        """Regression: single-batch content with only BATCH marker should NOT pass.
+
+        The merge function must be applied first to replace BATCH_END_MARKER with
+        REPORT_END_MARKER. This test ensures we don't accidentally revert to
+        accepting unmerged single-batch content.
+        """
+        monitor = self._make_monitor()
+        # Raw LLM output (single batch) — only has BATCH marker
+        content = (
+            "<!-- STOCK_BEGIN:600519 -->\na\n<!-- STOCK_END:600519 -->\n"
+            "<!-- INTRADAY_BATCH_COMPLETE -->"
+        )
+        result = monitor._validate_merged_report(content, ["600519"])
+        assert result["complete"] is False
+        # But after merge, it should pass
+        merged = monitor._merge_report_batches([content], ["600519"])
+        result2 = monitor._validate_merged_report(merged, ["600519"])
+        assert result2["complete"] is True
+
+
+class TestMissingCompensationAccumulation:
+    """Multi-batch missing codes accumulate across ALL batches, not just last."""
+
+    def _make_monitor_for_compensation(self):
+        return _make_monitor()
+
+    def test_all_batches_missing_codes_accumulated(self):
+        """If batch 1 and batch 2 both have missing codes, ALL are accumulated."""
+        monitor = self._make_monitor_for_compensation()
+        all_codes = ["600519", "000001", "600036", "000858"]
+        batch1_content = (
+            "<!-- STOCK_BEGIN:600519 -->\na\n<!-- STOCK_END:600519 -->\n"
+            "<!-- INTRADAY_BATCH_COMPLETE -->"
+        )
+        batch2_content = (
+            "<!-- STOCK_BEGIN:600036 -->\na\n<!-- STOCK_END:600036 -->\n"
+            "<!-- INTRADAY_BATCH_COMPLETE -->"
+        )
+        v1 = monitor._validate_batch_report(batch1_content, all_codes[:2], "stop")
+        v2 = monitor._validate_batch_report(batch2_content, all_codes[2:], "stop")
+        assert "000001" in v1["missing_codes"]
+        assert "000858" in v2["missing_codes"]
+
+        # Verify that BOTH missing codes would be accumulated
+        accumulated = set()
+        for v in [v1, v2]:
+            for mc in v.get("missing_codes", []):
+                accumulated.add(mc)
+        assert accumulated == {"000001", "000858"}

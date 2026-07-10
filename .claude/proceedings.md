@@ -196,3 +196,38 @@
 - 214 passed, 11 new, 0 regression
 - 3 预存失败（cache TTL / event_type，与本轮无关）
 - 编译检查：OK
+
+---
+
+# Session 2026-07-10: Refinement-Executor 盘中邮件内容完整性修复 Phase 2
+
+## 改动概要
+
+本轮修复 10 个问题（2 Critical + 7 Major + 1 Minor）：finish_reason 字段契约、批次/最终标记校验拆分、结构化股票块解析器、跨批次缺失补偿、邮件无损交付加固、安全默认配置。
+
+## 修改文件
+
+**`src/core/intraday_monitor.py`** (+243/-54):
+- 新增 `StockBlockParseResult` dataclass + `parse_stock_blocks()` 解析器（`<!-- STOCK_BEGIN/END:CODE -->` 结构化块）
+- 新增 `_get_finish_reasons()` 统一转换，禁止访问不存在的 `finish_reasons`
+- `_validate_report_batch()` → `_validate_batch_report()`（只认批次标记）
+- 新增 `_validate_merged_report()`（只认最终标记）
+- 单批路径经 `_merge_report_batches()` 合并后校验
+- `_generate_batched_decision()` 缺失代码改用全局 `accumulated_missing` 跨批次汇总
+
+**`src/notification_sender/email_sender.py`** (+44/-10):
+- 新增 `EmailDeliveryResult` dataclass（含 `__bool__` 后向兼容）
+- 新增 `_measure_mime_bytes()` 封装
+- `send_to_email()` 返回 `EmailDeliveryResult`
+- `_build_attachment_mime()` 正文仅短索引，不重复完整 HTML
+
+**`src/config.py`** (+6/-6): batch_size 0→6, max_inline_bytes 0→200000
+
+**`.env.example`** (+4/-4): 同步默认值
+
+**`tests/test_intraday_monitor.py`** (+262): 18 新测试（finish_reason 契约、结构化块解析、标记协议、跨批次补偿）
+
+## 验证
+- 233 passed, 3 预存失败（cache TTL / event_type，与本轮无关）
+- fallback 14 passed
+- 编译检查：OK

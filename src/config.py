@@ -956,10 +956,10 @@ class Config:
     intraday_decision_lock_ttl_seconds: int = 300
     # 盘中 LLM 调用 max_tokens（每批上限，防止报告截断）
     intraday_llm_max_tokens: int = 4096
-    # 盘中决策分批大小（每批股票数，0=不分批）
-    intraday_llm_batch_size: int = 0
-    # 邮件正文大小阈值（UTF-8 字节），超限触发拆分/附件模式
-    email_max_inline_bytes: int = 0
+    # 盘中决策分批大小（每批股票数，默认 6 只一批）
+    intraday_llm_batch_size: int = 6
+    # 邮件正文大小阈值（UTF-8 字节），超限触发拆分/附件模式；默认 200KB
+    email_max_inline_bytes: int = 200000
     # 长报告处理模式: "split" | "attachment" | "auto"
     email_long_content_mode: str = "auto"
     # 是否在超长邮件中附带完整原始报告附件
@@ -1839,7 +1839,7 @@ class Config:
             intraday_hk_batch_primary_timeout=parse_env_float(os.getenv('INTRADAY_HK_BATCH_PRIMARY_TIMEOUT'), 20.0, field_name='INTRADAY_HK_BATCH_PRIMARY_TIMEOUT', minimum=5.0),
             intraday_hk_batch_fallback_timeout=parse_env_float(os.getenv('INTRADAY_HK_BATCH_FALLBACK_TIMEOUT'), 60.0, field_name='INTRADAY_HK_BATCH_FALLBACK_TIMEOUT', minimum=10.0),
             intraday_llm_max_tokens=parse_env_int(os.getenv('INTRADAY_LLM_MAX_TOKENS'), 4096, field_name='INTRADAY_LLM_MAX_TOKENS', minimum=256, maximum=16384),
-            intraday_llm_batch_size=parse_env_int(os.getenv('INTRADAY_LLM_BATCH_SIZE'), 0, field_name='INTRADAY_LLM_BATCH_SIZE', minimum=0),
+            intraday_llm_batch_size=parse_env_int(os.getenv('INTRADAY_LLM_BATCH_SIZE'), 6, field_name='INTRADAY_LLM_BATCH_SIZE', minimum=0),
             intraday_llm_fallback_enabled=os.getenv('INTRADAY_LLM_FALLBACK_ENABLED', 'false').lower() == 'true',
             intraday_llm_fallback_protocol=os.getenv('INTRADAY_LLM_FALLBACK_PROTOCOL', 'openai'),
             intraday_llm_fallback_base_url=os.getenv('INTRADAY_LLM_FALLBACK_BASE_URL'),
@@ -1855,7 +1855,7 @@ class Config:
             intraday_market_indices_us=os.getenv('INTRADAY_MARKET_INDICES_US', '^GSPC,^IXIC'),
             intraday_min_market_index_coverage=parse_env_float(os.getenv('INTRADAY_MIN_MARKET_INDEX_COVERAGE'), 0.0, field_name='INTRADAY_MIN_MARKET_INDEX_COVERAGE', minimum=0.0, maximum=1.0),
             intraday_data_quality_alert_enabled=os.getenv('INTRADAY_DATA_QUALITY_ALERT_ENABLED', 'true').lower() == 'true',
-            email_max_inline_bytes=parse_env_int(os.getenv('EMAIL_MAX_INLINE_BYTES'), 0, field_name='EMAIL_MAX_INLINE_BYTES', minimum=0),
+            email_max_inline_bytes=parse_env_int(os.getenv('EMAIL_MAX_INLINE_BYTES'), 200000, field_name='EMAIL_MAX_INLINE_BYTES', minimum=0),
             email_long_content_mode=os.getenv('EMAIL_LONG_CONTENT_MODE', 'auto'),
             email_attach_full_report=os.getenv('EMAIL_ATTACH_FULL_REPORT', 'true').lower() == 'true',
             intraday_index_data_source=os.getenv('INTRADAY_INDEX_DATA_SOURCE', 'dedicated'),

@@ -7,6 +7,7 @@ Email 发送提醒服务
 """
 import hashlib
 import logging
+from dataclasses import dataclass, field
 from typing import Optional, List
 from datetime import datetime
 from email.mime.text import MIMEText
@@ -25,6 +26,24 @@ from src.formatters import markdown_to_html_document
 
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class EmailDeliveryResult:
+    """Structured result for multi-part email delivery with partial success tracking.
+
+    Bool-convertible for backward compatibility — truthy when all parts succeeded.
+    """
+    success: bool = True
+    parts_sent: int = 0
+    parts_failed: int = 0
+    parts_total: int = 0
+    failed_part_indices: List[int] = field(default_factory=list)
+    mode: str = ""  # "inline" | "split" | "attachment"
+    error_detail: Optional[str] = None
+
+    def __bool__(self) -> bool:
+        return self.success
 
 
 # SMTP 服务器配置（自动识别）
@@ -120,6 +139,14 @@ class EmailSender:
         return formataddr((str(Header(str(sender_name), 'utf-8')), sender))
 
     @staticmethod
+    def _measure_mime_bytes(msg: MIMEMultipart) -> int:
+        """Measure the serialized MIME message size in bytes, with fallback."""
+        try:
+            return len(msg.as_bytes())
+        except Exception:
+            return 0
+
+    @staticmethod
     def _close_server(server: Optional[smtplib.SMTP]) -> None:
         """Best-effort SMTP cleanup to avoid leaving sockets open on header/build errors.
 
@@ -144,13 +171,15 @@ class EmailSender:
         *,
         timeout_seconds: Optional[float] = None,
         report_id: Optional[str] = None,
-    ) -> bool:
+    ) -> EmailDeliveryResult:
         """
         Send email via SMTP with optional size-gating and stock-block splitting.
 
         When EMAIL_MAX_INLINE_BYTES is configured (>0) and the MIME body exceeds it:
         - If EMAIL_LONG_CONTENT_MODE is "split" or "auto", splits by stock blocks with [i/N] subjects.
         - If "attachment", sends a short index body with full Markdown as attachment.
+
+        Each individual final MIME message is verified against max_inline_bytes before sending.
 
         Args:
             content: Email body (Markdown, converted to HTML).
@@ -160,11 +189,11 @@ class EmailSender:
             report_id: Optional report identifier for subject and logging.
 
         Returns:
-            True if all parts were sent successfully, False otherwise.
+            EmailDeliveryResult with per-part success/failure tracking.
         """
         if not self._is_email_configured():
             logger.warning("邮件配置不完整，跳过推送")
-            return False
+            return EmailDeliveryResult(success=False, error_detail="email not configured")
 
         sender = self._email_config['sender']
         password = self._email_config['password']
@@ -186,10 +215,7 @@ class EmailSender:
 
         # Build a full MIME message to measure its serialized size
         test_msg = self._build_mime_message(content, html_content, subject, sender, receivers)
-        try:
-            mime_bytes = len(test_msg.as_bytes())
-        except Exception:
-            mime_bytes = md_bytes + html_bytes  # fallback estimate
+        mime_bytes = self._measure_mime_bytes(test_msg)
 
         logger.info(
             "Email size check: md=%d html=%d mime=%d max_inline=%d mode=%s",
@@ -197,12 +223,19 @@ class EmailSender:
         )
 
         if max_inline <= 0 or mime_bytes <= max_inline:
-            # Short content: send as single email
-            return self._send_single_email(test_msg, sender, password, receivers, timeout_seconds)
+            # Short content: send as single email — verify MIME size first
+            if max_inline > 0 and mime_bytes > max_inline:
+                logger.warning("Inline email exceeded max_inline after build: %d > %d", mime_bytes, max_inline)
+                return EmailDeliveryResult(success=False, error_detail="inline size exceeded")
+            ok = self._send_single_email(test_msg, sender, password, receivers, timeout_seconds)
+            return EmailDeliveryResult(
+                success=ok, parts_sent=1 if ok else 0, parts_failed=0 if ok else 1,
+                parts_total=1, mode="inline",
+            )
 
         # Long content: split or attachment mode
         if mode == "attachment":
-            return self._send_attachment_email(
+            att_ok = self._send_attachment_email(
                 content=content,
                 html_content=html_content,
                 subject=subject,
@@ -212,13 +245,18 @@ class EmailSender:
                 timeout_seconds=timeout_seconds,
                 report_id=report_id,
                 sha256=full_sha256,
+                max_inline=max_inline,
+            )
+            return EmailDeliveryResult(
+                success=att_ok, parts_sent=1 if att_ok else 0, parts_failed=0 if att_ok else 1,
+                parts_total=1, mode="attachment",
             )
 
         # mode == "auto" or "split": attempt stock-block splitting
         blocks = self._split_by_stock_blocks(content)
         if len(blocks) <= 1:
             # Can't split meaningfully, fall back to attachment
-            return self._send_attachment_email(
+            att_ok = self._send_attachment_email(
                 content=content,
                 html_content=html_content,
                 subject=subject,
@@ -228,33 +266,65 @@ class EmailSender:
                 timeout_seconds=timeout_seconds,
                 report_id=report_id,
                 sha256=full_sha256,
+                max_inline=max_inline,
+            )
+            return EmailDeliveryResult(
+                success=att_ok, parts_sent=1 if att_ok else 0, parts_failed=0 if att_ok else 1,
+                parts_total=1, mode="attachment",
             )
 
-        # Send each stock block as a separate email
+        # Send each stock block as a separate email with MIME size gating
         total = len(blocks)
-        all_ok = True
+        result = EmailDeliveryResult(parts_total=total, mode="split")
         for i, block in enumerate(blocks):
             part_subject = f"{subject} [{i + 1}/{total}]"
             block_html = markdown_to_html_document(block)
             block_msg = self._build_mime_message(block, block_html, part_subject, sender, receivers)
+            block_mime = self._measure_mime_bytes(block_msg)
+            if max_inline > 0 and block_mime > max_inline:
+                logger.warning(
+                    "Email part %d/%d MIME size %d exceeds max_inline %d, skipping",
+                    i + 1, total, block_mime, max_inline,
+                )
+                result.parts_failed += 1
+                result.failed_part_indices.append(i)
+                continue
             ok = self._send_single_email(block_msg, sender, password, receivers, timeout_seconds)
             if not ok:
-                logger.warning("Email part %d/%d failed: report_id=%s", i + 1, total, report_id)
-                all_ok = False
+                logger.warning("Email part %d/%d failed: report_id=%s mime=%d", i + 1, total, report_id, block_mime)
+                result.parts_failed += 1
+                result.failed_part_indices.append(i)
             else:
-                logger.info("Email part %d/%d sent: report_id=%s", i + 1, total, report_id)
+                logger.info("Email part %d/%d sent: report_id=%s mime=%d", i + 1, total, report_id, block_mime)
+                result.parts_sent += 1
+
+        result.success = result.parts_failed == 0
 
         # Optionally attach full report as a final email
         if attach_full:
             final_subject = f"{subject} [完整报告]"
             final_html = markdown_to_html_document(content)
             final_msg = self._build_attachment_mime(content, final_html, final_subject, sender, receivers, full_sha256)
-            final_ok = self._send_single_email(final_msg, sender, password, receivers, timeout_seconds)
-            if not final_ok:
-                logger.warning("Full report attachment email failed")
-                all_ok = False
+            final_mime = self._measure_mime_bytes(final_msg)
+            if max_inline > 0 and final_mime > max_inline:
+                logger.warning(
+                    "Full report attachment MIME size %d exceeds max_inline %d, skipping",
+                    final_mime, max_inline,
+                )
+                result.parts_failed += 1
+                result.failed_part_indices.append(-1)  # -1 = attachment email
+            else:
+                final_ok = self._send_single_email(final_msg, sender, password, receivers, timeout_seconds)
+                result.parts_total += 1
+                if not final_ok:
+                    logger.warning("Full report attachment email failed")
+                    result.parts_failed += 1
+                    result.failed_part_indices.append(-1)
+                else:
+                    result.parts_sent += 1
+            result.success = result.parts_failed == 0
 
-        return all_ok
+        return result
 
     def _split_by_stock_blocks(self, content: str) -> List[str]:
         """Split Markdown content by stock blocks for multi-part delivery.
@@ -336,8 +406,9 @@ class EmailSender:
             f"完整报告见附件。\nSHA-256: {sha256}",
             'plain', 'utf-8',
         ))
+        # ponytail: attachment body is a short index only — full report is the .md attachment
         alt.attach(MIMEText(
-            f"<p>完整报告见附件。</p><p>SHA-256: <code>{sha256}</code></p>{html_content}",
+            f"<p>完整报告见附件 (<code>intraday_report.md</code>)。</p><p>SHA-256: <code>{sha256}</code></p>",
             'html', 'utf-8',
         ))
         msg.attach(alt)
@@ -365,9 +436,18 @@ class EmailSender:
         timeout_seconds: Optional[float],
         report_id: Optional[str],
         sha256: str,
+        max_inline: int = 0,
     ) -> bool:
-        """Send long report as attachment email."""
+        """Send long report as attachment email, with optional MIME size check."""
         msg = self._build_attachment_mime(content, html_content, subject, sender, receivers, sha256)
+        if max_inline > 0:
+            att_mime = self._measure_mime_bytes(msg)
+            if att_mime > max_inline:
+                logger.warning(
+                    "Attachment email MIME size %d exceeds max_inline %d, blocked",
+                    att_mime, max_inline,
+                )
+                return False
         return self._send_single_email(msg, sender, password, receivers, timeout_seconds)
 
     def _send_single_email(
