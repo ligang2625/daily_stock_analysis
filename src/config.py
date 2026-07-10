@@ -958,6 +958,8 @@ class Config:
     intraday_llm_max_tokens: int = 4096
     # 盘中决策分批大小（每批股票数，默认 6 只一批）
     intraday_llm_batch_size: int = 6
+    # 盘中 LLM 补偿重试最大轮次（默认 2）
+    intraday_llm_compensation_max_rounds: int = 2
     # 邮件正文大小阈值（UTF-8 字节），超限触发拆分/附件模式；默认 200KB
     email_max_inline_bytes: int = 200000
     # 长报告处理模式: "split" | "attachment" | "auto"
@@ -1855,6 +1857,7 @@ class Config:
             intraday_market_indices_us=os.getenv('INTRADAY_MARKET_INDICES_US', '^GSPC,^IXIC'),
             intraday_min_market_index_coverage=parse_env_float(os.getenv('INTRADAY_MIN_MARKET_INDEX_COVERAGE'), 0.0, field_name='INTRADAY_MIN_MARKET_INDEX_COVERAGE', minimum=0.0, maximum=1.0),
             intraday_data_quality_alert_enabled=os.getenv('INTRADAY_DATA_QUALITY_ALERT_ENABLED', 'true').lower() == 'true',
+            intraday_llm_compensation_max_rounds=parse_env_int(os.getenv('INTRADAY_LLM_COMPENSATION_MAX_ROUNDS'), 2, field_name='INTRADAY_LLM_COMPENSATION_MAX_ROUNDS', minimum=0),
             email_max_inline_bytes=parse_env_int(os.getenv('EMAIL_MAX_INLINE_BYTES'), 200000, field_name='EMAIL_MAX_INLINE_BYTES', minimum=0),
             email_long_content_mode=os.getenv('EMAIL_LONG_CONTENT_MODE', 'auto'),
             email_attach_full_report=os.getenv('EMAIL_ATTACH_FULL_REPORT', 'true').lower() == 'true',

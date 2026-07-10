@@ -38,6 +38,7 @@ import litellm
 from src.core.intraday_prompt import format_intraday_event_time
 from data_provider.realtime_types import SnapshotQuoteProcessResult, SnapshotQuoteStatus
 from src.utils.stock_code import normalize_stock_code_key, normalize_stock_code_for_history_query
+from src.core.report_integrity import StockBlockParseResult, parse_stock_blocks
 
 logger = logging.getLogger(__name__)
 
@@ -186,106 +187,6 @@ class IntradayReportResult:
 
 class LLMConfigError(Exception):
     pass
-
-
-@dataclass
-class StockBlockParseResult:
-    """Result of parsing structured stock analysis blocks from LLM output.
-
-    Blocks are delimited by <!-- STOCK_BEGIN:CODE --> ... <!-- STOCK_END:CODE -->.
-    """
-    blocks_by_code: Dict[str, str] = field(default_factory=dict)
-    missing_codes: List[str] = field(default_factory=list)
-    duplicate_codes: List[str] = field(default_factory=list)
-    unknown_codes: List[str] = field(default_factory=list)
-    malformed_blocks: List[Dict[str, Any]] = field(default_factory=list)
-    preamble: str = ""
-    trailing_content: str = ""
-
-
-def parse_stock_blocks(content: str, expected_codes: List[str]) -> StockBlockParseResult:
-    """Parse LLM report content for structured stock analysis blocks.
-
-    Expected format: <!-- STOCK_BEGIN:CODE --> ... analysis ... <!-- STOCK_END:CODE -->
-
-    This replaces substring-based stock-code matching, which produces false
-    positives when stock codes appear in the prompt/instruction text rather
-    than in actual analysis blocks.
-    """
-    import re
-
-    result = StockBlockParseResult()
-
-    if not content or not expected_codes:
-        result.missing_codes = list(expected_codes) if expected_codes else []
-        return result
-
-    # Build a set of normalized expected codes for fast lookup
-    expected_set = {normalize_stock_code_key(c) for c in expected_codes if normalize_stock_code_key(c)}
-    # Map normalized -> original for output
-    rev_map = {normalize_stock_code_key(c): c for c in expected_codes if normalize_stock_code_key(c)}
-
-    block_pattern = re.compile(
-        r'<!--\s*STOCK_BEGIN\s*:\s*(\S*)\s*-->(.*?)<!--\s*STOCK_END\s*:\s*\S*\s*-->',
-        re.DOTALL,
-    )
-
-    matches = list(block_pattern.finditer(content))
-
-    if not matches:
-        result.preamble = content.strip()
-        result.missing_codes = list(expected_codes)
-        return result
-
-    # Preamble: everything before the first STOCK_BEGIN
-    first_match_start = matches[0].start()
-    result.preamble = content[:first_match_start].strip()
-
-    # Trailing content: everything after the last STOCK_END
-    last_match_end = matches[-1].end()
-    result.trailing_content = content[last_match_end:].strip()
-
-    # Track codes seen (Counter for duplicate detection)
-    code_counts: Dict[str, int] = {}
-    for m in matches:
-        raw_code = m.group(1).strip()
-        block_body = m.group(2).strip()
-
-        # Normalize the parsed code
-        normalized = normalize_stock_code_key(raw_code)
-        if not normalized:
-            result.malformed_blocks.append({
-                "raw_code": raw_code,
-                "reason": "unrecognized code format",
-            })
-            continue
-
-        code_counts[normalized] = code_counts.get(normalized, 0) + 1
-
-        # Keep the first block for each code (duplicates discarded)
-        if normalized in result.blocks_by_code:
-            continue
-        result.blocks_by_code[normalized] = block_body
-
-    # Classify each expected code
-    for code in expected_codes:
-        norm = normalize_stock_code_key(code)
-        if not norm:
-            result.missing_codes.append(code)
-            continue
-        count = code_counts.get(norm, 0)
-        if count == 0:
-            result.missing_codes.append(code)
-        elif count > 1:
-            result.duplicate_codes.append(code)
-
-    # Detect codes in blocks that aren't in expected set
-    for norm_code in code_counts:
-        if norm_code not in expected_set:
-            original = rev_map.get(norm_code, norm_code)
-            result.unknown_codes.append(original)
-
-    return result
 
 
 STOCK_BEGIN_TEMPLATE = "<!-- STOCK_BEGIN:{code} -->"
@@ -2433,9 +2334,17 @@ class IntradayMonitor:
         covered = [c for c in expected_codes if normalize_stock_code_key(c) in parsed.blocks_by_code]
         missing = list(parsed.missing_codes)
         duplicates = list(parsed.duplicate_codes)
+        malformed = parsed.malformed_blocks
+        unknown = parsed.unknown_codes
 
         # Check batch end marker
         has_marker = self.INTRADAY_BATCH_END_MARKER in content
+
+        # Log warnings for structural issues
+        if malformed:
+            logger.warning("Batch validation: %d malformed block(s) detected", len(malformed))
+        if unknown:
+            logger.warning("Batch validation: %d unknown code(s) in blocks: %s", len(unknown), unknown)
 
         # Determine completeness
         is_truncated = finish_reason in ("length", "max_tokens") if finish_reason else False
@@ -2443,6 +2352,8 @@ class IntradayMonitor:
             not is_truncated
             and len(missing) == 0
             and len(duplicates) == 0
+            and len(malformed) == 0
+            and len(unknown) == 0
             and has_marker
         )
 
@@ -2453,6 +2364,10 @@ class IntradayMonitor:
             error_type = "missing_stocks"
         elif len(duplicates) > 0:
             error_type = "duplicate_stocks"
+        elif len(malformed) > 0:
+            error_type = "malformed_report"
+        elif len(unknown) > 0:
+            error_type = "unknown_codes"
         elif not has_marker:
             error_type = "malformed_report"
 
@@ -2492,13 +2407,23 @@ class IntradayMonitor:
         covered = [c for c in expected_codes if normalize_stock_code_key(c) in parsed.blocks_by_code]
         missing = list(parsed.missing_codes)
         duplicates = list(parsed.duplicate_codes)
+        malformed = parsed.malformed_blocks
+        unknown = parsed.unknown_codes
 
         # Check report end marker (not batch marker)
         has_marker = self.INTRADAY_REPORT_END_MARKER in content
 
+        # Log warnings for structural issues
+        if malformed:
+            logger.warning("Merged report validation: %d malformed block(s) detected", len(malformed))
+        if unknown:
+            logger.warning("Merged report validation: %d unknown code(s) in blocks: %s", len(unknown), unknown)
+
         complete = (
             len(missing) == 0
             and len(duplicates) == 0
+            and len(malformed) == 0
+            and len(unknown) == 0
             and has_marker
         )
 
@@ -2507,6 +2432,10 @@ class IntradayMonitor:
             error_type = "missing_stocks"
         elif len(duplicates) > 0:
             error_type = "duplicate_stocks"
+        elif len(malformed) > 0:
+            error_type = "malformed_report"
+        elif len(unknown) > 0:
+            error_type = "unknown_codes"
         elif not has_marker:
             error_type = "malformed_report"
 
@@ -2653,13 +2582,15 @@ class IntradayMonitor:
             for missing_code in validation.get("missing_codes", []):
                 accumulated_missing.add(missing_code)
 
-        # One compensation batch for ALL accumulated missing codes
-        if accumulated_missing:
+        # Compensation with retry rounds
+        max_comp_rounds = getattr(self._config, 'intraday_llm_compensation_max_rounds', 2) or 2
+        comp_round = 0
+        while accumulated_missing and comp_round < max_comp_rounds:
+            comp_round += 1
             comp_list = list(accumulated_missing)
             logger.warning(
-                "Compensation batch: %d stocks accumulated missing across %d batches, "
-                "generating compensation: %s",
-                len(comp_list), batch_num, comp_list,
+                "Compensation round %d/%d: %d stocks still missing: %s",
+                comp_round, max_comp_rounds, len(comp_list), comp_list,
             )
             comp_result = self._generate_single_batch_llm(
                 batch_codes=comp_list,
@@ -2672,13 +2603,43 @@ class IntradayMonitor:
                 market_timeline_stats=market_timeline_stats,
                 historical_snapshot_count=historical_snapshot_count,
                 relative_strength_summary=relative_strength_summary,
-                batch_num=batch_num + 1,
+                batch_num=batch_num + comp_round,
                 total_batches="compensation",
             )
-            all_finish_reasons.extend(self._get_finish_reasons(comp_result))
+            comp_fr = self._get_finish_reasons(comp_result)
+            all_finish_reasons.extend(comp_fr)
             all_contents.append(comp_result.content or "")
             if comp_result.model:
                 models_used.add(comp_result.model)
+
+            # Abort immediately if truncated (length/max_tokens)
+            if any(fr in ("length", "max_tokens") for fr in comp_fr):
+                logger.warning(
+                    "Compensation round %d truncated (finish_reason=%s), aborting retries",
+                    comp_round, comp_fr,
+                )
+                break
+
+            # Re-parse ALL merged content to find still-missing codes
+            merged_so_far = self._merge_report_batches(all_contents, valid_quote_codes)
+            reparsed = parse_stock_blocks(merged_so_far, valid_quote_codes)
+            still_missing = set(reparsed.missing_codes)
+            if not still_missing:
+                logger.info("Compensation round %d: all codes now covered", comp_round)
+                accumulated_missing.clear()
+                break
+            else:
+                logger.info(
+                    "Compensation round %d: %d codes still missing after retry: %s",
+                    comp_round, len(still_missing), list(still_missing),
+                )
+                accumulated_missing = still_missing
+
+        if comp_round >= max_comp_rounds and accumulated_missing:
+            logger.warning(
+                "Compensation exhausted after %d rounds, %d codes still missing: %s",
+                comp_round, len(accumulated_missing), list(accumulated_missing),
+            )
 
         # Merge all batch contents (regular + compensation)
         merged_content = self._merge_report_batches(all_contents, valid_quote_codes)

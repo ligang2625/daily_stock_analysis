@@ -8,6 +8,7 @@ import pytest
 from datetime import datetime
 from unittest.mock import MagicMock, patch, PropertyMock
 
+from src.core.report_integrity import StockBlockParseResult, parse_stock_blocks
 from src.core.intraday_monitor import (
     EmailReportType,
     INTRADAY_SYSTEM_PROMPT,
@@ -17,14 +18,12 @@ from src.core.intraday_monitor import (
     LLMConfigError,
     LLMResult,
     SnapshotState,
-    StockBlockParseResult,
     STOCK_BEGIN_TEMPLATE,
     STOCK_END_TEMPLATE,
     _compare_with_thresholds,
     _find_sniper_points_in_dict,
     _log_ctx,
     _safe_float,
-    parse_stock_blocks,
 )
 try:
     from data_provider.base import DataFetcherManager

@@ -22,6 +22,7 @@ import smtplib
 
 from data_provider.base import normalize_stock_code
 from src.config import Config
+from src.core.report_integrity import parse_stock_blocks
 from src.formatters import markdown_to_html_document
 
 
@@ -277,7 +278,8 @@ class EmailSender:
         total = len(blocks)
         result = EmailDeliveryResult(parts_total=total, mode="split")
         for i, block in enumerate(blocks):
-            part_subject = f"{subject} [{i + 1}/{total}]"
+            rpt_prefix = f"[{report_id[:8]}/{full_sha256[:8]}]" if report_id else ""
+            part_subject = f"{rpt_prefix} {subject} [{i + 1}/{total}]".strip()
             block_html = markdown_to_html_document(block)
             block_msg = self._build_mime_message(block, block_html, part_subject, sender, receivers)
             block_mime = self._measure_mime_bytes(block_msg)
@@ -326,41 +328,44 @@ class EmailSender:
 
         return result
 
-    def _split_by_stock_blocks(self, content: str) -> List[str]:
-        """Split Markdown content by stock blocks for multi-part delivery.
+    def _split_by_stock_blocks(self, content: str, expected_codes: Optional[List[str]] = None) -> List[str]:
+        """Split content by structured STOCK_BEGIN/STOCK_END blocks for multi-part delivery.
 
-        Splits on section headers (## ###) or stock entries (- **), preserving
-        each stock's description as an intact unit. Never splits mid-block.
+        Uses parse_stock_blocks() for structured block detection instead of
+        Markdown header heuristics. Each stock block is an intact analysis unit.
+        Preamble and trailing content become separate chunks.
 
-        Returns list of content chunks; empty content returns single-element list.
+        Returns list of content chunks; empty or unsplittable content returns
+        a single-element list.
         """
         if not content:
             return [content]
 
-        # Try splitting on ### headers (stock groups)
-        section_pattern = re.compile(r'(?=^### )', re.MULTILINE)
-        sections = section_pattern.split(content.strip())
-        if len(sections) > 1:
-            return [s.strip() for s in sections if s.strip()]
+        codes = list(expected_codes) if expected_codes else []
+        parsed = parse_stock_blocks(content, codes)
+        if not parsed.blocks_by_code:
+            return [content]
 
-        # Try splitting on ### or **stock** entries within sections
-        entry_pattern = re.compile(r'(?=^- \*\*)', re.MULTILINE)
-        entries = entry_pattern.split(content.strip())
-        if len(entries) > 2:  # Only split if we have meaningful groups
-            # Combine preamble with first entry, then group entries
-            result = []
-            current = []
-            for entry in entries:
-                current.append(entry)
-                if len(current) >= 5:
-                    result.append('\n'.join(current).strip())
-                    current = []
-            if current:
-                result.append('\n'.join(current).strip())
-            if len(result) > 1:
-                return result
+        # Split original content at STOCK_BEGIN/STOCK_END block boundaries
+        block_pattern = re.compile(
+            r'<!--\s*STOCK_BEGIN\s*:\s*\S+\s*-->.*?<!--\s*STOCK_END\s*:\s*\S+\s*-->',
+            re.DOTALL,
+        )
 
-        return [content]
+        chunks: List[str] = []
+        last_end = 0
+        for m in block_pattern.finditer(content):
+            before = content[last_end:m.start()].strip()
+            if before:
+                chunks.append(before)
+            chunks.append(m.group(0).strip())
+            last_end = m.end()
+
+        after = content[last_end:].strip()
+        if after:
+            chunks.append(after)
+
+        return chunks if len(chunks) > 1 else [content]
 
     def _build_mime_message(
         self,
