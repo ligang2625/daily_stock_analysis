@@ -1,212 +1,143 @@
-# 盘中监控系统 — proceedings
+# Session 2026-06-10: Intraday/Postmarket Workflow Phase 3 — 完整跑通链路修复
 
-## 一、架构总览
+## 改动概要
 
-### 核心流程
+本轮修复 6 个问题（3 P0, 2 P1, 1 P2 暂缓），核心方向：partial snapshot coverage gate、workflow data cache 统一、CLI analysis-phase 参数、LLM 配置对齐、DB 摘要日志。
 
-```
-盘中快照（每 30 分钟，10:00–14:00）
-  实时行情 → 阈值比对(_compare_with_thresholds) → SQLite 持久化
+## 修改文件
 
-14:20 决策汇总
-  SQLite 读事件 → LLM Prompt 生成 + 调用 → Email 发送
-```
+**`src/core/intraday_monitor.py`** (+135/-6):
+- 新增 `_get_usable_snapshot_by_id()` — 查询 `status IN ('completed', 'partial')`
+- 新增 `_get_latest_usable_snapshot()` — 查询 `status IN ('completed', 'partial')`，completed 优先
+- `_final_decision_locked()` 改用 usable snapshot 方法，coverage gate 为最终仲裁
+- `load_yesterday_analysis()` 新增 sniper-point 完整性统计日志
+- `_final_decision_locked()` 新增 DB 状态摘要日志 + 决策状态摘要日志
 
-### 阈值判断逻辑
+**`main.py`** (+11/-1):
+- 新增 `--analysis-phase` CLI 参数，支持 premarket/intraday/postmarket/auto
 
-优先级（高→低）：stop_loss < secondary_buy < ideal_buy < take_profit
+**`.github/workflows/00-daily-analysis.yml`** (+46/-1):
+- 新增 `actions/cache/save@v4` 保存 `data/` 到 `dsa-data-*` 前缀
+- 新增 `actions/upload-artifact` 上传 `data/stock_analysis.db`
+- `python main.py` 调用全部加 `--analysis-phase postmarket`
+- 新增数据库状态摘要步骤（sqlite3 查询 analysis_history）
 
-事件类型：break_stop_loss / enter_secondary_buy / enter_ideal_buy / near_buy_zone / enter_take_profit / price_only / unusual_volume(量比≥3.0)
+**`.github/workflows/intraday-monitor.yml`** (+14/-3):
+- Cache key 前缀从 `intraday-data-*` 改为 `dsa-data-*`
+- 新增 `LITELLM_CONFIG_YAML` 环境变量和 YAML 写入逻辑
 
-### SQLite 表
+**`tests/test_intraday_monitor.py`** (+7/-2):
+- 3 个测试 mock 目标从 `_get_latest_completed_snapshot` 改为 `_get_latest_usable_snapshot`
 
-- `intraday_events` — 盘中事件
-- `intraday_snapshots` — 快照记录 (status: completed/partial/failed)
-- `intraday_monitor_state` — KV 状态存储
+## 验证
+- 177 passed, 3 预存失败（cache TTL、fallback event_type）
+- 编译检查：OK
+- Verifier (opus) 确认：全部验收标准通过
+- 无回归：原有 `_get_completed_snapshot_by_id()` 和 `_get_latest_completed_snapshot()` 保留
 
-### 昨日分析加载优先级
+## 已知预存问题
+- `test_expired_cache_returns_none` / `test_expired_ttl_returns_none` — cache TTL mock 行为不符
+- `test_fallback_single_quote_success` — event_type 断言不符
 
-1. SQLite `AnalysisHistory` 热字段 (ideal_buy/secondary_buy/stop_loss/take_profit)
-2. 回退：`raw_result` JSON → 递归搜索 sniper_points/battle_plan
-
----
-
-## 二、运行模式
-
-### A: 常驻进程 (`--schedule`)
-
-```bash
-python main.py --schedule --no-run-immediately
-```
-scheduler 轮询，进程约 5h (9:50-14:40)。6 次快照 + 1 次决策。
-
-### B: GitHub Actions 分次触发（推荐）
-
-```bash
-python main.py --intraday-snapshot    # 单次快照
-python main.py --intraday-decision    # 决策汇总
-```
-每次独立进程，约 2 分钟。`actions/cache@v4` 跨 run 持久化 `data/`。
+## 遗留
+- Issue 6（常驻 scheduler 14:30 snapshot/decision 冲突）暂缓
+- `actions/cache` 长期迁移到 artifact/外部存储未完成（中期方案）
 
 ---
 
-## 三、配置
+# Session 2026-06-10: Intraday/Postmarket Workflow Phase 4 — 手动触发链路补完
 
-### 环境变量
+## 改动概要
 
-| 变量 | 说明 | 默认值 |
-|------|------|--------|
-| `INTRADAY_MONITOR_ENABLED` | 启用盘中监控 | - |
-| `INTRADAY_MONITOR_STOCKS` | 监控股票（逗号分隔） | - |
-| `INTRADAY_MONITOR_DECISION_TIME` | LLM 决策时间 | `14:20` |
-| `INTRADAY_LEGACY_FALLBACK_ENABLED` | 旧数据兼容 fallback | `false` |
-| `INTRADAY_RESET_ON_START` | 启动清空当天事件 | `false` |
-| `INTRADAY_CN_BATCH_FIRST` | CN 批量预取优先 | `true` |
-| `INTRADAY_CN_BATCH_THRESHOLD` | CN 批量触发阈值 | `3` |
-| `INTRADAY_HK_BATCH_PRIMARY_TIMEOUT` | HK 主批量超时 | `20.0` |
-| `INTRADAY_HK_BATCH_FALLBACK_TIMEOUT` | HK 备用批量超时 | `60.0` |
-| `INTRADAY_SNAPSHOT_LOCK_TTL` | snapshot 锁 TTL | `600` |
-| `INTRADAY_DECISION_LOCK_TTL` | decision 锁 TTL | `300` |
-| `INTRADAY_LLM_MAX_TOKENS` | LLM max tokens | `8192` |
-| `INTRADAY_DECISION_EXPECTED_SCOPE` | decision 期望覆盖范围 | `events` |
-| `INTRADAY_DECISION_COMPLETENESS_ENABLED` | 决策完整性校验 | `true` |
-| `INTRADAY_DECISION_COMPLETION_RETRY` | 截断续写重试次数 | `1` |
-| `INTRADAY_DECISION_COMPLETION_USE_FALLBACK` | 续写使用备用 LLM | `true` |
-| `INTRADAY_DECISION_APPEND_RAW_FOR_MISSING` | 续写失败追加 raw summary | `true` |
-| `INTRADAY_EMAIL_BODY_MODE` | 邮件正文模式 | `full` |
-| `INTRADAY_EMAIL_BODY_MAX_CHARS` | 邮件正文最大字符数 | `60000` |
-| `INTRADAY_EMAIL_ATTACH_FULL_REPORT` | 附件完整报告 | `true` |
-| `INTRADAY_DECISION_STRICT_COMPLETENESS` | 严格模式: 缺失阻断 OFFICIAL_DECISION | `false` |
-| `INTRADAY_UNKNOWN_MARKET_POLICY` | 未知市场策略 | `skip` |
-| `INTRADAY_CALENDAR_FAIL_OPEN` | 日历不可用是否放行 | `false` |
-| `INTRADAY_FORCE_RUN` | 非交易日强制执行 | `false` |
-| `INTRADAY_SYSTEM_PROMPT` | 盘中 system prompt | - |
-| `INTRADAY_MARKET_SNAPSHOT_ENABLED` | 大盘指数快照 | `true` |
-| `INTRADAY_MIN_MARKET_INDEX_COVERAGE` | 指数覆盖率下限 | `0.5` |
-| `INTRADAY_DATA_QUALITY_ALERT_ENABLED` | 数据质量告警 | `true` |
-| `INTRADAY_INDEX_DATA_SOURCE` | 指数数据源 | `akshare` |
-| `INTRADAY_LLM_FALLBACK_ENABLED` | 备用 LLM 启用 | `false` |
-| `INTRADAY_LLM_FALLBACK_PROTOCOL` | 备用 LLM 协议 | `openai` |
-| `INTRADAY_LLM_FALLBACK_BASE_URL` | 备用 LLM URL | - |
-| `INTRADAY_LLM_FALLBACK_API_KEY` | 备用 LLM 密钥 | - |
-| `INTRADAY_LLM_FALLBACK_MODEL` | 备用 LLM 模型 | - |
-| `INTRADAY_LLM_FALLBACK_TEMPERATURE` | 备用 LLM temperature | - |
-| `INTRADAY_LLM_FALLBACK_MAX_TOKENS` | 备用 LLM max_tokens | - |
-| `INTRADAY_LLM_FALLBACK_TIMEOUT_SEC` | 备用 LLM 超时 | `60` |
-| `INTRADAY_LLM_FALLBACK_RETRY_ON` | 备用 LLM 重试条件 | `config_error,rate_limited,network_error,empty_response` |
-| `SCHEDULE_ENABLED` | 启用调度 | - |
-| `SCHEDULE_RUN_IMMEDIATELY` | 调度启动时立即分析 | - |
-| `TRADING_DAY_CHECK_ENABLED` | 交易日检查 | - |
-| `EMAIL_SENDER` | 发件邮箱 | - |
-| `EMAIL_PASSWORD` | 邮箱密码/SMTP 授权码 | - |
-| `EMAIL_RECEIVERS` | 收件邮箱 | - |
-| `REALTIME_SOURCE_PRIORITY` | 数据源优先级 | `tencent,akshare_sina,...` |
-| `LITELLM_MODEL` | LLM 模型 | `gemini-3-flash-preview` |
-| `STOCK_LIST` | 默认股票列表 | - |
+本轮修复 P0×1 + P1×1，核心方向：盘中 DB 摘要非阻断化、preferred snapshot 不可用时禁止静默 fallback。
 
-### GitHub Actions Secrets
+## 循环前提确认
 
-`LITELLM_API_KEY`, `GEMINI_API_KEY`, `EMAIL_SENDER`, `EMAIL_PASSWORD`, `EMAIL_RECEIVERS`, `TUSHARE_TOKEN`, `INTRADAY_LLM_FALLBACK_API_KEY`
+验证了 Phase 3 以下改动已就位（未回退，未重复修改）：
+- `--analysis-phase postmarket` 已存在于 3 个 workflow 分支
+- `data/` cache save/restore 已使用 `dsa-data-*` 前缀（两 workflow 统一）
+- `data/stock_analysis.db` artifact 已上传
+- `--analysis-phase` CLI 参数已存在，plumbing 正确
+- `pipeline.py` 的 `_resolve_analysis_phase()` 正确保留非 auto 值
+- snapshot 状态已使用 failed/partial/completed 分级
+- `run_one_shot_decision()` 已调用 `_final_decision_locked(preferred_snapshot_id=...)`
 
-### GitHub Actions Variables
+## 修改文件
 
-`INTRADAY_MONITOR_STOCKS`, `INTRADAY_MONITOR_DECISION_TIME`, `REALTIME_SOURCE_PRIORITY`, `LITELLM_MODEL`, `STOCK_LIST`, `INTRADAY_LLM_FALLBACK_ENABLED`, `INTRADAY_LLM_FALLBACK_PROTOCOL`, `INTRADAY_LLM_FALLBACK_BASE_URL`, `INTRADAY_LLM_FALLBACK_MODEL`, `INTRADAY_LLM_FALLBACK_TEMPERATURE`, `INTRADAY_LLM_FALLBACK_MAX_TOKENS`, `INTRADAY_LLM_FALLBACK_TIMEOUT_SEC`, `INTRADAY_LLM_FALLBACK_RETRY_ON`
+**`.github/workflows/intraday-monitor.yml`** (+48/-19):
+- `数据库状态摘要` 步骤从 sqlite3 CLI 改为 Python try/except
+- 每张表（analysis_history / intraday_snapshots / intraday_events）单独 try/except
+- 缺表时打印 `not ready` 不阻断 workflow
+
+**`src/core/intraday_monitor.py`** (+12/-5):
+- `_final_decision_locked()` 新增分支：preferred_snapshot_id 指定但不可用时，发送 `SNAPSHOT_INCOMPLETE_ALERT` 邮件并 return
+- 不传入 preferred_snapshot_id 时仍 fallback 到 `_get_latest_usable_snapshot()`
+
+## 验证
+- 104 passed, 1 预存失败（test_expired_cache_returns_none）
+- FinalDecision + CoverageGate 测试：7 passed, 0 failed
+- 编译检查：OK
 
 ---
 
-## 四、GitHub Actions Triggers
+# Session 2026-06-10: Refinement-Executor Review — 确认全部 review 项已完成
 
-### 盘中 (intraday-monitor.yml)
+## 改动概要
 
-| UTC | Beijing | Action |
-|-----|---------|--------|
-| 1:55 | 9:55 | snapshot |
-| 2:25 | 10:25 | snapshot |
-| 2:55 | 10:55 | snapshot |
-| 3:25 | 11:25 | snapshot |
-| 5:30 | 13:30 | snapshot |
-| 6:00 | 14:00 | snapshot |
-| 6:30 | 14:30 | snapshot + decision |
+本轮由 `/refinement-executor` 审查 review 文档 6 项 issue，确认 Phase 3/4 已覆盖全部 critical + major 项。2 项剩余 edit（timeout-minutes、postmarket DB 摘要）已在磁盘但未提交，本轮 commit。
 
-### 盘后 (main.yml / 00-daily-analysis.yml)
+## 修改文件
 
-| Workflow | UTC | Beijing |
-|----------|-----|---------|
-| `main.yml` | 8:00 | 16:00 |
-| `00-daily-analysis.yml` | 8:11 | 16:11 |
+**`.github/workflows/intraday-monitor.yml`** (+25/-1):
+- `timeout-minutes: 15` → `30`
+- DB 摘要新增 postmarket count + 最近 10 条 postmarket 记录
 
-concurrency: 盘中 `intraday-monitor`，盘后 `stock-analysis`，互不阻塞。
+## Review 项状态
 
-### Workflow 关键配置要点
+| # | Priority | Item | Status |
+|---|----------|------|--------|
+| 1 | critical | 盘后→盘中 DB 共享（dsa-data-*\* cache + artifact） | ✅ Phase 3 |
+| 2 | critical | `--analysis-phase postmarket` + CLI plumbing | ✅ Phase 3 |
+| 3 | major | `timeout-minutes: 15` → `30` | ✅ 本轮 commit |
+| 4 | major | DB 摘要增加 postmarket 查询 | ✅ 本轮 commit |
+| 5 | major | Preferred snapshot 不可用时不 fallback | ✅ Phase 4 |
+| 6 | minor | UTC 分支清理 | ⏸️ 暂缓 |
 
-- **Cache**: `actions/cache@v4`，key 前缀 `dsa-data-*`；snapshot 写/decision 读；盘后 restore→analyze→save 闭环
-- **Artifact**: 每次盘后上传 `data/stock_analysis.db`
-- **LLM fallback 环境变量映射**: 盘中 workflow env 区域需完整声明 9 项 `INTRADAY_LLM_FALLBACK_*`，API_KEY 从 secrets 读取，其余优先从 vars 读取
-- **DB 诊断**: 盘中/盘后均有数据库状态摘要步骤（Python try/except 非阻断），缺表时打印 `not ready`
-- **LLM 配置**: `LITELLM_CONFIG_YAML` 环境变量 + YAML 写入；`LITELLM_MODEL`/`LITELLM_API_KEY`/`GEMINI_API_KEY`
+## 验证
+- 无新代码改动（变更已在磁盘，仅首次 commit）
+- `.bug-fix-pipeline/plan.md` + `.omc/` 保留为本地产物，不入库
 
 ---
 
-## 五、Session Log
+### Session 19: 盘中决策备用 LLM 渠道 Fallback (2026-06-22)
 
-### Phase 1: 盘中监控核心 (Sessions 1-5, 2026-06-08~06-10)
-- Session 1: `intraday_monitor.py` 初始构建 (~1880 行)，LLM 决策 prompt，9 轮 bug fix
-- Session 2: Batch Prefetch 重构 — 逐股获取 → snapshot 级批量预取
-- Session 3: Batch-First 修复 — HK 部分命中补全、code normalize、Lock TTL 配置化
-- Session 4: 快照状态持久化 — `_run_snapshot_with_state_persistence`、防御性建表
-- Session 5: 正式决策绑定 `preferred_snapshot_id`、snapshot status 分级 (completed/partial/failed)
+## 改动概要
 
-### Phase 2: 链路修复与 Workflow 闭环 (Sessions 6-9, 2026-06-10~06-13)
-- Session 6: partial snapshot coverage gate、`--analysis-phase` CLI、cache key 统一 `dsa-data-*`
-- Session 7: 盘后 restore→analyze→save 闭环、DB 摘要 Python 非阻断诊断
-- Session 8: LLM 调用链统一 — 盘中从 `litellm.completion()` → `GeminiAnalyzer.generate_text()`
-- Session 9: 错误分类精化、INTRADAY_SYSTEM_PROMPT 配置、workflow env 一致性测试
+盘中决策链路新增可独立配置的备用 LLM 渠道：主 LLM 失败时自动按可配置条件重试备用 LLM，避免直接进入 LLM_FAILURE_ALERT。备用 LLM 使用 `litellm.completion()` 直接调用，不经过主 analyzer。
 
-### Phase 3: 系统加固 (Sessions 10-13, 2026-06-07~06-17)
-- Session 10: P0 analysis_phase 修复、进程重启不重置事件、严格日历、未知市场 fail-closed
-- Session 11: 港股代码大小写规范化、`src/utils/stock_code.py` 统一工具
-- Session 12: 大盘指数快照、个股全天走势、决策 prompt 增强
-- Session 13: 指数质量门禁、专用行情路由 (CN→AkShare, HK/US→yfinance)
+## 修改文件
 
-### Phase 4: 持久化与归档 (Sessions 14-18, 2026-06-17~06-18)
-- Session 14: 主库持久化优化 — code_norm 存储、热字段/payload 拆分、schema migration、归档 CLI
-- Session 17: 技术面历史结构化 — 4 张历史表、archive extractors、MarketDataRepository 统一查询
-- Session 18: Payload split 兼容修复 — extractor/repository LEFT JOIN、cutoff 边界 `<` 统一
-- Session 16: 主库补完 — 遗留大列置 NULL、分页查询、canonical 加载、backfill_phase1
-- Session 15: 决策邮件分组列表展示 — 买入/卖出止盈/卖出止损/观望 4 组、unusual_volume 附注
+**`src/config.py`** (+18 fields, +18 parsing lines):
+- Config 新增 9 个 `intraday_llm_fallback_*` 字段（enabled/protocol/base_url/api_key/model/temperature/max_tokens/timeout_sec/retry_on）
+- `from_env` 新增对应环境变量解析，temperature/max_tokens 可选值用预计算变量避免 `parse_env_float(None)` 崩溃
 
-### Phase 5: 备用 LLM 渠道 (Sessions 19-20, 2026-06-22)
-- Session 19: 主 LLM 失败 → 备用 LLM fallback 链路（`_call_llm_with_fallback`）、9 项独立配置、双失败分离告警、`.env.example` 示例
-- Session 20: Refinement review — 全部 9 项 issue 确认已在 Session 19 完整实现，无额外改动
+**`src/core/intraday_monitor.py`** (+200 lines):
+- `LLMResult` 扩展 6 个审计字段：provider/model/base_url_host/attempts/primary_error_message/fallback_error_message
+- 新增 `_call_llm_with_fallback()` 主备 LLM 编排
+- 新增 `_should_try_fallback_llm()` fallback 条件校验
+- 新增 `_call_fallback_llm()` 直接调用 litellm.completion() 实现
+- `_final_decision_locked()` 改用 `_call_llm_with_fallback()`；备用成功时邮件追加来源标注；失败时两路错误分别展示
+- `__init__` 增加 fallback 启动日志（显示 model/base_url_host/retry_on）
 
-### Phase 6: Decision 内容完整性 (Sessions 21, 2026-06-29)
-- decision 邮件截断修复：LLM finish_reason 检测 + `DecisionContentIntegrity` 完整性校验 + `_extract_stock_codes_from_decision_content` 股票覆盖率校验
-- Prompt 新增完整性协议 + sentinel 结束标记 `<!-- INTRADAY_DECISION_COMPLETE -->`
-- 截断后续写 3 策略（主 LLM 重试 → fallback → raw summary 兜底）
-- 邮件附件兜底：`send_to_email_with_attachments()`，长正文自动切换 summary+attachment 模式
-- 配置扩展：`INTRADAY_LLM_MAX_TOKENS` 默认 4096→8192；新增 8 项决策完整性/邮件配置
-- `GenerateTextResult` dataclass + `generate_text_with_metadata()` 暴露 finish_reason/usage
-- New tests: `tests/core/test_intraday_decision_content_integrity.py` (11 测试)
+**`.github/workflows/intraday-monitor.yml`** (+7 lines):
+- 增加 6 项 `INTRADAY_LLM_FALLBACK_*` 环境变量映射
 
-### Phase 6: Decision 内容完整性闭环 (Session 22, 2026-06-29)
-- Sentinel 交叉校验: 正则提取 expected/covered 并与程序计数比对，空 sentinel 正则修复
-- `CONTENT_INCOMPLETE_ALERT` 邮件类型: strict mode 下完整性失败 → `[内容不完整]` 告警
-- `_complete_missing_decision_sections()` 接入主链路: integrity fail → 补全 → 二次校验 → 发送
-- Fallback LLM finish_reason/usage 提取: `length`/`max_tokens` → `truncated_suspected=True`
-- `_save_decision_artifacts()`: 保存 raw/normalized/integrity JSON/HTML 4 文件到 logs/
-- `_build_decision_body_summary()`: section-boundary 切割取代 `content[:N]` 硬截断
-- 配置扩展: `INTRADAY_DECISION_STRICT_COMPLETENESS`; workflow 9 项变量透传
-- 5 项新测试: sentinel 值不匹配、无 sentinel not ok、分组统计、无 mid-Markdown 截断
+**`.env.example`** (+10 lines):
+- 增加 fallback 配置示例
 
-### Phase 6: 决策完整性最后一公里 (Session 23, 2026-06-29)
-- `_append_decision_complete_sentinel()`: 所有代码覆盖但 sentinel 缺失时程序追加 sentinel
-- Workflow 默认值变更: `STRICT_COMPLETENESS` → `true`, `EMAIL_BODY_MODE` → `summary_with_attachment`
-- `.env.example` 更新: 推荐生产 `STRICT_COMPLETENESS=true`, 新增 `EMAIL_BODY_MODE`/`EMAIL_ATTACH_FULL_REPORT` 示例
-- 2 项新测试: sentinel 自动追加、完整循环验证
+**`tests/test_intraday_monitor_llm_fallback.py`** (新文件, 174 行):
+- 3 个测试类、13 个测试方法：LLMResult 扩展字段、should_try_fallback 条件分支（6 种）、call_llm_with_fallback 主备切换（4 种）
 
----
-
-## 六、Known Issues (2 pre-existing)
-
-1. `test_expired_cache_returns_none` / `test_expired_ttl_returns_none` — cache TTL mock 行为不符
-2. Issue 6（常驻 scheduler 14:30 snapshot/decision 冲突）暂缓
+## 验证
+- 13 passed, 0 failed（新测试）
+- 编译检查：OK

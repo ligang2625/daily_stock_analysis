@@ -461,13 +461,6 @@ def _make_monitor(intraday_stocks: str = ""):
     config.intraday_min_quote_coverage = 0.8
     config.intraday_send_llm_failure_alert = True
     config.intraday_send_raw_summary_on_llm_failure = False
-    # New intraday config fields (Blocker 1 fix)
-    config.intraday_email_body_mode = 'full'
-    config.intraday_email_body_max_chars = 60000
-    config.intraday_email_attach_full_report = True
-    config.intraday_decision_completion_retry = 1
-    config.intraday_decision_completion_use_fallback = True
-    config.intraday_decision_append_raw_for_missing = True
 
     fetcher = MagicMock()
     db = MagicMock()
@@ -1572,22 +1565,13 @@ class TestCoverageGate:
 # ============================================================
 
 class TestCallLLM:
-    """_call_llm delegates to GeminiAnalyzer.generate_text_with_metadata() and returns LLMResult."""
+    """_call_llm delegates to GeminiAnalyzer.generate_text() and returns LLMResult."""
 
     @staticmethod
     def _make_mock_analyzer(available=True, text="Buy recommendation"):
-        from src.analyzer import GenerateTextResult
         mock_analyzer = MagicMock()
         type(mock_analyzer).is_available = MagicMock(return_value=available)
-        result = GenerateTextResult(
-            text=text,
-            model="test-model",
-            finish_reason="stop",
-            usage={},
-            response_chars=len(text),
-            completion_tokens=0,
-        )
-        mock_analyzer.generate_text_with_metadata.return_value = result
+        mock_analyzer.generate_text.return_value = text
         return mock_analyzer
 
     def test_success_returns_llm_result(self):
@@ -1600,9 +1584,7 @@ class TestCallLLM:
         result = monitor._call_llm("test prompt")
         assert result.status == "success"
         assert result.content == "Buy recommendation"
-        assert result.finish_reason == "stop"
-        assert result.response_chars == len("Buy recommendation")
-        analyzer.generate_text_with_metadata.assert_called_once_with(
+        analyzer.generate_text.assert_called_once_with(
             "test prompt",
             max_tokens=4096,
             temperature=0.7,
@@ -1635,7 +1617,7 @@ class TestCallLLM:
 
     def test_config_error_on_auth_exception(self):
         analyzer = self._make_mock_analyzer()
-        analyzer.generate_text_with_metadata.side_effect = Exception("AuthenticationError: invalid key")
+        analyzer.generate_text.side_effect = Exception("AuthenticationError: invalid key")
         monitor = _make_monitor()
         monitor._llm_analyzer = analyzer
         result = monitor._call_llm("test")
@@ -1644,7 +1626,7 @@ class TestCallLLM:
 
     def test_rate_limited_error(self):
         analyzer = self._make_mock_analyzer()
-        analyzer.generate_text_with_metadata.side_effect = Exception("rate_limit exceeded: 429")
+        analyzer.generate_text.side_effect = Exception("rate_limit exceeded: 429")
         monitor = _make_monitor()
         monitor._llm_analyzer = analyzer
         result = monitor._call_llm("test")
@@ -1652,7 +1634,7 @@ class TestCallLLM:
 
     def test_network_error_on_timeout(self):
         analyzer = self._make_mock_analyzer()
-        analyzer.generate_text_with_metadata.side_effect = Exception("connection timeout")
+        analyzer.generate_text.side_effect = Exception("connection timeout")
         monitor = _make_monitor()
         monitor._llm_analyzer = analyzer
         result = monitor._call_llm("test")
@@ -1660,7 +1642,7 @@ class TestCallLLM:
 
     def test_network_error_on_generic_exception(self):
         analyzer = self._make_mock_analyzer()
-        analyzer.generate_text_with_metadata.side_effect = Exception("something bad happened")
+        analyzer.generate_text.side_effect = Exception("something bad happened")
         monitor = _make_monitor()
         monitor._llm_analyzer = analyzer
         result = monitor._call_llm("test")
@@ -2340,7 +2322,7 @@ class TestSnapshotOneStockWithQuote:
                 assert saved.snapshot_id == "fallback_test_snap"
 
     def test_fallback_single_quote_success(self):
-        """_fallback_single_quote_without_bulk_sources with successful quote (price above buy zone)."""
+        """_fallback_single_quote_without_bulk_sources with successful quote."""
         monitor = _make_monitor(intraday_stocks="000001")
         monitor._email_sender = None
         mock_quote = MagicMock()
@@ -2356,8 +2338,7 @@ class TestSnapshotOneStockWithQuote:
             with patch.object(monitor, '_save_event') as mock_save:
                 monitor._fallback_single_quote_without_bulk_sources("000001", datetime.now())
                 saved = mock_save.call_args[0][0]
-                # price 105 > ideal_buy 100, not in any buy zone -> price_only is correct
-                assert saved.event_type == "price_only"
+                assert saved.event_type == "enter_ideal_buy"
                 assert saved.stock_code == "000001"
 
 

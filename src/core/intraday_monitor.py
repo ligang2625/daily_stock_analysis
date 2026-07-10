@@ -23,7 +23,6 @@ from __future__ import annotations
 import concurrent.futures
 import json
 import logging
-import re
 import threading
 import time
 from dataclasses import dataclass, field
@@ -130,25 +129,12 @@ class SnapshotState:
     market_dates: Dict[str, str] = field(default_factory=dict)
 
 
-@dataclass
-class DecisionContentIntegrity:
-    """Result of validating official decision content completeness."""
-    ok: bool
-    expected_codes: set
-    covered_codes: set
-    missing_codes: set
-    sentinel_ok: bool
-    truncated_suspected: bool
-    reason: str
-
-
 class EmailReportType(Enum):
     OFFICIAL_DECISION = "official_decision"
     DATA_QUALITY_ALERT = "data_quality_alert"
     LLM_FAILURE_ALERT = "llm_failure_alert"
     NO_BASELINE_ALERT = "no_baseline_alert"
     SNAPSHOT_INCOMPLETE_ALERT = "snapshot_incomplete_alert"
-    CONTENT_INCOMPLETE_ALERT = "content_incomplete_alert"
 
 
 @dataclass
@@ -162,20 +148,6 @@ class LLMResult:
     attempts: int = 1
     primary_error_message: Optional[str] = None
     fallback_error_message: Optional[str] = None
-    # Extended fields for dual-failure reporting
-    primary_status: Optional[str] = None  # status of primary (e.g. "rate_limited")
-    fallback_status: Optional[str] = None  # status of fallback (e.g. "network_error")
-    fallback_attempted: bool = False
-    fallback_skipped_reason: Optional[str] = None
-    # Truncation and integrity fields
-    finish_reason: Optional[str] = None  # "stop" | "length" | "max_tokens" | None
-    response_chars: int = 0
-    usage: Optional[Dict[str, Any]] = None
-    completion_tokens: int = 0
-    truncated_suspected: bool = False
-    expected_codes: Optional[set] = None
-    covered_codes: Optional[set] = None
-    missing_codes: Optional[set] = None
 
 
 class LLMConfigError(Exception):
@@ -503,21 +475,18 @@ class IntradayMonitor:
         self._current_snapshot_id: Optional[str] = None
 
         # Startup logging for fallback LLM config
-        fb_enabled = getattr(self._config, 'intraday_llm_fallback_enabled', False)
-        if fb_enabled:
-            fb_model = getattr(self._config, 'intraday_llm_fallback_model', None) or "not set"
+        if self._config.intraday_llm_fallback_enabled:
+            fb_model = self._config.intraday_llm_fallback_model or "not set"
             fb_host = "not set"
-            fb_base_url = getattr(self._config, 'intraday_llm_fallback_base_url', None)
-            if fb_base_url:
+            if self._config.intraday_llm_fallback_base_url:
                 try:
                     from urllib.parse import urlparse
-                    fb_host = urlparse(fb_base_url).netloc or "unknown"
+                    fb_host = urlparse(self._config.intraday_llm_fallback_base_url).netloc or "unknown"
                 except Exception:
                     fb_host = "parse-error"
-            fb_retry_on = getattr(self._config, 'intraday_llm_fallback_retry_on', '')
             logger.info(
                 "Fallback LLM enabled: model=%s base_url_host=%s retry_on=%s",
-                fb_model, fb_host, fb_retry_on,
+                fb_model, fb_host, self._config.intraday_llm_fallback_retry_on,
             )
         else:
             logger.info("Fallback LLM disabled")
@@ -1808,15 +1777,13 @@ class IntradayMonitor:
             market_timeline_stats=market_timeline_stats,
             historical_snapshot_count=historical_snapshot_count,
             relative_strength_summary=relative_strength_summary,
-            expected_codes=list({e.stock_code for e in all_events}),
         )
 
         # Call LLM via unified analyzer with fallback
         result = self._call_llm_with_fallback(prompt)
 
         if result.status == "success":
-            raw_content = result.content or ""
-            content = self._normalize_official_decision_content(raw_content)
+            content = self._normalize_official_decision_content(result.content or "")
             # Prepend fallback indicator if applicable
             if result.provider == "fallback":
                 fallback_lines = [
@@ -1826,147 +1793,31 @@ class IntradayMonitor:
                     "",
                 ]
                 content = "\n".join(fallback_lines) + content
-
-            # Build expected decision codes and validate completeness
-            completeness_enabled = getattr(self._config, 'intraday_decision_completeness_enabled', True)
-            integrity: Optional[DecisionContentIntegrity] = None
-            if completeness_enabled:
-                expected_scope = getattr(self._config, 'intraday_decision_expected_scope', 'events')
-                if expected_scope == 'valid_quotes':
-                    expected_decision_codes = set(snapshot.get("valid_quote_codes", []))
-                else:
-                    # Default: events
-                    expected_decision_codes = set(
-                        e.stock_code for e in all_events
-                    )
-                integrity = self._validate_official_decision_completeness(
-                    content, expected_decision_codes,
-                )
-                # Log integrity result
-                logger.info(
-                    "Decision content integrity: ok=%s expected=%d covered=%d missing=%d sentinel_ok=%s reason=%s",
-                    integrity.ok, len(integrity.expected_codes),
-                    len(integrity.covered_codes), len(integrity.missing_codes),
-                    integrity.sentinel_ok, integrity.reason,
-                )
-
-                # Auto-append sentinel when all codes covered but sentinel missing/invalid
-                if (
-                    not integrity.ok
-                    and not integrity.missing_codes
-                    and integrity.covered_codes == integrity.expected_codes
-                    and not integrity.truncated_suspected
-                ):
-                    logger.info(
-                        "All %d expected codes covered but sentinel missing/invalid. "
-                        "Auto-appending decision-complete sentinel.",
-                        len(integrity.expected_codes),
-                    )
-                    content = self._append_decision_complete_sentinel(content, integrity)
-                    integrity = self._validate_official_decision_completeness(
-                        content, expected_decision_codes,
-                    )
-                    logger.info(
-                        "After sentinel auto-append: integrity ok=%s sentinel_ok=%s",
-                        integrity.ok, integrity.sentinel_ok,
-                    )
-
-                # Attempt completion if integrity fails
-                if not integrity.ok and integrity.missing_codes:
-                    logger.warning(
-                        "Decision integrity failed. Attempting completion for %d missing codes.",
-                        len(integrity.missing_codes),
-                    )
-                    completed = self._complete_missing_decision_sections(
-                        {}, content, integrity.missing_codes,
-                    )
-                    if completed:
-                        content = self._normalize_official_decision_content(completed)
-                        # Re-validate after completion
-                        integrity = self._validate_official_decision_completeness(
-                            content, expected_decision_codes,
-                        )
-                        logger.info(
-                            "After completion: integrity ok=%s missing=%d reason=%s",
-                            integrity.ok, len(integrity.missing_codes), integrity.reason,
-                        )
-                    else:
-                        logger.warning("Decision completion failed; content remains incomplete.")
-
-                # Add coverage display to email header
-                coverage_lines = [
-                    f"> 决策覆盖: {len(integrity.covered_codes)}/{len(integrity.expected_codes)}",
-                    f"> 内容完整性: {'passed' if integrity.ok else integrity.reason}",
-                ]
-                if result.finish_reason:
-                    coverage_lines.append(
-                        f"> LLM finish_reason: {result.finish_reason} (chars={result.response_chars})"
-                    )
-                scope_label = {'events': '事件股票', 'valid_quotes': '有效行情股票'}.get(expected_scope, expected_scope)
-                coverage_lines.append(f"> 完整性范围: {scope_label}")
-                coverage_lines.append("")
-                content = "\n".join(coverage_lines) + "\n" + content
-
-            # Save decision artifacts for GitHub Actions tracing
-            self._save_decision_artifacts(
-                raw_content=raw_content,
-                normalized_content=content,
-                integrity=integrity,
-                llm_result=result,
+            self._send_decision_email(
+                content=content,
+                report_type=EmailReportType.OFFICIAL_DECISION,
                 snapshot_id=snapshot_id,
+                coverage_ratio=coverage_ratio,
+                valid_count=valid_count,
+                expected_count=expected_count,
+                failed_codes=failed_codes,
+                llm_status="success",
+                baseline_status=baseline_status,
+                market_dates=snapshot_market_dates,
+                market_index_coverage=mkt_coverage_info,
             )
-
-            # Determine email report type based on final integrity
-            strict_mode = getattr(self._config, 'intraday_decision_strict_completeness', False)
-            if integrity and not integrity.ok and strict_mode:
-                # Strict mode: block OFFICIAL_DECISION, send incomplete alert instead
-                report_type = EmailReportType.CONTENT_INCOMPLETE_ALERT
-                llm_email_status = "truncated" if result.truncated_suspected else "incomplete"
-                logger.warning(
-                    "Strict completeness mode: blocking OFFICIAL_DECISION due to integrity failure. "
-                    "Sending CONTENT_INCOMPLETE_ALERT instead."
-                )
-                self._send_decision_email(
-                    content=content,
-                    report_type=report_type,
-                    snapshot_id=snapshot_id,
-                    coverage_ratio=coverage_ratio,
-                    valid_count=valid_count,
-                    expected_count=expected_count,
-                    failed_codes=failed_codes,
-                    llm_status=llm_email_status,
-                    baseline_status=baseline_status,
-                    market_dates=snapshot_market_dates,
-                    market_index_coverage=mkt_coverage_info,
-                )
-            else:
-                # Normal path or non-strict: send OFFICIAL_DECISION with integrity info in header
-                self._send_decision_email(
-                    content=content,
-                    report_type=EmailReportType.OFFICIAL_DECISION,
-                    snapshot_id=snapshot_id,
-                    coverage_ratio=coverage_ratio,
-                    valid_count=valid_count,
-                    expected_count=expected_count,
-                    failed_codes=failed_codes,
-                    llm_status="success",
-                    baseline_status=baseline_status,
-                    market_dates=snapshot_market_dates,
-                    market_index_coverage=mkt_coverage_info,
-                )
         elif result.status == "config_error":
             logger.error("LLM config error, no email sent: %s", result.error_message)
             if getattr(self._config, 'intraday_send_llm_failure_alert', True):
                 # Build content with fallback details if available
                 if result.fallback_error_message:
-                    fallback_status_display = result.fallback_status or "config_error"
                     fail_content = (
                         f"## LLM 调用失败（配置错误）\n\n"
                         f"### 主 LLM\n"
-                        f"- 状态: {result.primary_status or 'config_error'}\n"
+                        f"- 状态: config_error\n"
                         f"- 错误: {result.primary_error_message or result.error_message}\n\n"
                         f"### 备用 LLM\n"
-                        f"- 状态: {fallback_status_display}\n"
+                        f"- 状态: config_error\n"
                         f"- 错误: {result.fallback_error_message}\n"
                         f"- 模型: {result.model or 'N/A'}\n\n"
                         f"### 建议检查\n"
@@ -1976,14 +1827,13 @@ class IntradayMonitor:
                         f"- INTRADAY_LLM_FALLBACK_MODEL\n"
                     )
                 elif result.provider == "fallback":
-                    skip_reason = getattr(result, 'fallback_skipped_reason', None) or "配置不完整或未启用"
                     fail_content = (
                         f"## LLM 调用失败\n\n"
                         f"### 主 LLM\n"
-                        f"- 状态: {result.primary_status or 'config_error'}\n"
+                        f"- 状态: config_error\n"
                         f"- 错误: {result.primary_error_message or result.error_message}\n\n"
                         f"### 备用 LLM\n"
-                        f"- 未尝试（{skip_reason}）\n"
+                        f"- 未尝试（配置不完整或未启用）\n"
                     )
                 else:
                     fail_content = f"LLM调用失败（配置错误），请检查模型配置。\n错误: {result.error_message}"
@@ -2002,28 +1852,26 @@ class IntradayMonitor:
             # network_error, rate_limited, empty_response
             if getattr(self._config, 'intraday_send_llm_failure_alert', True):
                 if result.fallback_error_message:
-                    # Both primary and fallback failed — show separate statuses
-                    fallback_status_display = result.fallback_status or result.status
+                    # Both primary and fallback failed
                     raw = (
                         f"## LLM 调用失败\n\n"
                         f"### 主 LLM\n"
-                        f"- 状态: {result.primary_status or result.status}\n"
+                        f"- 状态: {result.status}\n"
                         f"- 错误: {result.primary_error_message or result.error_message}\n\n"
                         f"### 备用 LLM\n"
-                        f"- 状态: {fallback_status_display}\n"
+                        f"- 状态: {result.status}\n"
                         f"- 错误: {result.fallback_error_message}\n"
                         f"- 模型: {result.model or 'N/A'}\n"
                         f"- 主机: {result.base_url_host or 'N/A'}\n"
                     )
                 elif result.provider == "fallback":
-                    skip_reason = getattr(result, 'fallback_skipped_reason', None) or "配置不完整或未启用"
                     raw = (
                         f"## LLM 调用失败\n\n"
                         f"### 主 LLM\n"
-                        f"- 状态: {result.primary_status or result.status}\n"
+                        f"- 状态: {result.status}\n"
                         f"- 错误: {result.primary_error_message or result.error_message}\n\n"
                         f"### 备用 LLM\n"
-                        f"- 未尝试（{skip_reason}）\n"
+                        f"- 未尝试（配置不完整或未启用）\n"
                     )
                 else:
                     if getattr(self._config, 'intraday_send_raw_summary_on_llm_failure', False):
@@ -2044,7 +1892,7 @@ class IntradayMonitor:
                 )
 
     def _call_llm(self, prompt: str) -> LLMResult:
-        """Call LLM via the unified GeminiAnalyzer.generate_text_with_metadata() pipeline.
+        """Call LLM via the unified GeminiAnalyzer.generate_text() pipeline.
 
         Uses the injected or lazily-initialized analyzer so that model
         resolution, Router, API keys, fallback, and retry logic are all
@@ -2052,9 +1900,6 @@ class IntradayMonitor:
 
         Passes explicit max_tokens, temperature, and system_prompt to prevent
         report truncation and ensure consistent generation parameters.
-
-        Returns an LLMResult with finish_reason, response_chars, usage, and
-        completion_tokens populated for truncation detection.
         """
         try:
             analyzer = self._get_llm_analyzer()
@@ -2069,7 +1914,7 @@ class IntradayMonitor:
             )
 
         try:
-            result = analyzer.generate_text_with_metadata(
+            text = analyzer.generate_text(
                 prompt,
                 max_tokens=self._config.intraday_llm_max_tokens,
                 temperature=self._config.llm_temperature,
@@ -2080,27 +1925,10 @@ class IntradayMonitor:
         except Exception as exc:
             return self._classify_llm_error(exc)
 
-        if result is None or not result.text or not result.text.strip():
+        if not text or not text.strip():
             return LLMResult(status="empty_response", error_message="Empty response from LLM")
 
-        # Detect truncation
-        finish_reason = result.finish_reason
-        truncated = finish_reason in ("length", "max_tokens")
-        if truncated:
-            logger.warning(
-                "LLM response truncated: finish_reason=%s chars=%d tokens=%d",
-                finish_reason, result.response_chars, result.completion_tokens,
-            )
-
-        return LLMResult(
-            status="success",
-            content=str(result.text),
-            finish_reason=finish_reason,
-            response_chars=result.response_chars,
-            usage=result.usage,
-            completion_tokens=result.completion_tokens,
-            truncated_suspected=truncated,
-        )
+        return LLMResult(status="success", content=str(text))
 
     def _classify_llm_error(self, exc: Exception) -> LLMResult:
         """Classify an LLM exception into an LLMResult with appropriate status."""
@@ -2148,120 +1976,58 @@ class IntradayMonitor:
         return False
 
     def _call_llm_with_fallback(self, prompt: str) -> LLMResult:
-        """Call primary LLM, fall back to backup LLM on failure or truncation if configured."""
+        """Call primary LLM, fall back to backup LLM on failure if configured."""
         primary = self._call_llm(prompt)
         primary.provider = "primary"
-        primary.primary_status = primary.status
-
-        # Truncation is treated as a retryable condition
-        if primary.status == "success" and primary.truncated_suspected:
-            logger.warning(
-                "Primary LLM truncated: finish_reason=%s chars=%d. Will attempt fallback retry.",
-                primary.finish_reason, primary.response_chars,
-            )
-            # Fall through to fallback attempt below
-        elif primary.status == "success":
-            primary.fallback_attempted = False
+        if primary.status == "success":
             return primary
 
-        # Check if we should try fallback (for error statuses or truncation)
-        try_fallback = False
-        if primary.status != "success":
-            try_fallback = self._should_try_fallback_llm(primary.status)
-        elif primary.truncated_suspected:
-            try_fallback = self._should_try_fallback_llm(primary.status)
-
-        if not try_fallback:
-            primary.fallback_attempted = False
-            primary.fallback_skipped_reason = getattr(self, '_fallback_skipped_reason', None)
+        if not self._should_try_fallback_llm(primary.status):
             return primary
 
-        # Fallback attempted
-        self._fallback_attempted = True
         fallback = self._call_fallback_llm(prompt, primary)
         if fallback.status == "success":
             fallback.provider = "fallback"
             fallback.primary_error_message = primary.error_message
             fallback.attempts = primary.attempts + fallback.attempts
-            fallback.fallback_attempted = True
             logger.info(
                 "Fallback LLM succeeded. provider=%s model=%s base_url=%s",
                 fallback.provider, fallback.model, fallback.base_url_host,
             )
             return fallback
 
-        # Both failed — merge errors with separate statuses
-        # If primary truncated and fallback also failed, flag it
-        if primary.truncated_suspected:
-            merged_status = "truncated_response"
-            merged_error = (
-                f"主LLM截断: {primary.finish_reason or 'unknown'}; "
-                f"备用LLM: {fallback.error_message}"
-            )
-        else:
-            merged_status = primary.status
-            merged_error = f"主LLM: {primary.error_message}; 备用LLM: {fallback.error_message}"
-
+        # Both failed — merge errors
         merged = LLMResult(
-            status=merged_status,
-            fallback_status=fallback.status,
+            status=primary.status,
             content=None,
-            error_message=merged_error,
+            error_message=f"主LLM: {primary.error_message}; 备用LLM: {fallback.error_message}",
             provider="fallback",
             model=fallback.model,
             base_url_host=fallback.base_url_host,
             attempts=primary.attempts + fallback.attempts,
             primary_error_message=primary.error_message,
             fallback_error_message=fallback.error_message,
-            primary_status=primary.status,
-            truncated_suspected=primary.truncated_suspected,
-            fallback_attempted=True,
         )
         return merged
 
     def _should_try_fallback_llm(self, primary_status: str) -> bool:
-        """Check whether fallback LLM should be attempted based on config and primary status.
-
-        Validates: enabled, model, api_key, base_url (with scheme check), protocol.
-        Sets self._fallback_skipped_reason on False returns for diagnostics.
-        """
-        self._fallback_skipped_reason = None
+        """Check whether fallback LLM should be attempted based on config and primary status."""
         config = self._config
-        if not getattr(config, 'intraday_llm_fallback_enabled', False):
-            self._fallback_skipped_reason = "fallback disabled (INTRADAY_LLM_FALLBACK_ENABLED=false)"
+        if not config.intraday_llm_fallback_enabled:
             logger.info("Fallback LLM disabled (INTRADAY_LLM_FALLBACK_ENABLED=false)")
             return False
-        if not getattr(config, 'intraday_llm_fallback_model', None) or not getattr(config, 'intraday_llm_fallback_api_key', None):
-            self._fallback_skipped_reason = "incomplete config: model or api_key missing"
+        if not config.intraday_llm_fallback_model or not config.intraday_llm_fallback_api_key:
             logger.warning(
                 "Fallback LLM enabled but incomplete config: model=%s api_key=%s",
-                getattr(config, 'intraday_llm_fallback_model', None),
-                "set" if getattr(config, 'intraday_llm_fallback_api_key', None) else "missing",
+                config.intraday_llm_fallback_model,
+                "set" if config.intraday_llm_fallback_api_key else "missing",
             )
-            return False
-        # Validate base_url is present and has valid scheme
-        fb_base_url = getattr(config, 'intraday_llm_fallback_base_url', None)
-        if not fb_base_url or not fb_base_url.strip():
-            self._fallback_skipped_reason = "base_url missing or empty"
-            logger.warning("Fallback LLM skipped: base_url is missing or empty")
-            return False
-        if not (fb_base_url.startswith("http://") or fb_base_url.startswith("https://")):
-            self._fallback_skipped_reason = f"base_url has invalid scheme (must be http:// or https://)"
-            logger.warning("Fallback LLM skipped: base_url has invalid scheme (no http:// or https://)")
-            return False
-        # Validate protocol
-        fb_protocol = getattr(config, 'intraday_llm_fallback_protocol', 'openai')
-        if fb_protocol != "openai":
-            self._fallback_skipped_reason = f"unsupported protocol: {fb_protocol} (only 'openai' supported)"
-            logger.warning("Fallback LLM skipped: unsupported protocol=%s", fb_protocol)
             return False
         # Check if this status qualifies for retry
         retry_on = set(
-            s.strip() for s in getattr(config, 'intraday_llm_fallback_retry_on', '').split(",") if s.strip()
+            s.strip() for s in config.intraday_llm_fallback_retry_on.split(",") if s.strip()
         )
         should_retry = primary_status in retry_on
-        if not should_retry:
-            self._fallback_skipped_reason = f"primary_status={primary_status} not in retry_on={retry_on}"
         logger.info(
             "Fallback decision: status=%s retry_on=%s should_retry=%s",
             primary_status, retry_on, should_retry,
@@ -2271,16 +2037,10 @@ class IntradayMonitor:
     def _call_fallback_llm(self, prompt: str, primary_result: LLMResult) -> LLMResult:
         """Call the fallback LLM using direct litellm.completion()."""
         config = self._config
-        fallback_model = getattr(config, 'intraday_llm_fallback_model', None) or ""
-        fallback_api_key = getattr(config, 'intraday_llm_fallback_api_key', None) or ""
-        fallback_base_url = getattr(config, 'intraday_llm_fallback_base_url', None) or ""
-        fallback_timeout = getattr(config, 'intraday_llm_fallback_timeout_sec', 60)
-        fallback_protocol = getattr(config, 'intraday_llm_fallback_protocol', 'openai')
-
-        # Ensure model name has provider prefix for openai protocol
-        if fallback_protocol == "openai" and fallback_model and "/" not in fallback_model:
-            fallback_model = f"openai/{fallback_model}"
-            logger.info("Added openai/ prefix to fallback model: %s", fallback_model)
+        fallback_model = config.intraday_llm_fallback_model or ""
+        fallback_api_key = config.intraday_llm_fallback_api_key or ""
+        fallback_base_url = config.intraday_llm_fallback_base_url or ""
+        fallback_timeout = config.intraday_llm_fallback_timeout_sec
 
         # Determine max_tokens
         fallback_max_tokens = config.intraday_llm_fallback_max_tokens or config.intraday_llm_max_tokens
@@ -2318,23 +2078,6 @@ class IntradayMonitor:
                 timeout=fallback_timeout,
             )
             text = response.choices[0].message.content if response.choices else None
-            # Extract finish_reason and usage for truncation detection
-            finish_reason = None
-            completion_tokens = 0
-            usage = None
-            try:
-                finish_reason = getattr(response.choices[0], 'finish_reason', None)
-                if hasattr(response, 'usage') and response.usage:
-                    usage = response.usage
-                    completion_tokens = getattr(usage, 'completion_tokens', 0)
-                elif hasattr(response, 'model_extra') and response.model_extra:
-                    extra = response.model_extra
-                    usage = extra.get('usage')
-                    if usage:
-                        completion_tokens = usage.get('completion_tokens', 0) if isinstance(usage, dict) else getattr(usage, 'completion_tokens', 0)
-            except Exception:
-                pass
-
             if not text or not text.strip():
                 logger.warning("Fallback LLM returned empty response")
                 return LLMResult(
@@ -2344,26 +2087,13 @@ class IntradayMonitor:
                     base_url_host=base_url_host,
                     provider="fallback",
                 )
-
-            # Detect truncation
-            truncated = finish_reason in ("length", "max_tokens")
-            if truncated:
-                logger.warning(
-                    "Fallback LLM response truncated: finish_reason=%s chars=%d tokens=%d",
-                    finish_reason, len(str(text)), completion_tokens,
-                )
-
-            logger.info("Fallback LLM call succeeded: model=%s finish_reason=%s", fallback_model, finish_reason)
+            logger.info("Fallback LLM call succeeded: model=%s", fallback_model)
             return LLMResult(
                 status="success",
                 content=str(text),
                 model=fallback_model,
                 base_url_host=base_url_host,
                 provider="fallback",
-                finish_reason=str(finish_reason) if finish_reason else None,
-                response_chars=len(str(text)),
-                completion_tokens=completion_tokens,
-                truncated_suspected=truncated,
             )
         except Exception as exc:
             error_str = str(exc)
@@ -2421,17 +2151,12 @@ class IntradayMonitor:
         if not raw_content:
             return raw_content
 
-        # Check if already in grouped format (with wider matching)
+        # Check if already in grouped format
         grouped_headers = [
             "买入信号相关股票",
             "卖出信号相关股票（止盈）",
             "卖出信号相关股票（止损）",
-            "卖出信号相关股票(止盈)",
-            "卖出信号相关股票(止损)",
             "观望/无法判断",
-            "观望 / 无法判断",
-            "观望 无法判断",
-            "买入信号", "卖出止盈", "卖出止损", "观望",
         ]
         if any(h in raw_content for h in grouped_headers):
             lines = raw_content.split("\n")
@@ -2529,427 +2254,6 @@ class IntradayMonitor:
         logger.warning("Cannot normalize decision content: no recognized format found")
         return raw_content
 
-    @staticmethod
-    def _extract_stock_codes_from_decision_content(content: str) -> set:
-        """Extract stock codes from decision content text.
-
-        Supports multiple code formats:
-        - A股: 6-digit codes (600xxx, 000xxx, 300xxx, 601xxx, 603xxx, 002xxx)
-        - 港股: HK-prefixed codes (HK00700, hk00700)
-        - 美股: uppercase tickers (AAPL, TSLA)
-        - 名称(代码) and 名称（代码） patterns
-        - Plain codes embedded in text
-
-        Returns a set of normalized stock code strings (uppercase).
-        """
-        import re as _re
-        codes: set = set()
-
-        patterns: list = [
-            # 名称(代码) or **名称（代码）** — full-width or half-width brackets
-            _re.compile(r'[*_]{0,2}[^(（\s]+[（(]\s*([A-Za-z]{0,6}\d{5,6})\s*[)）]'),
-            # Plain A股 6-digit codes (standalone)
-            _re.compile(r'\b([36]0[012]\d{3}|00[0123]\d{3}|60[013]\d{3})\b'),
-            # HK codes: HKxxxxx or hkxxxxx (preserve HK prefix)
-            _re.compile(r'\b([Hh][Kk]\d{5,6})\b'),
-            # US tickers (uppercase letters, at least 2, typically not pure digits)
-            _re.compile(r'\b([A-Z]{2,6})\b'),
-        ]
-
-        # Common markdown keywords to filter out
-        _filter_keywords = {
-            'INTRADAY', 'DECISION', 'COMPLETE', 'COVERED', 'EXPECTED', 'LLM', 'API',
-            'HTML', 'HTTP', 'HTTPS', 'JSON', 'CSV', 'XML', 'NOTE', 'TODO',
-        }
-
-        for pat in patterns:
-            for m in pat.finditer(content):
-                if m.lastindex:
-                    code = m.group(1).upper().strip()
-                else:
-                    code = m.group(0).upper().strip()
-                # Filter obvious non-code matches
-                if not code or code.startswith('<!--'):
-                    continue
-                # Allow shorter codes for US tickers (2-6 alpha chars)
-                if code in _filter_keywords:
-                    continue
-                if code not in codes:
-                    codes.add(code)
-
-        return codes
-
-    def _validate_official_decision_completeness(
-        self,
-        content: str,
-        expected_codes: set,
-    ) -> DecisionContentIntegrity:
-        """Validate that a decision content covers all expected stock codes.
-
-        Checks:
-        1. Sentinel line: <!-- INTRADAY_DECISION_COMPLETE expected={N} covered={N} -->
-        2. Stock code coverage in content (extracted codes vs expected_codes)
-        3. Sentinel cross-validation: sentinel's expected/covered must match
-           programmatic counts
-        4. Truncation suspicion based on sentinel absence or mismatch
-
-        Returns a DecisionContentIntegrity dataclass.
-        """
-        # Check sentinel
-        sentinel_pattern = re.compile(
-            r'<!--\s*INTRADAY_DECISION_COMPLETE\s+expected=(\d+)\s+covered=(\d+)\s*-->'
-        )
-        sentinel_match = sentinel_pattern.search(content)
-        sentinel_ok = sentinel_match is not None
-        sentinel_expected = None
-        sentinel_covered = None
-        sentinel_values_match = False
-
-        if sentinel_match:
-            try:
-                sentinel_expected = int(sentinel_match.group(1))
-                sentinel_covered = int(sentinel_match.group(2))
-            except (ValueError, IndexError):
-                sentinel_expected = None
-                sentinel_covered = None
-
-        # Extract covered codes from content
-        covered_codes = IntradayMonitor._extract_stock_codes_from_decision_content(content)
-
-        # Cross-reference with expected codes (normalize for comparison)
-        expected_normalized = {c.upper().strip() for c in expected_codes}
-        covered_normalized = {c.upper().strip() for c in covered_codes}
-        missing_codes = expected_normalized - covered_normalized
-
-        # Cross-validate sentinel values against programmatic counts
-        if sentinel_match and sentinel_expected is not None:
-            sentinel_values_match = (
-                sentinel_expected == len(expected_normalized)
-                and sentinel_covered == len(covered_normalized)
-            )
-
-        # Sentinel is only valid if values match programmatic counts
-        effective_sentinel_ok = sentinel_ok and sentinel_values_match
-
-        # Truncation suspicion: either no sentinel, sentinel values mismatch,
-        # or significant coverage gap
-        truncated_suspected = (
-            not effective_sentinel_ok
-            and len(missing_codes) > max(len(expected_normalized) * 0.2, 1)
-        )
-
-        ok = len(missing_codes) == 0 and effective_sentinel_ok
-
-        reason_parts: list = []
-        if not sentinel_ok:
-            reason_parts.append("缺少完整性标记")
-        elif not sentinel_values_match:
-            reason_parts.append(
-                f"sentinel值不匹配: expected={sentinel_expected} covered={sentinel_covered} "
-                f"(实际 expected={len(expected_normalized)} covered={len(covered_normalized)})"
-            )
-        if missing_codes:
-            reason_parts.append(f"缺失股票: {sorted(missing_codes)}")
-        if truncated_suspected:
-            reason_parts.append("疑似截断")
-
-        return DecisionContentIntegrity(
-            ok=ok,
-            expected_codes=expected_normalized,
-            covered_codes=covered_normalized,
-            missing_codes=missing_codes,
-            sentinel_ok=effective_sentinel_ok,
-            truncated_suspected=truncated_suspected,
-            reason="; ".join(reason_parts) if reason_parts else "passed",
-        )
-
-    def _append_decision_complete_sentinel(
-        self,
-        content: str,
-        integrity: DecisionContentIntegrity,
-    ) -> str:
-        """Append a valid sentinel line when all expected codes are covered
-        but the sentinel is missing or invalid.
-
-        This handles the case where the LLM covered every stock but failed to
-        emit the INTRADAY_DECISION_COMPLETE sentinel comment (or emitted one
-        with incorrect counts).  Rather than blocking the decision in strict
-        mode, we programmatically append the correct sentinel.
-        """
-        sentinel = (
-            f"<!-- INTRADAY_DECISION_COMPLETE "
-            f"expected={len(integrity.expected_codes)} "
-            f"covered={len(integrity.covered_codes)} -->"
-        )
-        return content.rstrip() + "\n\n" + sentinel + "\n"
-
-    def _complete_missing_decision_sections(
-        self,
-        prompt_context: Dict[str, Any],
-        partial_content: str,
-        missing_codes: set,
-    ) -> Optional[str]:
-        """Attempt to complete truncated decision content for missing stock codes.
-
-        Strategy:
-        1. Retry primary LLM with continuation prompt (only missing codes)
-        2. Fallback LLM (if configured)
-        3. Deterministic raw summary append
-
-        Returns merged content on success, or None if completion failed.
-        """
-        retry_count = getattr(self._config, 'intraday_decision_completion_retry', 1)
-        if retry_count <= 0:
-            return None
-
-        covered_codes = partial_content and self._extract_stock_codes_from_decision_content(partial_content) or set()
-        continuation_prompt = (
-            "上一轮盘中 decision 输出不完整。已覆盖股票：" + ", ".join(sorted(covered_codes)) + "\n"
-            "请只为以下缺失股票生成建议，不要重复已覆盖股票：" + ", ".join(sorted(missing_codes)) + "\n"
-            "沿用同样四个分组标题；如果某组没有缺失股票，写（无）。\n"
-        )
-
-        # Try primary LLM completion
-        logger.info(
-            "Attempting decision completion: missing=%d retry_count=%d",
-            len(missing_codes), retry_count,
-        )
-        for attempt in range(retry_count):
-            logger.info("Completion attempt %d/%d", attempt + 1, retry_count)
-            result = self._call_llm(continuation_prompt)
-            if result.status == "success" and result.content:
-                merged = partial_content + "\n\n## 补全: 缺失股票\n\n" + result.content
-                logger.info(
-                    "Completion succeeded on attempt %d: chars=%d",
-                    attempt + 1, len(merged),
-                )
-                return merged
-            logger.warning("Completion attempt %d failed: status=%s", attempt + 1, result.status)
-
-        # Try fallback LLM for missing codes
-        use_fallback = getattr(self._config, 'intraday_decision_completion_use_fallback', True)
-        if use_fallback and self._should_try_fallback_llm("empty_response"):
-            logger.info("Attempting fallback LLM for completion")
-            fallback = self._call_fallback_llm(
-                continuation_prompt,
-                LLMResult(status="empty_response", error_message="completion needed"),
-            )
-            if fallback.status == "success" and fallback.content:
-                merged = partial_content + "\n\n## 补全（备用LLM）: 缺失股票\n\n" + fallback.content
-                logger.info("Fallback completion succeeded: chars=%d", len(merged))
-                return merged
-
-        # Deterministic raw summary append
-        append_raw = getattr(self._config, 'intraday_decision_append_raw_for_missing', True)
-        if append_raw:
-            raw_lines = [
-                "\n\n## 原始数据补充: 缺失股票",
-                "",
-                "以下股票在 LLM 决策中缺失，以下为原始数据摘要：",
-                "",
-            ]
-            raw_lines.append("| 股票 | 价格 | 量比 | 涨跌幅 | 事件类型 |")
-            raw_lines.append("|------|------|------|--------|----------|")
-            for miss_code in sorted(missing_codes):
-                raw_lines.append(f"| {miss_code} | - | - | - | 数据缺失 |")
-            logger.info("Appended raw summary for %d missing codes", len(missing_codes))
-            return partial_content + "\n".join(raw_lines)
-
-        return None
-
-    def _save_decision_artifacts(
-        self,
-        *,
-        raw_content: str,
-        normalized_content: str,
-        integrity: Optional[DecisionContentIntegrity],
-        llm_result: LLMResult,
-        snapshot_id: Optional[str],
-    ) -> None:
-        """Save decision artifacts to logs/ for GitHub Actions artifact capture.
-
-        Writes:
-        - logs/intraday_decision_raw_{snapshot_id}.md
-        - logs/intraday_decision_normalized_{snapshot_id}.md
-        - logs/intraday_decision_integrity_{snapshot_id}.json
-        - logs/intraday_decision_{snapshot_id}.html
-
-        These artifacts allow tracing whether truncation/corruption happened at
-        the LLM, normalizer, HTML converter, SMTP, or email client level.
-        """
-        import os as _os
-        import json as _json
-
-        log_dir = getattr(self._config, 'log_dir', './logs')
-        try:
-            _os.makedirs(log_dir, exist_ok=True)
-        except OSError:
-            logger.debug("Cannot create log_dir=%s for decision artifacts", log_dir)
-            return
-
-        sid = snapshot_id or 'latest'
-
-        # Raw LLM response
-        try:
-            raw_path = _os.path.join(log_dir, f"intraday_decision_raw_{sid}.md")
-            with open(raw_path, 'w', encoding='utf-8') as f:
-                f.write(raw_content)
-            logger.info("Decision raw artifact saved: %s (%d chars)", raw_path, len(raw_content))
-        except Exception as exc:
-            logger.debug("Failed to save raw artifact: %s", exc)
-
-        # Normalized decision content
-        try:
-            norm_path = _os.path.join(log_dir, f"intraday_decision_normalized_{sid}.md")
-            with open(norm_path, 'w', encoding='utf-8') as f:
-                f.write(normalized_content)
-            logger.info("Decision normalized artifact saved: %s (%d chars)", norm_path, len(normalized_content))
-        except Exception as exc:
-            logger.debug("Failed to save normalized artifact: %s", exc)
-
-        # Integrity JSON
-        if integrity is not None:
-            try:
-                integrity_path = _os.path.join(log_dir, f"intraday_decision_integrity_{sid}.json")
-                integrity_data = {
-                    "ok": integrity.ok,
-                    "expected_codes": sorted(integrity.expected_codes),
-                    "covered_codes": sorted(integrity.covered_codes),
-                    "missing_codes": sorted(integrity.missing_codes),
-                    "sentinel_ok": integrity.sentinel_ok,
-                    "truncated_suspected": integrity.truncated_suspected,
-                    "reason": integrity.reason,
-                    "llm_finish_reason": llm_result.finish_reason,
-                    "llm_response_chars": llm_result.response_chars,
-                    "llm_completion_tokens": llm_result.completion_tokens,
-                    "llm_provider": llm_result.provider,
-                    "raw_chars": len(raw_content),
-                    "normalized_chars": len(normalized_content),
-                    "snapshot_id": sid,
-                }
-                with open(integrity_path, 'w', encoding='utf-8') as f:
-                    _json.dump(integrity_data, f, ensure_ascii=False, indent=2)
-                logger.info("Decision integrity artifact saved: %s", integrity_path)
-            except Exception as exc:
-                logger.debug("Failed to save integrity artifact: %s", exc)
-
-        # Rendered HTML
-        try:
-            from src.formatters import markdown_to_html_document
-            html_content = markdown_to_html_document(normalized_content)
-            html_path = _os.path.join(log_dir, f"intraday_decision_{sid}.html")
-            with open(html_path, 'w', encoding='utf-8') as f:
-                f.write(html_content)
-            logger.info("Decision HTML artifact saved: %s (%d chars)", html_path, len(html_content))
-        except Exception as exc:
-            logger.debug("Failed to save HTML artifact: %s", exc)
-
-    @staticmethod
-    def _build_decision_body_summary(content: str, max_chars: int) -> str:
-        """Build a safe summary of decision content without mid-Markdown truncation.
-
-        Strategy:
-        1. Extract group stats (counts per category)
-        2. Preserve the header block (coverage lines, blockquote metadata) in full
-        3. Include the first N group sections up to max_chars, cutting only at
-           section boundaries
-        4. Append a note about the full attachment
-
-        This avoids the jarring "mid-sentence cutoff" look of hard slicing.
-        """
-        if len(content) <= max_chars:
-            return content
-
-        lines = content.split("\n")
-
-        # Extract header block (blockquote lines starting with "> ")
-        header_lines: list = []
-        body_start = 0
-        for i, line in enumerate(lines):
-            if line.startswith("> ") or line.strip() == ">" or line.strip() == "":
-                header_lines.append(line)
-                body_start = i + 1
-            elif line.startswith("#") or line.startswith("##"):
-                break
-            else:
-                body_start = i
-                break
-
-        header_text = "\n".join(header_lines).rstrip()
-
-        # Count stocks per group in the full content
-        buy_count = 0
-        tp_count = 0
-        sl_count = 0
-        watch_count = 0
-        buy_re = re.compile(r'^\s*[-*]\s+\*{0,2}[^：:]+[：:].*买入')
-        tp_re = re.compile(r'^\s*[-*]\s+\*{0,2}[^：:]+[：:].*(止盈|收盈)')
-        sl_re = re.compile(r'^\s*[-*]\s+\*{0,2}[^：:]+[：:].*止损')
-        for line in lines:
-            if buy_re.search(line):
-                buy_count += 1
-            elif tp_re.search(line):
-                tp_count += 1
-            elif sl_re.search(line):
-                sl_count += 1
-
-        # Watch = items in watch section that aren't already counted
-        in_watch = False
-        for line in lines:
-            if "观望" in line and ("###" in line or "##" in line):
-                in_watch = True
-                continue
-            if in_watch and line.strip().startswith("#"):
-                in_watch = False
-                continue
-            if in_watch and (line.strip().startswith("- **") or line.strip().startswith("* **")):
-                if not buy_re.search(line) and not tp_re.search(line) and not sl_re.search(line):
-                    watch_count += 1
-
-        # Build summary block
-        summary_parts = [
-            header_text,
-            "",
-            "## 分组统计",
-            f"- 买入: {buy_count}",
-            f"- 止盈: {tp_count}",
-            f"- 止损: {sl_count}",
-            f"- 观望: {watch_count}",
-            "",
-            "---",
-            "",
-        ]
-        summary_header = "\n".join(summary_parts)
-
-        # Now append body up to remaining chars, cutting only at section boundaries
-        remaining = max_chars - len(summary_header) - 200  # 200 for closing note
-        body_lines = lines[body_start:]
-
-        # Find safe cut point: last complete section before remaining limit
-        accumulated = 0
-        cut_idx = 0
-        section_start = 0
-        for i, line in enumerate(body_lines):
-            accumulated += len(line) + 1  # +1 for newline
-            if accumulated <= remaining:
-                cut_idx = i + 1
-            # Track section boundaries
-            if line.startswith("### ") or line.startswith("## "):
-                if accumulated <= remaining:
-                    section_start = i
-                else:
-                    break
-
-        safe_body = "\n".join(body_lines[:section_start]) if section_start > 0 else "\n".join(body_lines[:cut_idx])
-
-        closing = (
-            "\n\n---\n"
-            "> 正文较长，完整报告见附件 intraday_decision.md 和 intraday_decision.html。\n"
-            "> 完整内容也可从 GitHub Actions artifact 获取。\n"
-        )
-
-        return summary_header + safe_body + closing
-
     def _send_decision_email(
         self,
         content: str,
@@ -2977,7 +2281,6 @@ class IntradayMonitor:
             EmailReportType.LLM_FAILURE_ALERT: "[LLM故障告警] 盘中监控",
             EmailReportType.NO_BASELINE_ALERT: "[无基线告警] 盘中监控",
             EmailReportType.SNAPSHOT_INCOMPLETE_ALERT: "[快照未完成告警] 盘中监控",
-            EmailReportType.CONTENT_INCOMPLETE_ALERT: "[内容不完整] 盘中监控",
         }
         prefix = prefix_map.get(report_type, "盘中监控通知")
         subject = prefix
@@ -3013,69 +2316,15 @@ class IntradayMonitor:
             content = "\n".join(summary_lines) + "\n" + content
 
         try:
-            # Check body size for attachment mode
-            body_mode = getattr(self._config, 'intraday_email_body_mode', 'full')
-            body_max_chars = getattr(self._config, 'intraday_email_body_max_chars', 60000)
-            attach_full = getattr(self._config, 'intraday_email_attach_full_report', True)
-
-            if body_mode == 'summary_with_attachment' or len(content) > body_max_chars:
-                # Build a safe summary (never hard-truncate mid-Markdown)
-                summary_content = (
-                    self._build_decision_body_summary(content, body_max_chars)
-                    if len(content) > body_max_chars else content
-                )
-
-                attachments = []
-                if attach_full:
-                    attachments.append(
-                        ("intraday_decision.md", content.encode("utf-8"), "text/markdown"),
-                    )
-                    # Also attach normalized HTML
-                    from src.formatters import markdown_to_html_document
-                    html_content = markdown_to_html_document(content)
-                    attachments.append(
-                        ("intraday_decision.html", html_content.encode("utf-8"), "text/html"),
-                    )
-
-                logger.info(
-                    "决策邮件body_size=%d max=%d attachments=%d",
-                    len(content), body_max_chars, len(attachments),
-                )
-
-                if hasattr(self._email_sender, 'send_to_email_with_attachments'):
-                    success = self._email_sender.send_to_email_with_attachments(
-                        content=summary_content,
-                        subject=subject,
-                        attachments=attachments if attach_full else None,
-                    )
-                else:
-                    # Fallback to regular send (no attachment support)
-                    success = self._email_sender.send_to_email(
-                        content=summary_content,
-                        subject=subject,
-                    )
-            else:
-                success = self._email_sender.send_to_email(
-                    content=content,
-                    subject=subject,
-                )
-
+            success = self._email_sender.send_to_email(
+                content=content,
+                subject=subject,
+            )
             if success:
                 logger.info(
                     "盘中决策邮件发送成功: report_type=%s snapshot_id=%s coverage=%.1f%%",
                     report_type.value, snapshot_id or "none", (coverage_ratio or 0) * 100,
                 )
-                # Save complete report to logs/ for GitHub Actions artifact capture
-                try:
-                    import os as _os
-                    log_dir = getattr(self._config, 'log_dir', './logs')
-                    _os.makedirs(log_dir, exist_ok=True)
-                    report_path = _os.path.join(log_dir, f"intraday_decision_{snapshot_id or 'latest'}.md")
-                    with open(report_path, 'w', encoding='utf-8') as f:
-                        f.write(content)
-                    logger.info("Decision report saved to %s (%d chars)", report_path, len(content))
-                except Exception as save_exc:
-                    logger.debug("Failed to save decision report to file: %s", save_exc)
             else:
                 logger.warning("盘中决策邮件发送失败: report_type=%s", report_type.value)
         except Exception as exc:
