@@ -141,3 +141,58 @@
 ## 验证
 - 13 passed, 0 failed（新测试）
 - 编译检查：OK
+
+---
+
+# Session 2026-07-10: 盘中分析邮件内容完整性 — 端到端链路修复
+
+## 改动概要
+
+本轮修复盘中决策邮件完整性缺失的 4 个根因（1 Critical + 3 Major），覆盖 LLM 元数据透传、股票级完整性校验、分批生成与补偿、邮件无损拆分。
+
+## 修改文件
+
+**`src/analyzer.py`** (+92/-4):
+- 新增 `GenerateTextResult` dataclass（content/model/finish_reason/prompt_tokens/completion_tokens/total_tokens）
+- 新增 `generate_text_with_metadata()` — 返回结构化结果
+- 新增 `_extract_finish_reason()` — 从 provider 响应提取结束原因
+- `_call_litellm()` 返回 4-tuple (text, model, usage, finish_reason)
+- 旧 `generate_text()` 保留为薄兼容层，解包丢弃 finish_reason
+
+**`src/core/intraday_monitor.py`** (+811/-174):
+- `LLMResult` 扩展：finish_reason/prompt_tokens/completion_tokens/total_tokens/response_bytes/integrity_status/expected_codes/covered_codes/missing_codes/duplicate_codes
+- `_call_llm()` 改用 `generate_text_with_metadata()`；`finish_reason` 为 `length`/`max_tokens` 时返回 `truncated_response` 状态
+- 新增 `IntradayReportResult` dataclass（report_id/content/expected_codes/covered_codes/missing_codes/complete/error_type）
+- 新增 `_check_stock_code_in_report()` / `_validate_report_batch()` / `_validate_full_report()` — 股票覆盖完整性校验
+- 新增 `_generate_batched_decision()` / `_generate_single_batch_decision()` / `_generate_single_batch_llm()` / `_merge_report_batches()` — 分批生成与缺失补偿流水线
+- 新增 batch 结束标记 `<!-- INTRADAY_BATCH_COMPLETE -->` 和报告级结束标记 `<!-- INTRADAY_REPORT_COMPLETE -->`
+- `_send_decision_email()` 新增参数：report_coverage_ratio/report_covered_count/report_expected_count/report_id/report_batch_count；邮件头部区分展示"行情快照覆盖率"与"报告正文覆盖率"
+- 正式邮件仅当 `report.complete == True` 时发送
+
+**`src/notification_sender/email_sender.py`** (+282/-17):
+- 新增配置引用：EMAIL_MAX_INLINE_BYTES/EMAIL_LONG_CONTENT_MODE/EMAIL_ATTACH_FULL_REPORT
+- `send_to_email()` 新增 `report_id` 参数；发送前对 MIME 大小做门禁检查
+- 新增 `_split_by_stock_blocks()` — 按股票块无损拆分（不切断股票段落）
+- 新增 `_build_mime_message()` / `_build_attachment_mime()` / `_send_attachment_email()` / `_send_single_email()`
+- 三种交付模式：inline（短报告）、split（按股票块分片，主题 `[i/N]`）、attachment（附件兜底）
+- 每个分片携带 report_id、总分片数、完整报告 SHA-256
+
+**`src/config.py`** (+16/-2):
+- 新增 `intraday_llm_batch_size`（默认 0，不分批）
+- 新增 `email_max_inline_bytes`（默认 0，不限制）
+- 新增 `email_long_content_mode`（默认 "auto"）
+- 新增 `email_attach_full_report`（默认 True）
+
+**`.env.example`** (+13/-2):
+- 新增 INTRADAY_LLM_BATCH_SIZE / EMAIL_MAX_INLINE_BYTES / EMAIL_LONG_CONTENT_MODE / EMAIL_ATTACH_FULL_REPORT 说明
+
+**`tests/test_intraday_monitor.py`** (+199/-6):
+- `TestCallLLM` mock 路径更新
+- `TestLLMTruncationDetection`（4 测试）：length/max_tokens/stop/None finish_reason
+- `TestReportIntegrityValidation`（6 测试）：全覆盖/缺失股票/截断/缺标记/空内容/归一化匹配
+- `TestEmailCoverageDistinction`（1 测试）：邮件同时展示两种覆盖率
+
+## 验证
+- 214 passed, 11 new, 0 regression
+- 3 预存失败（cache TTL / event_type，与本轮无关）
+- 编译检查：OK

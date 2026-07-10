@@ -139,7 +139,7 @@ class EmailReportType(Enum):
 
 @dataclass
 class LLMResult:
-    status: str  # "success" | "config_error" | "rate_limited" | "network_error" | "empty_response"
+    status: str  # "success" | "config_error" | "rate_limited" | "network_error" | "empty_response" | "truncated_response"
     content: Optional[str] = None
     error_message: Optional[str] = None
     provider: Optional[str] = None       # "primary" | "fallback"
@@ -148,6 +148,40 @@ class LLMResult:
     attempts: int = 1
     primary_error_message: Optional[str] = None
     fallback_error_message: Optional[str] = None
+    # --- LLM response metadata (from generate_text_with_metadata) ---
+    finish_reason: Optional[str] = None
+    prompt_tokens: Optional[int] = None
+    completion_tokens: Optional[int] = None
+    total_tokens: Optional[int] = None
+    response_bytes: Optional[int] = None
+    # --- Integrity fields ---
+    integrity_status: Optional[str] = None  # "complete" | "truncated_response" | "missing_stocks" | "duplicate_stocks" | "malformed_report"
+    expected_codes: Optional[List[str]] = None
+    covered_codes: Optional[List[str]] = None
+    missing_codes: Optional[List[str]] = None
+    duplicate_codes: Optional[List[str]] = None
+
+
+@dataclass
+class IntradayReportResult:
+    """Complete intraday decision report with integrity metadata.
+
+    Tracks expected vs covered stocks, batch-level finish reasons,
+    and overall completeness for the multi-batch generation pipeline.
+    """
+    report_id: str
+    content: str
+    expected_codes: List[str] = field(default_factory=list)
+    covered_codes: List[str] = field(default_factory=list)
+    missing_codes: List[str] = field(default_factory=list)
+    duplicate_codes: List[str] = field(default_factory=list)
+    finish_reasons: List[str] = field(default_factory=list)
+    complete: bool = False
+    error_type: Optional[str] = None  # "truncated_response" | "missing_stocks" | "duplicate_stocks" | "malformed_report"
+    batch_count: int = 0
+    model: Optional[str] = None
+    md_bytes: int = 0
+
 
 
 class LLMConfigError(Exception):
@@ -1652,9 +1686,6 @@ class IntradayMonitor:
             )
             return
 
-        # Build prompt (filter out data_unavailable)
-        from src.core.intraday_prompt import build_intraday_prompt
-
         # Rebuild snapshot_times from DB instead of relying on in-memory state
         db_snapshot_times = self._rebuild_snapshot_times_from_db()
         merged_times = db_snapshot_times if db_snapshot_times else self._snapshot_times
@@ -1767,32 +1798,48 @@ class IntradayMonitor:
             logger.debug("Relative strength summary skipped: %s", exc)
             relative_strength_summary = None
 
-        prompt = build_intraday_prompt(
-            events=all_events,
-            yesterday_analysis=self._yesterday_analysis,
-            snapshot_times=merged_times,
-            markets={self._get_market_for_stock(c) for c in stock_codes if self._get_market_for_stock(c)},
-            stock_timelines=stock_timelines,
-            market_timelines=market_timelines,
-            market_timeline_stats=market_timeline_stats,
-            historical_snapshot_count=historical_snapshot_count,
-            relative_strength_summary=relative_strength_summary,
-        )
+        # Compute markets set used by the batched decision pipeline
+        markets_set = {self._get_market_for_stock(c) for c in stock_codes if self._get_market_for_stock(c)}
 
-        # Call LLM via unified analyzer with fallback
-        result = self._call_llm_with_fallback(prompt)
+        # --- Batched LLM decision with integrity validation ---
+        try:
+            report = self._generate_batched_decision(
+                events=all_events,
+                yesterday_analysis=self._yesterday_analysis,
+                valid_quote_codes=snapshot["valid_quote_codes"],
+                merged_times=merged_times,
+                markets_set=markets_set,
+                stock_timelines=stock_timelines,
+                market_timelines=market_timelines,
+                market_timeline_stats=market_timeline_stats,
+                historical_snapshot_count=historical_snapshot_count,
+                relative_strength_summary=relative_strength_summary,
+            )
+        except Exception as exc:
+            logger.exception("Batched LLM decision failed: %s", exc)
+            # Fall back to raw summary
+            llm_fail_markets = {self._get_market_for_stock(c) for c in stock_codes if self._get_market_for_stock(c)}
+            raw = self._build_raw_summary(all_events, markets=llm_fail_markets)
+            self._send_decision_email(
+                content=raw,
+                report_type=EmailReportType.LLM_FAILURE_ALERT,
+                snapshot_id=snapshot_id,
+                coverage_ratio=coverage_ratio,
+                valid_count=valid_count,
+                expected_count=expected_count,
+                failed_codes=failed_codes,
+                llm_status="error",
+                baseline_status=baseline_status,
+                market_dates=snapshot_market_dates,
+                market_index_coverage=mkt_coverage_info,
+                report_coverage_ratio=0.0,
+                report_covered_count=0,
+                report_expected_count=len(snapshot["valid_quote_codes"]),
+            )
+            return
 
-        if result.status == "success":
-            content = self._normalize_official_decision_content(result.content or "")
-            # Prepend fallback indicator if applicable
-            if result.provider == "fallback":
-                fallback_lines = [
-                    f"> LLM来源: fallback",
-                    f"> 主LLM状态: {result.primary_error_message or 'unknown'}",
-                    f"> 备用模型: {result.model or 'unknown'}",
-                    "",
-                ]
-                content = "\n".join(fallback_lines) + content
+        if report.complete:
+            content = self._normalize_official_decision_content(report.content)
             self._send_decision_email(
                 content=content,
                 report_type=EmailReportType.OFFICIAL_DECISION,
@@ -1805,38 +1852,26 @@ class IntradayMonitor:
                 baseline_status=baseline_status,
                 market_dates=snapshot_market_dates,
                 market_index_coverage=mkt_coverage_info,
+                report_coverage_ratio=len(report.covered_codes) / max(len(report.expected_codes), 1),
+                report_covered_count=len(report.covered_codes),
+                report_expected_count=len(report.expected_codes),
+                report_id=report.report_id,
+                report_batch_count=report.batch_count,
             )
-        elif result.status == "config_error":
-            logger.error("LLM config error, no email sent: %s", result.error_message)
+        elif report.error_type == "truncated_response":
+            logger.error(
+                "LLM response truncated: report_id=%s finish_reasons=%s missing=%s",
+                report.report_id, report.finish_reasons, report.missing_codes,
+            )
             if getattr(self._config, 'intraday_send_llm_failure_alert', True):
-                # Build content with fallback details if available
-                if result.fallback_error_message:
-                    fail_content = (
-                        f"## LLM 调用失败（配置错误）\n\n"
-                        f"### 主 LLM\n"
-                        f"- 状态: config_error\n"
-                        f"- 错误: {result.primary_error_message or result.error_message}\n\n"
-                        f"### 备用 LLM\n"
-                        f"- 状态: config_error\n"
-                        f"- 错误: {result.fallback_error_message}\n"
-                        f"- 模型: {result.model or 'N/A'}\n\n"
-                        f"### 建议检查\n"
-                        f"- INTRADAY_LLM_FALLBACK_ENABLED\n"
-                        f"- INTRADAY_LLM_FALLBACK_BASE_URL\n"
-                        f"- INTRADAY_LLM_FALLBACK_API_KEY\n"
-                        f"- INTRADAY_LLM_FALLBACK_MODEL\n"
-                    )
-                elif result.provider == "fallback":
-                    fail_content = (
-                        f"## LLM 调用失败\n\n"
-                        f"### 主 LLM\n"
-                        f"- 状态: config_error\n"
-                        f"- 错误: {result.primary_error_message or result.error_message}\n\n"
-                        f"### 备用 LLM\n"
-                        f"- 未尝试（配置不完整或未启用）\n"
-                    )
-                else:
-                    fail_content = f"LLM调用失败（配置错误），请检查模型配置。\n错误: {result.error_message}"
+                fail_content = (
+                    f"## LLM 响应截断告警\n\n"
+                    f"模型在达到输出上限时停止，以下股票未被分析：{', '.join(report.missing_codes) if report.missing_codes else '未知'}\n\n"
+                    f"报告ID: {report.report_id}\n"
+                    f"已覆盖: {len(report.covered_codes)}/{len(report.expected_codes)}\n"
+                    f"缺失: {len(report.missing_codes)}\n"
+                    f"完成原因: {', '.join(report.finish_reasons) if report.finish_reasons else 'unknown'}\n"
+                )
                 self._send_decision_email(
                     content=fail_content,
                     report_type=EmailReportType.LLM_FAILURE_ALERT,
@@ -1844,52 +1879,72 @@ class IntradayMonitor:
                     coverage_ratio=coverage_ratio,
                     valid_count=valid_count,
                     expected_count=expected_count,
-                    llm_status="config_error",
+                    failed_codes=failed_codes,
+                    llm_status="truncated_response",
                     baseline_status=baseline_status,
                     market_dates=snapshot_market_dates,
+                    market_index_coverage=mkt_coverage_info,
+                    report_coverage_ratio=len(report.covered_codes) / max(len(report.expected_codes), 1),
+                    report_covered_count=len(report.covered_codes),
+                    report_expected_count=len(report.expected_codes),
+                    report_id=report.report_id,
+                    report_batch_count=report.batch_count,
                 )
-        else:
-            # network_error, rate_limited, empty_response
+        elif report.error_type in ("missing_stocks", "duplicate_stocks", "malformed_report"):
+            logger.error(
+                "Report integrity check failed: report_id=%s error_type=%s missing=%s duplicates=%s",
+                report.report_id, report.error_type,
+                report.missing_codes, report.duplicate_codes,
+            )
             if getattr(self._config, 'intraday_send_llm_failure_alert', True):
-                if result.fallback_error_message:
-                    # Both primary and fallback failed
-                    raw = (
-                        f"## LLM 调用失败\n\n"
-                        f"### 主 LLM\n"
-                        f"- 状态: {result.status}\n"
-                        f"- 错误: {result.primary_error_message or result.error_message}\n\n"
-                        f"### 备用 LLM\n"
-                        f"- 状态: {result.status}\n"
-                        f"- 错误: {result.fallback_error_message}\n"
-                        f"- 模型: {result.model or 'N/A'}\n"
-                        f"- 主机: {result.base_url_host or 'N/A'}\n"
-                    )
-                elif result.provider == "fallback":
-                    raw = (
-                        f"## LLM 调用失败\n\n"
-                        f"### 主 LLM\n"
-                        f"- 状态: {result.status}\n"
-                        f"- 错误: {result.primary_error_message or result.error_message}\n\n"
-                        f"### 备用 LLM\n"
-                        f"- 未尝试（配置不完整或未启用）\n"
-                    )
-                else:
-                    if getattr(self._config, 'intraday_send_raw_summary_on_llm_failure', False):
-                        llm_fail_markets = {self._get_market_for_stock(c) for c in stock_codes if self._get_market_for_stock(c)}
-                        raw = self._build_raw_summary(all_events, markets=llm_fail_markets)
-                    else:
-                        raw = f"LLM调用失败: {result.status}\n{result.error_message}"
+                fail_content = (
+                    f"## LLM 报告完整性校验失败\n\n"
+                    f"错误类型: {report.error_type}\n"
+                    f"报告ID: {report.report_id}\n"
+                    f"已覆盖: {len(report.covered_codes)}/{len(report.expected_codes)}\n"
+                    f"缺失: {', '.join(report.missing_codes) if report.missing_codes else '无'}\n"
+                    f"重复: {', '.join(report.duplicate_codes) if report.duplicate_codes else '无'}\n"
+                    f"批次: {report.batch_count}\n"
+                )
                 self._send_decision_email(
-                    content=raw,
+                    content=fail_content,
                     report_type=EmailReportType.LLM_FAILURE_ALERT,
                     snapshot_id=snapshot_id,
                     coverage_ratio=coverage_ratio,
                     valid_count=valid_count,
                     expected_count=expected_count,
-                    llm_status=result.status,
+                    failed_codes=failed_codes,
+                    llm_status="integrity_failure",
                     baseline_status=baseline_status,
                     market_dates=snapshot_market_dates,
+                    market_index_coverage=mkt_coverage_info,
+                    report_coverage_ratio=len(report.covered_codes) / max(len(report.expected_codes), 1),
+                    report_covered_count=len(report.covered_codes),
+                    report_expected_count=len(report.expected_codes),
+                    report_id=report.report_id,
+                    report_batch_count=report.batch_count,
                 )
+        else:
+            # Unknown/incomplete but not explicitly failing
+            logger.warning(
+                "LLM response incomplete: report_id=%s complete=%s error_type=%s",
+                report.report_id, report.complete, report.error_type,
+            )
+            llm_fail_markets = {self._get_market_for_stock(c) for c in stock_codes if self._get_market_for_stock(c)}
+            raw = self._build_raw_summary(all_events, markets=llm_fail_markets)
+            self._send_decision_email(
+                content=raw,
+                report_type=EmailReportType.LLM_FAILURE_ALERT,
+                snapshot_id=snapshot_id,
+                coverage_ratio=coverage_ratio,
+                valid_count=valid_count,
+                expected_count=expected_count,
+                failed_codes=failed_codes,
+                llm_status="incomplete",
+                baseline_status=baseline_status,
+                market_dates=snapshot_market_dates,
+                market_index_coverage=mkt_coverage_info,
+            )
 
     def _call_llm(self, prompt: str) -> LLMResult:
         """Call LLM via the unified GeminiAnalyzer.generate_text() pipeline.
@@ -1913,22 +1968,74 @@ class IntradayMonitor:
                 error_message="LLM analyzer not available (no Router and no legacy litellm fallback)",
             )
 
-        try:
-            text = analyzer.generate_text(
-                prompt,
-                max_tokens=self._config.intraday_llm_max_tokens,
-                temperature=self._config.llm_temperature,
-                system_prompt=INTRADAY_SYSTEM_PROMPT,
-                call_type="intraday_decision",
-                raise_on_error=True,
+        # Use generate_text_with_metadata if available (for finish_reason + token metadata),
+        # fall back to generate_text for backward compatibility.
+        if hasattr(analyzer, 'generate_text_with_metadata'):
+            try:
+                result = analyzer.generate_text_with_metadata(
+                    prompt,
+                    max_tokens=self._config.intraday_llm_max_tokens,
+                    temperature=self._config.llm_temperature,
+                    system_prompt=INTRADAY_SYSTEM_PROMPT,
+                    call_type="intraday_decision",
+                    raise_on_error=True,
+                )
+            except Exception as exc:
+                return self._classify_llm_error(exc)
+
+            if not result or not result.content or not result.content.strip():
+                return LLMResult(status="empty_response", error_message="Empty response from LLM")
+        else:
+            # Legacy path: plain generate_text()
+            try:
+                text = analyzer.generate_text(
+                    prompt,
+                    max_tokens=self._config.intraday_llm_max_tokens,
+                    temperature=self._config.llm_temperature,
+                    system_prompt=INTRADAY_SYSTEM_PROMPT,
+                    call_type="intraday_decision",
+                    raise_on_error=True,
+                )
+            except Exception as exc:
+                return self._classify_llm_error(exc)
+
+            if not text or not text.strip():
+                return LLMResult(status="empty_response", error_message="Empty response from LLM")
+
+            return LLMResult(
+                status="success",
+                content=str(text),
+                response_bytes=len(str(text).encode("utf-8")),
             )
-        except Exception as exc:
-            return self._classify_llm_error(exc)
 
-        if not text or not text.strip():
-            return LLMResult(status="empty_response", error_message="Empty response from LLM")
+        # Detect truncation from finish_reason
+        finish_reason = result.finish_reason
+        is_truncated = finish_reason in ("length", "max_tokens") if finish_reason else False
 
-        return LLMResult(status="success", content=str(text))
+        if is_truncated:
+            logger.warning(
+                "LLM response truncated (finish_reason=%s, completion_tokens=%s, content_len=%d)",
+                finish_reason, result.completion_tokens, len(result.content),
+            )
+            return LLMResult(
+                status="truncated_response",
+                content=result.content,
+                finish_reason=finish_reason,
+                prompt_tokens=result.prompt_tokens,
+                completion_tokens=result.completion_tokens,
+                total_tokens=result.total_tokens,
+                response_bytes=len(result.content.encode("utf-8")),
+            )
+
+        return LLMResult(
+            status="success",
+            content=result.content,
+            finish_reason=finish_reason,
+            prompt_tokens=result.prompt_tokens,
+            completion_tokens=result.completion_tokens,
+            total_tokens=result.total_tokens,
+            response_bytes=len(result.content.encode("utf-8")),
+        )
 
     def _classify_llm_error(self, exc: Exception) -> LLMResult:
         """Classify an LLM exception into an LLMResult with appropriate status."""
@@ -2087,13 +2194,42 @@ class IntradayMonitor:
                     base_url_host=base_url_host,
                     provider="fallback",
                 )
-            logger.info("Fallback LLM call succeeded: model=%s", fallback_model)
+
+            # Extract finish_reason and usage
+            fallback_finish_reason = None
+            fallback_usage = None
+            try:
+                choice0 = response.choices[0] if response.choices else None
+                if choice0:
+                    fallback_finish_reason = getattr(choice0, "finish_reason", None)
+                usage_obj = getattr(response, "usage", None)
+                if usage_obj:
+                    fallback_usage = {
+                        "prompt_tokens": getattr(usage_obj, "prompt_tokens", 0),
+                        "completion_tokens": getattr(usage_obj, "completion_tokens", 0),
+                        "total_tokens": getattr(usage_obj, "total_tokens", 0),
+                    }
+            except Exception:
+                pass
+
+            text_str = str(text)
+            is_truncated = fallback_finish_reason in ("length", "max_tokens") if fallback_finish_reason else False
+
+            logger.info(
+                "Fallback LLM call succeeded: model=%s finish_reason=%s truncated=%s content_len=%d",
+                fallback_model, fallback_finish_reason, is_truncated, len(text_str),
+            )
             return LLMResult(
-                status="success",
-                content=str(text),
+                status="truncated_response" if is_truncated else "success",
+                content=text_str,
                 model=fallback_model,
                 base_url_host=base_url_host,
                 provider="fallback",
+                finish_reason=fallback_finish_reason,
+                prompt_tokens=fallback_usage.get("prompt_tokens") if fallback_usage else None,
+                completion_tokens=fallback_usage.get("completion_tokens") if fallback_usage else None,
+                total_tokens=fallback_usage.get("total_tokens") if fallback_usage else None,
+                response_bytes=len(text_str.encode("utf-8")),
             )
         except Exception as exc:
             error_str = str(exc)
@@ -2120,6 +2256,421 @@ class IntradayMonitor:
                 base_url_host=base_url_host,
                 provider="fallback",
             )
+
+    # ------------------------------------------------------------------
+    # Report integrity validation
+    # ------------------------------------------------------------------
+
+    INTRADAY_BATCH_END_MARKER = "<!-- INTRADAY_BATCH_COMPLETE -->"
+    INTRADAY_REPORT_END_MARKER = "<!-- INTRADAY_REPORT_COMPLETE -->"
+
+    def _check_stock_code_in_report(self, content: str, expected_code: str) -> bool:
+        """Check if an expected stock code appears in the report content.
+
+        Uses normalized code matching to handle different code formats
+        (e.g. SH600519 vs 600519 vs 600519.SH).
+        """
+        if not content or not expected_code:
+            return False
+        # Direct substring match (fast path)
+        if expected_code in content:
+            return True
+        # Try normalized variants
+        try:
+            normalized = normalize_stock_code_key(expected_code)
+            if normalized and normalized in content:
+                return True
+            # Try without market prefix
+            base = expected_code.replace("SH.", "").replace("SZ.", "").replace("HK.", "")
+            if base != expected_code and base in content:
+                return True
+        except Exception:
+            pass
+        return False
+
+    def _validate_report_batch(
+        self,
+        content: str,
+        expected_codes: List[str],
+        finish_reason: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Validate a single batch's report content for stock coverage and structure.
+
+        Returns a dict with covered_codes, missing_codes, duplicate_codes,
+        complete flag, and error_type.
+        """
+        if not content or not expected_codes:
+            return {
+                "covered_codes": [],
+                "missing_codes": list(expected_codes or []),
+                "duplicate_codes": [],
+                "complete": False,
+                "error_type": "empty_content" if not content else None,
+            }
+
+        covered = []
+        missing = []
+        for code in expected_codes:
+            if self._check_stock_code_in_report(content, code):
+                covered.append(code)
+            else:
+                missing.append(code)
+
+        # Detect duplicates (same code appearing in different sections)
+        duplicates = []
+        seen = set()
+        for code in covered:
+            if code in seen:
+                duplicates.append(code)
+            seen.add(code)
+
+        # Check end marker
+        has_marker = self.INTRADAY_BATCH_END_MARKER in content
+
+        # Determine completeness
+        is_truncated = finish_reason in ("length", "max_tokens") if finish_reason else False
+        complete = (
+            not is_truncated
+            and len(missing) == 0
+            and len(duplicates) == 0
+            and has_marker
+        )
+
+        error_type = None
+        if is_truncated:
+            error_type = "truncated_response"
+        elif len(missing) > 0:
+            error_type = "missing_stocks"
+        elif len(duplicates) > 0:
+            error_type = "duplicate_stocks"
+        elif not has_marker:
+            error_type = "malformed_report"
+
+        return {
+            "covered_codes": covered,
+            "missing_codes": missing,
+            "duplicate_codes": duplicates,
+            "complete": complete,
+            "error_type": error_type,
+        }
+
+    def _validate_full_report(
+        self,
+        content: str,
+        expected_codes: List[str],
+        finish_reasons: List[str],
+        model: Optional[str] = None,
+    ) -> IntradayReportResult:
+        """Validate the full (possibly merged) report against expected stock codes.
+
+        Returns an IntradayReportResult with complete integrity metadata.
+        """
+        report_id = str(uuid.uuid4())
+        validation = self._validate_report_batch(content, expected_codes)
+        has_report_marker = self.INTRADAY_REPORT_END_MARKER in content
+
+        # Collect finish reasons
+        truncated_reasons = [fr for fr in finish_reasons if fr in ("length", "max_tokens")]
+
+        complete = (
+            validation["complete"]
+            and has_report_marker
+            and len(truncated_reasons) == 0
+        )
+
+        error_type = validation.get("error_type")
+        if not complete and error_type is None and len(truncated_reasons) > 0:
+            error_type = "truncated_response"
+
+        return IntradayReportResult(
+            report_id=report_id,
+            content=content,
+            expected_codes=list(expected_codes),
+            covered_codes=list(validation["covered_codes"]),
+            missing_codes=list(validation["missing_codes"]),
+            duplicate_codes=list(validation["duplicate_codes"]),
+            finish_reasons=list(finish_reasons),
+            complete=complete,
+            error_type=error_type,
+            batch_count=len(finish_reasons) if finish_reasons else 0,
+            model=model,
+            md_bytes=len(content.encode("utf-8")),
+        )
+
+    # ------------------------------------------------------------------
+    # Batched decision generation
+    # ------------------------------------------------------------------
+
+    def _generate_batched_decision(
+        self,
+        events: List[IntradayEvent],
+        yesterday_analysis: Dict,
+        valid_quote_codes: List[str],
+        merged_times: List[str],
+        markets_set: set,
+        stock_timelines: Dict,
+        market_timelines: Dict,
+        market_timeline_stats: Dict,
+        historical_snapshot_count: int,
+        relative_strength_summary: Optional[str],
+    ) -> IntradayReportResult:
+        """Generate intraday decision in batches, with missing-stock compensation.
+
+        When INTRADAY_LLM_BATCH_SIZE is 0 or fewer codes than batch_size,
+        falls back to single-call generation with integrity validation.
+
+        Returns IntradayReportResult with full integrity metadata.
+        """
+        batch_size = getattr(self._config, 'intraday_llm_batch_size', 0) or 0
+        if batch_size <= 0 or len(valid_quote_codes) <= batch_size:
+            return self._generate_single_batch_decision(
+                events=events,
+                yesterday_analysis=yesterday_analysis,
+                valid_quote_codes=valid_quote_codes,
+                merged_times=merged_times,
+                markets_set=markets_set,
+                stock_timelines=stock_timelines,
+                market_timelines=market_timelines,
+                market_timeline_stats=market_timeline_stats,
+                historical_snapshot_count=historical_snapshot_count,
+                relative_strength_summary=relative_strength_summary,
+            )
+
+        # --- Multi-batch path ---
+        all_finish_reasons: List[str] = []
+        all_contents: List[str] = []
+        models_used: set = set()
+
+        remaining = list(valid_quote_codes)
+        batch_num = 0
+
+        while remaining:
+            batch_num += 1
+            batch_codes = remaining[:batch_size]
+            remaining = remaining[batch_size:]
+
+            logger.info(
+                "Batch %d: generating for %d stocks (remaining: %d)",
+                batch_num, len(batch_codes), len(remaining),
+            )
+
+            batch_result = self._generate_single_batch_llm(
+                batch_codes=batch_codes,
+                events=events,
+                yesterday_analysis=yesterday_analysis,
+                merged_times=merged_times,
+                markets_set=markets_set,
+                stock_timelines=stock_timelines,
+                market_timelines=market_timelines,
+                market_timeline_stats=market_timeline_stats,
+                historical_snapshot_count=historical_snapshot_count,
+                relative_strength_summary=relative_strength_summary,
+                batch_num=batch_num,
+                total_batches=(len(valid_quote_codes) + batch_size - 1) // batch_size,
+            )
+
+            if batch_result.model:
+                models_used.add(batch_result.model)
+
+            # Validate this batch
+            validation = self._validate_report_batch(
+                batch_result.content or "",
+                batch_codes,
+                batch_result.finish_reasons[0] if batch_result.finish_reasons else None,
+            )
+
+            all_finish_reasons.extend(batch_result.finish_reasons)
+            all_contents.append(batch_result.content or "")
+
+            # Compensate for missing codes
+            missing_from_batch = validation.get("missing_codes", [])
+            if missing_from_batch and remaining == []:
+                # Last batch or only batch - add missing codes back
+                logger.warning(
+                    "Batch %d: %d stocks missing from report, creating compensation batch",
+                    batch_num, len(missing_from_batch),
+                )
+                # Compensation: add missing codes at the end
+                comp_result = self._generate_single_batch_llm(
+                    batch_codes=missing_from_batch,
+                    events=events,
+                    yesterday_analysis=yesterday_analysis,
+                    merged_times=merged_times,
+                    markets_set=markets_set,
+                    stock_timelines=stock_timelines,
+                    market_timelines=market_timelines,
+                    market_timeline_stats=market_timeline_stats,
+                    historical_snapshot_count=historical_snapshot_count,
+                    relative_strength_summary=relative_strength_summary,
+                    batch_num=batch_num + 1,
+                    total_batches="compensation",
+                )
+                all_finish_reasons.extend(comp_result.finish_reasons)
+                all_contents.append(comp_result.content or "")
+                if comp_result.model:
+                    models_used.add(comp_result.model)
+
+        # Merge all batch contents
+        merged_content = self._merge_report_batches(all_contents, valid_quote_codes)
+
+        # Final validation
+        result = self._validate_full_report(
+            merged_content, valid_quote_codes, all_finish_reasons,
+            model=", ".join(sorted(models_used)) if models_used else None,
+        )
+
+        logger.info(
+            "Batched decision complete: report_id=%s complete=%s batches=%d "
+            "covered=%d/%d missing=%s md_bytes=%d",
+            result.report_id, result.complete, result.batch_count,
+            len(result.covered_codes), len(result.expected_codes),
+            result.missing_codes, result.md_bytes,
+        )
+
+        return result
+
+    def _generate_single_batch_decision(
+        self,
+        events: List[IntradayEvent],
+        yesterday_analysis: Dict,
+        valid_quote_codes: List[str],
+        merged_times: List[str],
+        markets_set: set,
+        stock_timelines: Dict,
+        market_timelines: Dict,
+        market_timeline_stats: Dict,
+        historical_snapshot_count: int,
+        relative_strength_summary: Optional[str],
+    ) -> IntradayReportResult:
+        """Single-call generation with integrity validation (no batching)."""
+        batch_result = self._generate_single_batch_llm(
+            batch_codes=valid_quote_codes,
+            events=events,
+            yesterday_analysis=yesterday_analysis,
+            merged_times=merged_times,
+            markets_set=markets_set,
+            stock_timelines=stock_timelines,
+            market_timelines=market_timelines,
+            market_timeline_stats=market_timeline_stats,
+            historical_snapshot_count=historical_snapshot_count,
+            relative_strength_summary=relative_strength_summary,
+            batch_num=1,
+            total_batches=1,
+        )
+
+        content = batch_result.content or ""
+        finish_reasons = batch_result.finish_reasons
+        fr_single = finish_reasons[0] if finish_reasons else None
+
+        result = self._validate_full_report(
+            content, valid_quote_codes, finish_reasons,
+            model=batch_result.model,
+        )
+
+        logger.info(
+            "Single-batch decision: report_id=%s complete=%s finish_reason=%s "
+            "covered=%d/%d md_bytes=%d",
+            result.report_id, result.complete, fr_single,
+            len(result.covered_codes), len(result.expected_codes), result.md_bytes,
+        )
+
+        return result
+
+    def _generate_single_batch_llm(
+        self,
+        batch_codes: List[str],
+        events: List[IntradayEvent],
+        yesterday_analysis: Dict,
+        merged_times: List[str],
+        markets_set: set,
+        stock_timelines: Dict,
+        market_timelines: Dict,
+        market_timeline_stats: Dict,
+        historical_snapshot_count: int,
+        relative_strength_summary: Optional[str],
+        batch_num: int = 1,
+        total_batches: Any = 1,
+    ) -> LLMResult:
+        """Generate one batch's report via LLM (with fallback).
+
+        Builds a prompt scoped to the given batch_codes, calls LLM,
+        and returns the LLMResult with metadata.
+        """
+        from src.core.intraday_prompt import build_intraday_prompt
+
+        # Filter events to only these codes
+        batch_events = [e for e in events if e.stock_code in batch_codes]
+        if not batch_events:
+            # No events but we still need to generate for these codes
+            batch_events = events
+
+        # Filter yesterday_analysis to batch codes
+        batch_yesterday = {
+            code: pts
+            for code, pts in yesterday_analysis.items()
+            if code in batch_codes
+        }
+
+        # Filter stock_timelines to batch codes
+        batch_stock_timelines = {
+            code: tl
+            for code, tl in stock_timelines.items()
+            if code in batch_codes
+        } if stock_timelines else None
+
+        prompt = build_intraday_prompt(
+            events=batch_events,
+            yesterday_analysis=batch_yesterday,
+            snapshot_times=merged_times,
+            markets=markets_set,
+            stock_timelines=batch_stock_timelines,
+            market_timelines=market_timelines,
+            market_timeline_stats=market_timeline_stats,
+            historical_snapshot_count=historical_snapshot_count,
+            relative_strength_summary=relative_strength_summary,
+        )
+
+        # Append batch-specific instructions
+        batch_lines = [
+            "",
+            f"---",
+            f"批次 {batch_num}/{total_batches}：请只分析以下股票（每只恰好一次），完成后以 `{self.INTRADAY_BATCH_END_MARKER}` 结束。",
+            f"本批股票: {', '.join(batch_codes)}",
+            "",
+        ]
+        prompt = prompt + "\n".join(batch_lines)
+
+        result = self._call_llm_with_fallback(prompt)
+        return result
+
+    def _merge_report_batches(
+        self, batch_contents: List[str], all_expected_codes: List[str],
+    ) -> str:
+        """Merge multiple batch report contents deterministically.
+
+        Extracts stock blocks from each batch, sorts by expected position,
+        and produces a single merged report with proper headers.
+        """
+        import re
+
+        if len(batch_contents) <= 1:
+            base = batch_contents[0] if batch_contents else ""
+            # Strip batch markers from single batch
+            base = base.replace(self.INTRADAY_BATCH_END_MARKER, "")
+            return base.strip() + f"\n\n{self.INTRADAY_REPORT_END_MARKER}\n"
+
+        parts = []
+        for i, content in enumerate(batch_contents):
+            if not content:
+                continue
+            # Strip end markers from individual batches
+            cleaned = content.replace(self.INTRADAY_BATCH_END_MARKER, "").strip()
+            if cleaned:
+                parts.append(cleaned)
+
+        merged = "\n\n---\n\n".join(parts)
+        merged += f"\n\n{self.INTRADAY_REPORT_END_MARKER}\n"
+        return merged
 
     def _build_raw_summary(self, events: List[IntradayEvent], markets: Optional[set] = None) -> str:
         """Build raw data summary when LLM fails."""
@@ -2268,8 +2819,19 @@ class IntradayMonitor:
         baseline_status: Optional[str] = None,
         market_dates: Optional[Dict[str, str]] = None,
         market_index_coverage: Optional[Dict[str, Any]] = None,
+        # --- Report body coverage (separate from quote snapshot coverage) ---
+        report_coverage_ratio: Optional[float] = None,
+        report_covered_count: int = 0,
+        report_expected_count: int = 0,
+        report_id: Optional[str] = None,
+        report_batch_count: int = 0,
     ) -> None:
-        """Send decision email via EmailSender with structured params."""
+        """Send decision email via EmailSender with structured params.
+
+        Distinguishes between:
+        - Snapshot quote coverage (coverage_ratio): how many stocks got valid quotes
+        - Report body coverage (report_coverage_ratio): how many stocks appear in the LLM-generated report
+        """
         if self._email_sender is None:
             logger.warning("EmailSender 未配置，跳过邮件发送")
             return
@@ -2285,23 +2847,42 @@ class IntradayMonitor:
         prefix = prefix_map.get(report_type, "盘中监控通知")
         subject = prefix
 
-        coverage_str = f" (覆盖率{coverage_ratio:.0%})" if coverage_ratio is not None else ""
         # Use provided market_dates or fallback to primary market
         if not market_dates:
             primary_market = self._resolve_primary_market()
             mkt_date = self._get_market_query_date(primary_market)
             market_dates = {primary_market: mkt_date}
         market_str = " / ".join(sorted(f"{m.upper()}:{d}" for m, d in market_dates.items()))
+
+        # Use report coverage for subject when available, otherwise quote coverage
+        if report_coverage_ratio is not None:
+            coverage_str = f" (报告覆盖{report_coverage_ratio:.0%})"
+        elif coverage_ratio is not None:
+            coverage_str = f" (快照覆盖{coverage_ratio:.0%})"
+        else:
+            coverage_str = ""
         subject = f"{prefix} - {market_str}{coverage_str}"
 
-        # Prepend coverage summary for official
+        # Prepend coverage summary for official decision emails
         if report_type == EmailReportType.OFFICIAL_DECISION:
             summary_lines = [
-                f"> 快照覆盖率: {valid_count}/{expected_count} ({coverage_ratio:.0%})",
                 f"> 快照ID: {snapshot_id}",
+                f"> 行情快照覆盖率: {valid_count}/{expected_count} ({coverage_ratio:.0%})" if coverage_ratio is not None else f"> 行情快照覆盖率: {valid_count}/{expected_count}",
+            ]
+            if report_expected_count > 0:
+                summary_lines.append(
+                    f"> 报告正文覆盖率: {report_covered_count}/{report_expected_count} ({report_coverage_ratio:.0%})"
+                    if report_coverage_ratio is not None
+                    else f"> 报告正文覆盖率: {report_covered_count}/{report_expected_count}"
+                )
+            if report_id:
+                summary_lines.append(f"> 报告ID: {report_id}")
+                if report_batch_count > 0:
+                    summary_lines.append(f"> 批次: {report_batch_count}")
+            summary_lines.extend([
                 f"> LLM状态: {llm_status or 'unknown'}",
                 f"> 基线状态: {baseline_status or 'unknown'}",
-            ]
+            ])
             if market_index_coverage:
                 if market_index_coverage.get('quality_alert'):
                     summary_lines.append("> ⚠️ 大盘指数数据不足，本决策仅供参考")
@@ -2322,8 +2903,10 @@ class IntradayMonitor:
             )
             if success:
                 logger.info(
-                    "盘中决策邮件发送成功: report_type=%s snapshot_id=%s coverage=%.1f%%",
-                    report_type.value, snapshot_id or "none", (coverage_ratio or 0) * 100,
+                    "盘中决策邮件发送成功: report_type=%s snapshot_id=%s report_id=%s "
+                    "quote_cov=%.1f%% report_cov=%.1f%%",
+                    report_type.value, snapshot_id or "none", report_id or "none",
+                    (coverage_ratio or 0) * 100, (report_coverage_ratio or 0) * 100,
                 )
             else:
                 logger.warning("盘中决策邮件发送失败: report_type=%s", report_type.value)

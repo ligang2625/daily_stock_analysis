@@ -1569,9 +1569,26 @@ class TestCallLLM:
 
     @staticmethod
     def _make_mock_analyzer(available=True, text="Buy recommendation"):
+        from src.analyzer import GenerateTextResult
         mock_analyzer = MagicMock()
         type(mock_analyzer).is_available = MagicMock(return_value=available)
-        mock_analyzer.generate_text.return_value = text
+        mock_analyzer.generate_text.return_value = text  # legacy compat
+        if text is not None and text.strip():
+            mock_result = GenerateTextResult(
+                content=text,
+                model="test-model",
+                finish_reason="stop",
+                prompt_tokens=100,
+                completion_tokens=200,
+                total_tokens=300,
+            )
+        else:
+            mock_result = GenerateTextResult(
+                content=text or "",
+                model=None,
+                finish_reason=None,
+            )
+        mock_analyzer.generate_text_with_metadata.return_value = mock_result
         return mock_analyzer
 
     def test_success_returns_llm_result(self):
@@ -1584,7 +1601,9 @@ class TestCallLLM:
         result = monitor._call_llm("test prompt")
         assert result.status == "success"
         assert result.content == "Buy recommendation"
-        analyzer.generate_text.assert_called_once_with(
+        assert result.finish_reason == "stop"
+        assert result.completion_tokens == 200
+        analyzer.generate_text_with_metadata.assert_called_once_with(
             "test prompt",
             max_tokens=4096,
             temperature=0.7,
@@ -1617,7 +1636,7 @@ class TestCallLLM:
 
     def test_config_error_on_auth_exception(self):
         analyzer = self._make_mock_analyzer()
-        analyzer.generate_text.side_effect = Exception("AuthenticationError: invalid key")
+        analyzer.generate_text_with_metadata.side_effect = Exception("AuthenticationError: invalid key")
         monitor = _make_monitor()
         monitor._llm_analyzer = analyzer
         result = monitor._call_llm("test")
@@ -1626,7 +1645,7 @@ class TestCallLLM:
 
     def test_rate_limited_error(self):
         analyzer = self._make_mock_analyzer()
-        analyzer.generate_text.side_effect = Exception("rate_limit exceeded: 429")
+        analyzer.generate_text_with_metadata.side_effect = Exception("rate_limit exceeded: 429")
         monitor = _make_monitor()
         monitor._llm_analyzer = analyzer
         result = monitor._call_llm("test")
@@ -1634,7 +1653,7 @@ class TestCallLLM:
 
     def test_network_error_on_timeout(self):
         analyzer = self._make_mock_analyzer()
-        analyzer.generate_text.side_effect = Exception("connection timeout")
+        analyzer.generate_text_with_metadata.side_effect = Exception("connection timeout")
         monitor = _make_monitor()
         monitor._llm_analyzer = analyzer
         result = monitor._call_llm("test")
@@ -1642,7 +1661,7 @@ class TestCallLLM:
 
     def test_network_error_on_generic_exception(self):
         analyzer = self._make_mock_analyzer()
-        analyzer.generate_text.side_effect = Exception("something bad happened")
+        analyzer.generate_text_with_metadata.side_effect = Exception("something bad happened")
         monitor = _make_monitor()
         monitor._llm_analyzer = analyzer
         result = monitor._call_llm("test")
@@ -1655,6 +1674,174 @@ class TestCallLLM:
             result = monitor._call_llm("test")
         assert result.status == "config_error"
         assert "no module" in result.error_message
+
+
+# ============================================================
+# Truncation detection and integrity validation
+# ============================================================
+
+class TestLLMTruncationDetection:
+    """_call_llm detects truncation from finish_reason and sets status=truncated_response."""
+
+    @staticmethod
+    def _make_truncated_result(text="Partial buy signal for 600519"):
+        from src.analyzer import GenerateTextResult
+        return GenerateTextResult(
+            content=text,
+            model="test-model",
+            finish_reason="length",
+            prompt_tokens=500,
+            completion_tokens=4096,
+            total_tokens=4596,
+        )
+
+    @staticmethod
+    def _make_normal_result(text="Complete report"):
+        from src.analyzer import GenerateTextResult
+        return GenerateTextResult(
+            content=text,
+            model="test-model",
+            finish_reason="stop",
+            prompt_tokens=500,
+            completion_tokens=1500,
+            total_tokens=2000,
+        )
+
+    def test_truncated_finish_reason_length(self):
+        mock_analyzer = MagicMock()
+        type(mock_analyzer).is_available = MagicMock(return_value=True)
+        mock_analyzer.generate_text_with_metadata.return_value = self._make_truncated_result(
+            "Buy signal... (truncated mid-sentence"
+        )
+        monitor = _make_monitor()
+        monitor._llm_analyzer = mock_analyzer
+        result = monitor._call_llm("prompt")
+        assert result.status == "truncated_response"
+        assert result.finish_reason == "length"
+        assert result.completion_tokens == 4096
+        assert result.response_bytes is not None
+
+    def test_truncated_finish_reason_max_tokens(self):
+        result_obj = self._make_truncated_result()
+        result_obj.finish_reason = "max_tokens"
+        mock_analyzer = MagicMock()
+        type(mock_analyzer).is_available = MagicMock(return_value=True)
+        mock_analyzer.generate_text_with_metadata.return_value = result_obj
+        monitor = _make_monitor()
+        monitor._llm_analyzer = mock_analyzer
+        result = monitor._call_llm("prompt")
+        assert result.status == "truncated_response"
+
+    def test_normal_finish_reason_stop(self):
+        mock_analyzer = MagicMock()
+        type(mock_analyzer).is_available = MagicMock(return_value=True)
+        mock_analyzer.generate_text_with_metadata.return_value = self._make_normal_result()
+        monitor = _make_monitor()
+        monitor._llm_analyzer = mock_analyzer
+        result = monitor._call_llm("prompt")
+        assert result.status == "success"
+        assert result.finish_reason == "stop"
+
+    def test_finish_reason_none_still_success(self):
+        result_obj = self._make_normal_result()
+        result_obj.finish_reason = None
+        mock_analyzer = MagicMock()
+        type(mock_analyzer).is_available = MagicMock(return_value=True)
+        mock_analyzer.generate_text_with_metadata.return_value = result_obj
+        monitor = _make_monitor()
+        monitor._llm_analyzer = mock_analyzer
+        result = monitor._call_llm("prompt")
+        assert result.status == "success"
+
+
+class TestReportIntegrityValidation:
+    """_validate_report_batch checks stock coverage, end markers, and truncation."""
+
+    def _make_monitor_with_validator(self):
+        monitor = _make_monitor()
+        return monitor
+
+    def test_all_codes_covered_with_marker(self):
+        monitor = self._make_monitor_with_validator()
+        content = "- **600519**\nreport for 600519\n- **000001**\nreport for 000001\n<!-- INTRADAY_BATCH_COMPLETE -->"
+        result = monitor._validate_report_batch(content, ["600519", "000001"], "stop")
+        assert result["complete"] is True
+        assert result["covered_codes"] == ["600519", "000001"]
+        assert result["missing_codes"] == []
+
+    def test_missing_code_detected(self):
+        monitor = self._make_monitor_with_validator()
+        content = "- **600519**\nreport for 600519\n<!-- INTRADAY_BATCH_COMPLETE -->"
+        result = monitor._validate_report_batch(content, ["600519", "000001"], "stop")
+        assert result["complete"] is False
+        assert result["missing_codes"] == ["000001"]
+        assert result["error_type"] == "missing_stocks"
+
+    def test_truncated_even_with_all_codes(self):
+        monitor = self._make_monitor_with_validator()
+        content = "- **600519**\n- **000001**\n<!-- INTRADAY_BATCH_COMPLETE -->"
+        result = monitor._validate_report_batch(content, ["600519", "000001"], "length")
+        assert result["complete"] is False
+        assert result["error_type"] == "truncated_response"
+
+    def test_missing_end_marker(self):
+        monitor = self._make_monitor_with_validator()
+        content = "- **600519**\nreport\n- **000001**\nreport"
+        result = monitor._validate_report_batch(content, ["600519", "000001"], "stop")
+        assert result["complete"] is False
+        assert result["error_type"] == "malformed_report"
+
+    def test_empty_content(self):
+        monitor = self._make_monitor_with_validator()
+        result = monitor._validate_report_batch("", ["600519"], "stop")
+        assert result["complete"] is False
+        assert result["missing_codes"] == ["600519"]
+
+    def test_normalized_code_matching(self):
+        monitor = self._make_monitor_with_validator()
+        # Code appears in SH.600519 format but expected as 600519
+        content = "- **股票（SH.600519）**\nreport content\n<!-- INTRADAY_BATCH_COMPLETE -->"
+        result = monitor._validate_report_batch(content, ["600519"], "stop")
+        # Should match because 600519 appears as substring
+        assert result["covered_codes"] == ["600519"]
+
+
+class TestEmailCoverageDistinction:
+    """_send_decision_email distinguishes quote coverage from report coverage."""
+
+    def _make_monitor_for_email(self):
+        monitor = _make_monitor()
+        mock_sender = MagicMock()
+        mock_sender.send_to_email.return_value = True
+        monitor._email_sender = mock_sender
+        return monitor
+
+    def test_official_decision_includes_report_coverage(self):
+        monitor = self._make_monitor_for_email()
+        monitor._resolve_primary_market = MagicMock(return_value="cn")
+        monitor._get_market_query_date = MagicMock(return_value="2026-07-10")
+        monitor._send_decision_email(
+            content="Test report",
+            report_type=EmailReportType.OFFICIAL_DECISION,
+            snapshot_id="snap-1",
+            coverage_ratio=0.95,
+            valid_count=19,
+            expected_count=20,
+            report_coverage_ratio=0.90,
+            report_covered_count=18,
+            report_expected_count=20,
+            report_id="rpt-1",
+            report_batch_count=2,
+            llm_status="success",
+            baseline_status="available",
+            market_dates={"cn": "2026-07-10"},
+        )
+        assert monitor._email_sender.send_to_email.called
+        call_content = monitor._email_sender.send_to_email.call_args[1]["content"]
+        assert "行情快照覆盖率" in call_content
+        assert "报告正文覆盖率" in call_content
+        assert "18/20" in call_content
+        assert "rpt-1" in call_content
 
 
 # ============================================================

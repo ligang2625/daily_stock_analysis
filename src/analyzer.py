@@ -15,8 +15,23 @@ import logging
 import math
 import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional, Dict, Any, List, Tuple, Callable
+
+
+@dataclass
+class GenerateTextResult:
+    """Structured result from generate_text_with_metadata().
+
+    Carries LLM response metadata including finish_reason for integrity checks
+    in downstream callers (e.g. intraday decision truncation detection).
+    """
+    content: str
+    model: Optional[str] = None
+    finish_reason: Optional[str] = None
+    prompt_tokens: Optional[int] = None
+    completion_tokens: Optional[int] = None
+    total_tokens: Optional[int] = None
 
 import litellm
 from json_repair import repair_json
@@ -2364,6 +2379,22 @@ class GeminiAnalyzer:
 
         return "".join(parts).strip()
 
+    @staticmethod
+    def _extract_finish_reason(response: Any) -> Optional[str]:
+        """Extract finish_reason from a LiteLLM completion response.
+
+        Returns the string finish_reason (e.g. 'stop', 'length', 'max_tokens')
+        or None if the field is absent / not a string.
+        """
+        choices = GeminiAnalyzer._get_response_field(response, "choices")
+        if not choices:
+            return None
+        choice = choices[0]
+        fr = GeminiAnalyzer._get_response_field(choice, "finish_reason")
+        if isinstance(fr, str) and fr:
+            return fr
+        return None
+
     def _extract_completion_text(self, response: Any) -> str:
         """Extract text from non-stream LiteLLM completion responses."""
         choices = self._get_response_field(response, "choices")
@@ -2617,7 +2648,7 @@ class GeminiAnalyzer:
                     last_usage = _stream_usage
                     if response_validator is not None:
                         response_validator(_stream_text)
-                    return _stream_text, model, _stream_usage
+                    return _stream_text, model, _stream_usage, None  # finish_reason unavailable for streams
 
                 response = call_litellm_with_param_recovery(
                     lambda kwargs: self._dispatch_litellm_completion(
@@ -2636,12 +2667,13 @@ class GeminiAnalyzer:
                 content = self._extract_completion_text(response)
                 if content:
                     usage = self._normalize_usage(self._get_response_field(response, "usage"))
+                    finish_reason = self._extract_finish_reason(response)
                     last_response_text = content
                     last_model = model
                     last_usage = usage
                     if response_validator is not None:
                         response_validator(content)
-                    return (content, model, usage)
+                    return (content, model, usage, finish_reason)
                 raise ValueError("LLM returned empty response")
 
             except Exception as e:
@@ -2690,12 +2722,62 @@ class GeminiAnalyzer:
                 system_prompt=system_prompt,
             )
             if isinstance(result, tuple):
-                text, model_used, usage = result
+                text, model_used, usage, _finish_reason = result
                 persist_llm_usage(usage, model_used, call_type=call_type)
                 return text
             return result
         except Exception as exc:
             logger.error("[generate_text] LLM call failed: %s", exc)
+            if raise_on_error:
+                raise
+            return None
+
+    def generate_text_with_metadata(
+        self,
+        prompt: str,
+        max_tokens: int = 2048,
+        temperature: float = 0.7,
+        system_prompt: Optional[str] = None,
+        call_type: str = "market_review",
+        raise_on_error: bool = False,
+    ) -> Optional[GenerateTextResult]:
+        """Generate text with full response metadata (finish_reason, token usage).
+
+        Use this method when downstream callers need to check finish_reason
+        for truncation detection or other integrity validation.
+
+        Args:
+            prompt:        Text prompt to send to the LLM.
+            max_tokens:    Maximum tokens in the response (default 2048).
+            temperature:   Sampling temperature (default 0.7).
+            system_prompt: Optional system prompt override.
+            call_type:     Usage record tag.
+            raise_on_error: If True, re-raise exceptions instead of returning None.
+
+        Returns:
+            GenerateTextResult with content, model, finish_reason, and token counts,
+            or None if the LLM call fails and raise_on_error is False.
+        """
+        try:
+            result = self._call_litellm(
+                prompt,
+                generation_config={"max_tokens": max_tokens, "temperature": temperature},
+                system_prompt=system_prompt,
+            )
+            if isinstance(result, tuple):
+                text, model_used, usage, finish_reason = result
+                persist_llm_usage(usage, model_used, call_type=call_type)
+                return GenerateTextResult(
+                    content=text,
+                    model=model_used,
+                    finish_reason=finish_reason,
+                    prompt_tokens=usage.get("prompt_tokens") if usage else None,
+                    completion_tokens=usage.get("completion_tokens") if usage else None,
+                    total_tokens=usage.get("total_tokens") if usage else None,
+                )
+            return None
+        except Exception as exc:
+            logger.error("[generate_text_with_metadata] LLM call failed: %s", exc)
             if raise_on_error:
                 raise
             return None
@@ -2810,7 +2892,7 @@ class GeminiAnalyzer:
             while True:
                 start_time = time.time()
                 try:
-                    response_text, model_used, llm_usage = self._call_litellm(
+                    response_text, model_used, llm_usage, _finish_reason = self._call_litellm(
                         current_prompt,
                         generation_config,
                         system_prompt=system_prompt,

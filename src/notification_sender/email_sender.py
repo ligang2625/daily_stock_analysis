@@ -5,14 +5,18 @@ Email 发送提醒服务
 职责：
 1. 通过 SMTP 发送 Email 消息
 """
+import hashlib
 import logging
 from typing import Optional, List
 from datetime import datetime
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from email.mime.image import MIMEImage
+from email.mime.base import MIMEBase
+from email import encoders
 from email.header import Header
 from email.utils import formataddr
+import re
 import smtplib
 
 from data_provider.base import normalize_stock_code
@@ -57,6 +61,7 @@ class EmailSender:
         Args:
             config: 配置对象
         """
+        self._config = config
         self._email_config = {
             'sender': config.email_sender,
             'sender_name': getattr(config, 'email_sender_name', 'daily_stock_analysis股票分析助手'),
@@ -138,79 +143,264 @@ class EmailSender:
         receivers: Optional[List[str]] = None,
         *,
         timeout_seconds: Optional[float] = None,
+        report_id: Optional[str] = None,
     ) -> bool:
         """
-        通过 SMTP 发送邮件（自动识别 SMTP 服务器）
-        
+        Send email via SMTP with optional size-gating and stock-block splitting.
+
+        When EMAIL_MAX_INLINE_BYTES is configured (>0) and the MIME body exceeds it:
+        - If EMAIL_LONG_CONTENT_MODE is "split" or "auto", splits by stock blocks with [i/N] subjects.
+        - If "attachment", sends a short index body with full Markdown as attachment.
+
         Args:
-            content: 邮件内容（支持 Markdown，会转换为 HTML）
-            subject: 邮件主题（可选，默认自动生成）
-            receivers: 收件人列表（可选，默认使用配置的 receivers）
-            
+            content: Email body (Markdown, converted to HTML).
+            subject: Email subject.
+            receivers: Recipient list (default: configured receivers).
+            timeout_seconds: SMTP timeout.
+            report_id: Optional report identifier for subject and logging.
+
         Returns:
-            是否发送成功
+            True if all parts were sent successfully, False otherwise.
         """
         if not self._is_email_configured():
             logger.warning("邮件配置不完整，跳过推送")
             return False
-        
+
         sender = self._email_config['sender']
         password = self._email_config['password']
         receivers = receivers or self._email_config['receivers']
-        server: Optional[smtplib.SMTP] = None
-        
+        config = self._config if hasattr(self, '_config') else None
+
+        if subject is None:
+            date_str = datetime.now().strftime('%Y-%m-%d')
+            subject = f"\U0001F4C8 股票智能分析报告 - {date_str}"
+
+        max_inline = getattr(config, 'email_max_inline_bytes', 0) or 0 if config else 0
+        mode = getattr(config, 'email_long_content_mode', 'auto') or 'auto' if config else 'auto'
+        attach_full = getattr(config, 'email_attach_full_report', True) if config else True
+
+        html_content = markdown_to_html_document(content)
+        md_bytes = len(content.encode('utf-8'))
+        html_bytes = len(html_content.encode('utf-8'))
+        full_sha256 = hashlib.sha256(content.encode('utf-8')).hexdigest()
+
+        # Build a full MIME message to measure its serialized size
+        test_msg = self._build_mime_message(content, html_content, subject, sender, receivers)
         try:
-            # 生成主题
-            if subject is None:
-                date_str = datetime.now().strftime('%Y-%m-%d')
-                subject = f"📈 股票智能分析报告 - {date_str}"
-            
-            # 将 Markdown 转换为简单 HTML
-            html_content = markdown_to_html_document(content)
-            
-            # 构建邮件
-            msg = MIMEMultipart('alternative')
-            msg['Subject'] = Header(subject, 'utf-8')
-            msg['From'] = self._format_sender_address(sender)
-            msg['To'] = ', '.join(receivers)
-            
-            # 添加纯文本和 HTML 两个版本
-            text_part = MIMEText(content, 'plain', 'utf-8')
-            html_part = MIMEText(html_content, 'html', 'utf-8')
-            msg.attach(text_part)
-            msg.attach(html_part)
-            
-            # 自动识别 SMTP 配置
+            mime_bytes = len(test_msg.as_bytes())
+        except Exception:
+            mime_bytes = md_bytes + html_bytes  # fallback estimate
+
+        logger.info(
+            "Email size check: md=%d html=%d mime=%d max_inline=%d mode=%s",
+            md_bytes, html_bytes, mime_bytes, max_inline, mode,
+        )
+
+        if max_inline <= 0 or mime_bytes <= max_inline:
+            # Short content: send as single email
+            return self._send_single_email(test_msg, sender, password, receivers, timeout_seconds)
+
+        # Long content: split or attachment mode
+        if mode == "attachment":
+            return self._send_attachment_email(
+                content=content,
+                html_content=html_content,
+                subject=subject,
+                sender=sender,
+                password=password,
+                receivers=receivers,
+                timeout_seconds=timeout_seconds,
+                report_id=report_id,
+                sha256=full_sha256,
+            )
+
+        # mode == "auto" or "split": attempt stock-block splitting
+        blocks = self._split_by_stock_blocks(content)
+        if len(blocks) <= 1:
+            # Can't split meaningfully, fall back to attachment
+            return self._send_attachment_email(
+                content=content,
+                html_content=html_content,
+                subject=subject,
+                sender=sender,
+                password=password,
+                receivers=receivers,
+                timeout_seconds=timeout_seconds,
+                report_id=report_id,
+                sha256=full_sha256,
+            )
+
+        # Send each stock block as a separate email
+        total = len(blocks)
+        all_ok = True
+        for i, block in enumerate(blocks):
+            part_subject = f"{subject} [{i + 1}/{total}]"
+            block_html = markdown_to_html_document(block)
+            block_msg = self._build_mime_message(block, block_html, part_subject, sender, receivers)
+            ok = self._send_single_email(block_msg, sender, password, receivers, timeout_seconds)
+            if not ok:
+                logger.warning("Email part %d/%d failed: report_id=%s", i + 1, total, report_id)
+                all_ok = False
+            else:
+                logger.info("Email part %d/%d sent: report_id=%s", i + 1, total, report_id)
+
+        # Optionally attach full report as a final email
+        if attach_full:
+            final_subject = f"{subject} [完整报告]"
+            final_html = markdown_to_html_document(content)
+            final_msg = self._build_attachment_mime(content, final_html, final_subject, sender, receivers, full_sha256)
+            final_ok = self._send_single_email(final_msg, sender, password, receivers, timeout_seconds)
+            if not final_ok:
+                logger.warning("Full report attachment email failed")
+                all_ok = False
+
+        return all_ok
+
+    def _split_by_stock_blocks(self, content: str) -> List[str]:
+        """Split Markdown content by stock blocks for multi-part delivery.
+
+        Splits on section headers (## ###) or stock entries (- **), preserving
+        each stock's description as an intact unit. Never splits mid-block.
+
+        Returns list of content chunks; empty content returns single-element list.
+        """
+        if not content:
+            return [content]
+
+        # Try splitting on ### headers (stock groups)
+        section_pattern = re.compile(r'(?=^### )', re.MULTILINE)
+        sections = section_pattern.split(content.strip())
+        if len(sections) > 1:
+            return [s.strip() for s in sections if s.strip()]
+
+        # Try splitting on ### or **stock** entries within sections
+        entry_pattern = re.compile(r'(?=^- \*\*)', re.MULTILINE)
+        entries = entry_pattern.split(content.strip())
+        if len(entries) > 2:  # Only split if we have meaningful groups
+            # Combine preamble with first entry, then group entries
+            result = []
+            current = []
+            for entry in entries:
+                current.append(entry)
+                if len(current) >= 5:
+                    result.append('\n'.join(current).strip())
+                    current = []
+            if current:
+                result.append('\n'.join(current).strip())
+            if len(result) > 1:
+                return result
+
+        return [content]
+
+    def _build_mime_message(
+        self,
+        content: str,
+        html_content: str,
+        subject: str,
+        sender: str,
+        receivers: List[str],
+    ) -> MIMEMultipart:
+        """Build a MIME multipart/alternative message for email delivery."""
+        msg = MIMEMultipart('alternative')
+        msg['Subject'] = Header(subject, 'utf-8')
+        msg['From'] = self._format_sender_address(sender)
+        msg['To'] = ', '.join(receivers)
+
+        # For short messages: text + HTML. For long split messages: text is a summary.
+        text_body = content if len(content.encode('utf-8')) < 4000 else (
+            "本报告内容较长，请使用支持HTML的邮件客户端查看完整内容。\n"
+            "如需完整Markdown原文，请查看完整报告附件。"
+        )
+        msg.attach(MIMEText(text_body, 'plain', 'utf-8'))
+        msg.attach(MIMEText(html_content, 'html', 'utf-8'))
+        return msg
+
+    def _build_attachment_mime(
+        self,
+        content: str,
+        html_content: str,
+        subject: str,
+        sender: str,
+        receivers: List[str],
+        sha256: str,
+    ) -> MIMEMultipart:
+        """Build a MIME message with the full Markdown as a .md attachment."""
+        msg = MIMEMultipart()
+        msg['Subject'] = Header(subject, 'utf-8')
+        msg['From'] = self._format_sender_address(sender)
+        msg['To'] = ', '.join(receivers)
+
+        # Text + HTML body
+        alt = MIMEMultipart('alternative')
+        alt.attach(MIMEText(
+            f"完整报告见附件。\nSHA-256: {sha256}",
+            'plain', 'utf-8',
+        ))
+        alt.attach(MIMEText(
+            f"<p>完整报告见附件。</p><p>SHA-256: <code>{sha256}</code></p>{html_content}",
+            'html', 'utf-8',
+        ))
+        msg.attach(alt)
+
+        # Attach .md file
+        md_part = MIMEBase('application', 'octet-stream')
+        md_part.set_payload(content.encode('utf-8'))
+        encoders.encode_base64(md_part)
+        md_part.add_header(
+            'Content-Disposition',
+            'attachment',
+            filename=('utf-8', '', 'intraday_report.md'),
+        )
+        msg.attach(md_part)
+        return msg
+
+    def _send_attachment_email(
+        self,
+        content: str,
+        html_content: str,
+        subject: str,
+        sender: str,
+        password: str,
+        receivers: List[str],
+        timeout_seconds: Optional[float],
+        report_id: Optional[str],
+        sha256: str,
+    ) -> bool:
+        """Send long report as attachment email."""
+        msg = self._build_attachment_mime(content, html_content, subject, sender, receivers, sha256)
+        return self._send_single_email(msg, sender, password, receivers, timeout_seconds)
+
+    def _send_single_email(
+        self,
+        msg: MIMEMultipart,
+        sender: str,
+        password: str,
+        receivers: List[str],
+        timeout_seconds: Optional[float] = None,
+    ) -> bool:
+        """Send a single MIME message via SMTP. Handles connection and authentication."""
+        server: Optional[smtplib.SMTP] = None
+        try:
             domain = sender.split('@')[-1].lower()
             smtp_config = SMTP_CONFIGS.get(domain)
-            
             if smtp_config:
-                smtp_server = smtp_config['server']
-                smtp_port = smtp_config['port']
+                smtp_server, smtp_port = smtp_config['server'], smtp_config['port']
                 use_ssl = smtp_config['ssl']
-                logger.info(f"自动识别邮箱类型: {domain} -> {smtp_server}:{smtp_port}")
             else:
-                # 未知邮箱，尝试通用配置
-                smtp_server = f"smtp.{domain}"
-                smtp_port = 465
+                smtp_server, smtp_port = f"smtp.{domain}", 465
                 use_ssl = True
-                logger.warning(f"未知邮箱类型 {domain}，尝试通用配置: {smtp_server}:{smtp_port}")
-            
-            # 根据配置选择连接方式
+
             if use_ssl:
-                # SSL 连接（端口 465）
                 server = smtplib.SMTP_SSL(smtp_server, smtp_port, timeout=timeout_seconds or 30)
             else:
-                # TLS 连接（端口 587）
                 server = smtplib.SMTP(smtp_server, smtp_port, timeout=timeout_seconds or 30)
                 server.starttls()
-            
+
             server.login(sender, password)
             server.send_message(msg)
-            
-            logger.info(f"邮件发送成功，收件人: {receivers}")
+            logger.info("邮件发送成功，收件人: %s", receivers)
             return True
-            
+
         except smtplib.SMTPAuthenticationError:
             logger.error("邮件发送失败：认证错误，请检查邮箱和授权码是否正确")
             return False
