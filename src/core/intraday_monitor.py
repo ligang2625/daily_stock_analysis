@@ -2337,6 +2337,15 @@ class IntradayMonitor:
         malformed = parsed.malformed_blocks
         unknown = parsed.unknown_codes
 
+        # State machine structural anomalies
+        structural_anomalies = (
+            parsed.unclosed_codes
+            or parsed.orphan_end_codes
+            or parsed.mismatched_pairs
+            or parsed.empty_codes
+            or parsed.nested_codes
+        )
+
         # Check batch end marker
         has_marker = self.INTRADAY_BATCH_END_MARKER in content
 
@@ -2345,6 +2354,14 @@ class IntradayMonitor:
             logger.warning("Batch validation: %d malformed block(s) detected", len(malformed))
         if unknown:
             logger.warning("Batch validation: %d unknown code(s) in blocks: %s", len(unknown), unknown)
+        if parsed.mismatched_pairs:
+            logger.warning("Batch validation: %d BEGIN/END mismatched pair(s)", len(parsed.mismatched_pairs))
+        if parsed.empty_codes:
+            logger.warning("Batch validation: %d empty stock block(s): %s", len(parsed.empty_codes), parsed.empty_codes)
+        if parsed.nested_codes:
+            logger.warning("Batch validation: %d nested STOCK_BEGIN detected", len(parsed.nested_codes))
+        if parsed.unclosed_codes:
+            logger.warning("Batch validation: %d unclosed block(s): %s", len(parsed.unclosed_codes), parsed.unclosed_codes)
 
         # Determine completeness
         is_truncated = finish_reason in ("length", "max_tokens") if finish_reason else False
@@ -2354,12 +2371,15 @@ class IntradayMonitor:
             and len(duplicates) == 0
             and len(malformed) == 0
             and len(unknown) == 0
+            and not structural_anomalies
             and has_marker
         )
 
         error_type = None
         if is_truncated:
             error_type = "truncated_response"
+        elif structural_anomalies:
+            error_type = "malformed_report"
         elif len(missing) > 0:
             error_type = "missing_stocks"
         elif len(duplicates) > 0:
@@ -2410,6 +2430,15 @@ class IntradayMonitor:
         malformed = parsed.malformed_blocks
         unknown = parsed.unknown_codes
 
+        # State machine structural anomalies
+        structural_anomalies = (
+            parsed.unclosed_codes
+            or parsed.orphan_end_codes
+            or parsed.mismatched_pairs
+            or parsed.empty_codes
+            or parsed.nested_codes
+        )
+
         # Check report end marker (not batch marker)
         has_marker = self.INTRADAY_REPORT_END_MARKER in content
 
@@ -2418,17 +2447,28 @@ class IntradayMonitor:
             logger.warning("Merged report validation: %d malformed block(s) detected", len(malformed))
         if unknown:
             logger.warning("Merged report validation: %d unknown code(s) in blocks: %s", len(unknown), unknown)
+        if parsed.mismatched_pairs:
+            logger.warning("Merged report validation: %d BEGIN/END mismatched pair(s)", len(parsed.mismatched_pairs))
+        if parsed.empty_codes:
+            logger.warning("Merged report validation: %d empty stock block(s): %s", len(parsed.empty_codes), parsed.empty_codes)
+        if parsed.nested_codes:
+            logger.warning("Merged report validation: %d nested STOCK_BEGIN detected", len(parsed.nested_codes))
+        if parsed.unclosed_codes:
+            logger.warning("Merged report validation: %d unclosed block(s): %s", len(parsed.unclosed_codes), parsed.unclosed_codes)
 
         complete = (
             len(missing) == 0
             and len(duplicates) == 0
             and len(malformed) == 0
             and len(unknown) == 0
+            and not structural_anomalies
             and has_marker
         )
 
         error_type = None
-        if len(missing) > 0:
+        if structural_anomalies:
+            error_type = "malformed_report"
+        elif len(missing) > 0:
             error_type = "missing_stocks"
         elif len(duplicates) > 0:
             error_type = "duplicate_stocks"
@@ -3046,22 +3086,89 @@ class IntradayMonitor:
             summary_lines.append("")
             content = "\n".join(summary_lines) + "\n" + content
 
+        # Collect codes from failed_codes if available, for delivery tracking
+        all_codes = None
+        if report_type == EmailReportType.OFFICIAL_DECISION and report_expected_count > 0:
+            all_codes = failed_codes  # used as expected_codes for conservation check
+        # ponytail: derive expected codes from the context; fall back to empty list
+
         try:
-            success = self._email_sender.send_to_email(
+            delivery = self._email_sender.send_to_email(
                 content=content,
                 subject=subject,
+                report_id=report_id,
+                expected_codes=all_codes,
             )
-            if success:
+            if delivery.success:
                 logger.info(
                     "盘中决策邮件发送成功: report_type=%s snapshot_id=%s report_id=%s "
-                    "quote_cov=%.1f%% report_cov=%.1f%%",
+                    "quote_cov=%.1f%% report_cov=%.1f%% parts=%d/%d mode=%s",
                     report_type.value, snapshot_id or "none", report_id or "none",
                     (coverage_ratio or 0) * 100, (report_coverage_ratio or 0) * 100,
+                    delivery.parts_sent, delivery.parts_total, delivery.mode,
+                )
+            elif delivery.partial_delivery:
+                logger.warning(
+                    "盘中决策邮件部分发送: report_type=%s report_id=%s "
+                    "sent=%d/%d failed=%d failed_stocks=%s",
+                    report_type.value, report_id or "none",
+                    delivery.parts_sent, delivery.parts_total,
+                    delivery.parts_failed, delivery.failed_stock_codes,
+                )
+                # Send a separate delivery-failure alert
+                self._send_delivery_failure_alert(
+                    report_id=report_id or "unknown",
+                    report_type=report_type,
+                    sent=delivery.parts_sent,
+                    total=delivery.parts_total,
+                    failed_stocks=delivery.failed_stock_codes,
                 )
             else:
-                logger.warning("盘中决策邮件发送失败: report_type=%s", report_type.value)
+                logger.warning(
+                    "盘中决策邮件完全发送失败: report_type=%s report_id=%s error=%s",
+                    report_type.value, report_id or "none", delivery.error_detail,
+                )
         except Exception as exc:
             logger.exception("盘中决策邮件发送异常: report_type=%s: %s", report_type.value, exc)
+
+    def _send_delivery_failure_alert(
+        self,
+        *,
+        report_id: str,
+        report_type: "EmailReportType",
+        sent: int,
+        total: int,
+        failed_stocks: List[str],
+    ) -> None:
+        """Send a standalone alert email when report delivery is partial.
+
+        This is a best-effort alert — if it fails, we only log it since
+        we already logged the partial delivery in _send_decision_email.
+        """
+        if self._email_sender is None:
+            return
+        try:
+            stock_list = ", ".join(failed_stocks) if failed_stocks else "(unknown)"
+            alert_content = (
+                f"## 盘中决策报告交付不完整\n\n"
+                f"- 报告ID: {report_id}\n"
+                f"- 发送成功: {sent}/{total}\n"
+                f"- 失败分片数: {total - sent}\n"
+                f"- 未送达股票: {stock_list}\n"
+                f"- 报告类型: {report_type.value}\n\n"
+                f"建议：检查邮件配额、SMTP 限制或重试失败分片。"
+            )
+            alert_subject = f"[交付异常] 盘中监控报告部分未送达 - report_id={report_id[:12]}"
+            alert_result = self._email_sender.send_to_email(
+                content=alert_content,
+                subject=alert_subject,
+            )
+            if alert_result:
+                logger.info("交付异常告警邮件已发送: report_id=%s", report_id[:12])
+            else:
+                logger.warning("交付异常告警邮件发送失败: report_id=%s", report_id[:12])
+        except Exception as exc:
+            logger.exception("发送交付异常告警邮件时出错: %s", exc)
 
     # ------------------------------------------------------------------
     # SQLite helpers

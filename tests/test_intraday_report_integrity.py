@@ -137,10 +137,9 @@ def test_duplicate_only_appears_once():
 
 
 def test_block_without_stock_end():
-    """When STOCK_BEGIN has no matching STOCK_END, the regex (non-greedy) consumes
-    content up to the NEXT STOCK_END, producing a merged block that swallows the
-    following STOCK_BEGIN. Both codes end up inside the block for the first code.
-    The inner (swallowed) code is therefore missing from blocks_by_code.
+    """When STOCK_BEGIN has no matching STOCK_END and is followed by another
+    block's STOCK_END, the state machine detects the BEGIN/END mismatch.
+    Neither block is trusted; both are recorded as malformed.
     """
     content = (
         f"{STOCK_BEGIN.format(code='600519')}\n"
@@ -151,25 +150,33 @@ def test_block_without_stock_end():
     )
     result = parse_stock_blocks(content, expected_codes=["600519", "000001"])
 
-    # The regex matched: STOCK_BEGIN:600519 ... up to STOCK_END:000001
-    # Everything — including STOCK_BEGIN:000001 — is the body of 600519's block.
-    assert "600519" in result.blocks_by_code
-    # 000001 was consumed inside 600519's block, so it is missing
+    # State machine: BEGIN 600519 → nested BEGIN 000001 → END 000001 mismatches BEGIN 600519
+    # Neither block is valid → neither appears in blocks_by_code
+    assert "600519" not in result.blocks_by_code
     assert "000001" not in result.blocks_by_code
+    assert result.mismatched_pairs == [{"begin_code": "600519", "end_code": "000001"}]
+    assert result.nested_codes == ["600519"]
+    assert "600519" in result.missing_codes
     assert "000001" in result.missing_codes
+    assert not result.is_clean
 
 
 def test_malformed_block_unrecognized_code():
-    """Block code that cannot be normalized ends up in malformed_blocks."""
+    """Block code that cannot be normalized ends up in malformed_blocks.
+
+    State machine: unrecognized BEGIN is skipped (not entered), the following
+    END is therefore orphaned. Both produce malformed_blocks entries.
+    """
     content = _make_content(
         _make_block("", "空的股票代码"),
     )
     result = parse_stock_blocks(content, expected_codes=["600519"])
 
     assert result.blocks_by_code == {}
-    assert len(result.malformed_blocks) == 1
-    assert result.malformed_blocks[0]["reason"] == "unrecognized code format"
-    assert result.malformed_blocks[0]["raw_code"] == ""
+    assert len(result.malformed_blocks) >= 1
+    assert any(m["reason"] == "unrecognized code format" for m in result.malformed_blocks)
+    assert any(m["raw_code"] == "" for m in result.malformed_blocks)
+    assert not result.is_clean
 
 
 # ---------------------------------------------------------------------------
@@ -303,3 +310,128 @@ def test_stock_block_parse_result_defaults():
     assert result.malformed_blocks == []
     assert result.preamble == ""
     assert result.trailing_content == ""
+    assert result.unclosed_codes == []
+    assert result.orphan_end_codes == []
+    assert result.mismatched_pairs == []
+    assert result.empty_codes == []
+    assert result.nested_codes == []
+    assert result.is_clean is True
+
+
+# ---------------------------------------------------------------------------
+# State machine tests — strict validation
+# ---------------------------------------------------------------------------
+
+
+def test_begin_end_code_mismatch():
+    """BEGIN code != END code → mismatched_pairs populated, complete → False."""
+    content = (
+        "<!-- STOCK_BEGIN:600519 -->\n"
+        "茅台分析内容\n"
+        "<!-- STOCK_END:000001 -->\n"
+    )
+    result = parse_stock_blocks(content, expected_codes=["600519", "000001"])
+
+    assert result.blocks_by_code == {}
+    assert result.mismatched_pairs == [{"begin_code": "600519", "end_code": "000001"}]
+    assert not result.is_clean
+    assert "600519" in result.missing_codes
+    assert "000001" in result.missing_codes
+
+
+def test_empty_block_body_detected():
+    """Block with whitespace-only body → empty_codes populated, not in blocks_by_code.
+
+    The code is counted as seen (code_counts=1) so it's NOT in missing_codes.
+    But it's NOT in blocks_by_code (body was empty). Validation layer checks
+    structural_anomalies to mark the report incomplete.
+    """
+    content = (
+        "<!-- STOCK_BEGIN:600519 -->\n"
+        "   \n"
+        "<!-- STOCK_END:600519 -->\n"
+    )
+    result = parse_stock_blocks(content, expected_codes=["600519"])
+
+    assert result.blocks_by_code == {}
+    assert result.empty_codes == ["600519"]
+    assert not result.is_clean
+
+
+def test_orphan_begin_unclosed():
+    """STOCK_BEGIN without matching STOCK_END → unclosed_codes, not in blocks_by_code."""
+    content = "<!-- STOCK_BEGIN:600519 -->\n茅台分析内容\n"
+    result = parse_stock_blocks(content, expected_codes=["600519"])
+
+    assert result.unclosed_codes == ["600519"]
+    assert result.blocks_by_code == {}
+    assert not result.is_clean
+
+
+def test_orphan_end_no_begin():
+    """STOCK_END without preceding STOCK_BEGIN → orphan_end_codes."""
+    content = "<!-- STOCK_END:600519 -->\n"
+    result = parse_stock_blocks(content, expected_codes=["600519"])
+
+    assert result.orphan_end_codes == ["600519"]
+    assert result.blocks_by_code == {}
+    assert not result.is_clean
+
+
+def test_nested_blocks_detected():
+    """STOCK_BEGIN inside another block → nested_codes populated."""
+    content = (
+        "<!-- STOCK_BEGIN:600519 -->\n"
+        "茅台分析\n"
+        "<!-- STOCK_BEGIN:000001 -->\n"
+        "嵌套的平安分析\n"
+        "<!-- STOCK_END:000001 -->\n"
+        "<!-- STOCK_END:600519 -->\n"
+    )
+    result = parse_stock_blocks(content, expected_codes=["600519", "000001"])
+
+    # Outer block (600519) absorbs the inner BEGIN as part of its body mismatched with END
+    assert not result.is_clean
+    assert len(result.nested_codes) >= 1
+    assert len(result.mismatched_pairs) >= 1
+
+
+def test_duplicate_blocks_with_state_machine():
+    """Duplicate blocks for the same code are detected."""
+    content = (
+        "<!-- STOCK_BEGIN:600519 -->\n第一份\n<!-- STOCK_END:600519 -->\n"
+        "<!-- STOCK_BEGIN:600519 -->\n第二份\n<!-- STOCK_END:600519 -->\n"
+    )
+    result = parse_stock_blocks(content, expected_codes=["600519"])
+
+    assert result.duplicate_codes == ["600519"]
+    assert len(result.blocks_by_code) == 1  # only first kept
+    assert not result.is_clean
+
+
+def test_unknown_code_with_state_machine():
+    """Code not in expected list → unknown_codes."""
+    content = (
+        "<!-- STOCK_BEGIN:600519 -->\n茅台\n<!-- STOCK_END:600519 -->\n"
+        "<!-- STOCK_BEGIN:XYZ999 -->\n未知\n<!-- STOCK_END:XYZ999 -->\n"
+    )
+    result = parse_stock_blocks(content, expected_codes=["600519"])
+
+    assert "XYZ999" in result.unknown_codes
+    assert not result.is_clean
+
+
+def test_is_clean_property_all_clear():
+    """is_clean is True when no anomalies detected."""
+    content = (
+        "<!-- STOCK_BEGIN:600519 -->\n茅台分析\n<!-- STOCK_END:600519 -->\n"
+        "<!-- STOCK_BEGIN:000001 -->\n平安分析\n<!-- STOCK_END:000001 -->\n"
+    )
+    result = parse_stock_blocks(content, expected_codes=["600519", "000001"])
+
+    assert result.is_clean is True
+    assert result.unclosed_codes == []
+    assert result.orphan_end_codes == []
+    assert result.mismatched_pairs == []
+    assert result.empty_codes == []
+    assert result.nested_codes == []

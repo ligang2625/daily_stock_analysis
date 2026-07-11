@@ -962,6 +962,8 @@ class Config:
     intraday_llm_compensation_max_rounds: int = 2
     # 邮件正文大小阈值（UTF-8 字节），超限触发拆分/附件模式；默认 200KB
     email_max_inline_bytes: int = 200000
+    # 单封邮件总大小硬上限（字节，默认 20MB），依据 SMTP 服务商真实限制
+    email_max_message_bytes: int = 20_000_000
     # 长报告处理模式: "split" | "attachment" | "auto"
     email_long_content_mode: str = "auto"
     # 是否在超长邮件中附带完整原始报告附件
@@ -1859,6 +1861,7 @@ class Config:
             intraday_data_quality_alert_enabled=os.getenv('INTRADAY_DATA_QUALITY_ALERT_ENABLED', 'true').lower() == 'true',
             intraday_llm_compensation_max_rounds=parse_env_int(os.getenv('INTRADAY_LLM_COMPENSATION_MAX_ROUNDS'), 2, field_name='INTRADAY_LLM_COMPENSATION_MAX_ROUNDS', minimum=0),
             email_max_inline_bytes=parse_env_int(os.getenv('EMAIL_MAX_INLINE_BYTES'), 200000, field_name='EMAIL_MAX_INLINE_BYTES', minimum=0),
+            email_max_message_bytes=parse_env_int(os.getenv('EMAIL_MAX_MESSAGE_BYTES'), 20_000_000, field_name='EMAIL_MAX_MESSAGE_BYTES', minimum=0),
             email_long_content_mode=os.getenv('EMAIL_LONG_CONTENT_MODE', 'auto'),
             email_attach_full_report=os.getenv('EMAIL_ATTACH_FULL_REPORT', 'true').lower() == 'true',
             intraday_index_data_source=os.getenv('INTRADAY_INDEX_DATA_SOURCE', 'dedicated'),

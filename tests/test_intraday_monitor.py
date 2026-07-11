@@ -3337,9 +3337,10 @@ class TestParseStockBlocks:
             "<!-- STOCK_BEGIN: -->\nbad\n<!-- STOCK_END: -->\n"
         )
         result = parse_stock_blocks(content, ["600519"])
-        # Empty code string does not normalize → malformed
-        assert len(result.malformed_blocks) == 1
-        assert result.malformed_blocks[0]["raw_code"] == ""
+        # Empty code: state machine produces 2 malformed entries —
+        # one for unrecognized BEGIN, one for orphan END
+        assert len(result.malformed_blocks) == 2
+        assert any(m["raw_code"] == "" for m in result.malformed_blocks)
 
 
 class TestValidatorMarkerProtocol:
